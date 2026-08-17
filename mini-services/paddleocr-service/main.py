@@ -95,17 +95,17 @@ app = FastAPI(
 
 class OCRErrorInfo(BaseModel):
     """Per-image error details when a single image in a batch fails."""
-    index = 0
-    path = ""
-    error = ""
+    index: int = 0
+    path: str = ""
+    error: str = ""
 
 
 class OCRResult(BaseModel):
     """OCR output for a single image."""
-    index = 0
-    text = ""
-    confidence = 0.0
-    regions = 0
+    index: int = 0
+    text: str = ""
+    confidence: float = 0.0
+    regions: int = 0
 
 
 class OCROptions(BaseModel):
@@ -174,15 +174,17 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class _TextRegion:
     """A single detected text region with position metadata."""
-    text = ""  # type: str
-    confidence = 0.0  # type: float
-    x_min = 0.0  # type: float
-    y_min = 0.0  # type: float
-    y_max = 0.0  # type: float
-    x_max = 0.0  # type: float
+    __slots__ = ('text', 'confidence', 'x_min', 'y_min', 'y_max', 'x_max')
+
+    def __init__(self, text, confidence, x_min, y_min, y_max, x_max):
+        self.text = text
+        self.confidence = confidence
+        self.x_min = x_min
+        self.y_min = y_min
+        self.y_max = y_max
+        self.x_max = x_max
 
 
 def _sort_regions_reading_order(regions):
