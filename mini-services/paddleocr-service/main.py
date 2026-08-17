@@ -55,11 +55,6 @@ def _init_ocr() -> None:
         ocr = PaddleOCR(
             ocr_version="PP-OCRv5",
             lang="en",
-            use_angle_cls=True,
-            show_log=False,
-            det_db_score_mode="fast",
-            det_db_unclip_ratio=1.8,
-            use_space_char=True,
         )
         MODEL_NAME = "PP-OCRv5"
         MODEL_READY = True
@@ -72,11 +67,6 @@ def _init_ocr() -> None:
             ocr = PaddleOCR(
                 ocr_version="PP-OCRv4",
                 lang="en",
-                use_angle_cls=True,
-                show_log=False,
-                det_db_score_mode="fast",
-                det_db_unclip_ratio=1.8,
-                use_space_char=True,
             )
             MODEL_NAME = "PP-OCRv4"
             MODEL_READY = True
