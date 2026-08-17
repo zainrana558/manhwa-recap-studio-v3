@@ -28,10 +28,15 @@ ENV PATH="/opt/venv/bin:${PATH}"
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
     edge-tts openai Pillow opencv-python-headless numpy \
-    torch torchvision ultralytics huggingface-hub
+    torch torchvision ultralytics huggingface-hub && \
+    pip install --no-cache-dir \
+    paddlepaddle paddleocr fastapi uvicorn python-multipart
 
 # Pre-download the YOLO model so the first job doesn't stall on a download
 RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" || true
+
+# Pre-download PaddleOCR PP-OCRv5 English model so the first job doesn't stall
+RUN python3 -c "from paddleocr import PaddleOCR; PaddleOCR(ocr_version='PP-OCRv5', lang='en', show_log=False)" || true
 
 # ---- App setup --------------------------------------------------------------
 WORKDIR /app
@@ -39,9 +44,11 @@ WORKDIR /app
 # Copy package files first (better Docker layer caching)
 COPY package.json bun.lock ./
 COPY mini-services/pipeline-service/package.json mini-services/pipeline-service/bun.lock ./mini-services/pipeline-service/
+COPY mini-services/paddleocr-service/requirements.txt ./mini-services/paddleocr-service/
 
 RUN bun install
 RUN cd mini-services/pipeline-service && bun install
+RUN pip install -r mini-services/paddleocr-service/requirements.txt --no-cache-dir || true
 
 # Copy source code
 COPY . .

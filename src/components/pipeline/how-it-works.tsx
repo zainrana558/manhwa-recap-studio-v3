@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Search, ScanLine, Eye, Scissors, Clapperboard, ChevronDown, Workflow } from "lucide-react";
+import { Search, ScanLine, FileText, Scissors, Clapperboard, ChevronDown, Workflow } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSectionObserver } from "@/hooks/use-section-observer";
 
@@ -21,11 +21,11 @@ const STEPS = [
     duration: "~30s/ch",
   },
   {
-    icon: Eye,
-    title: "Transcribe",
-    desc: "Vision AI reads speech bubbles and captions from each panel, transcribing the exact dialogue.",
-    details: "Multiple VLM providers (z-ai, Groq, Gemini) analyze each panel image to detect and transcribe speech bubble text. Results are cached to speed up re-runs.",
-    duration: "~3min/ch",
+    icon: FileText,
+    title: "OCR",
+    desc: "PaddleOCR PP-OCRv5 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
+    details: "PP-OCRv5 is the primary transcription engine (+13% accuracy over v4). It runs entirely on-device with no API keys. If OCR quality is low, VLM providers (SiliconFlow, Gemini, Groq) serve as automatic fallback.",
+    duration: "~15s/ch",
   },
   {
     icon: Scissors,

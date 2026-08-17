@@ -10,7 +10,7 @@ import {
   WifiOff,
   Search as SearchIcon,
   ScanLine,
-  Eye,
+  FileText,
   Scissors,
   Clapperboard,
   RotateCw,
@@ -41,7 +41,7 @@ interface StageInfo {
 const PIPELINE_STAGES: StageInfo[] = [
   { key: "search", label: "Search", icon: SearchIcon },
   { key: "scrape", label: "Download", icon: ScanLine },
-  { key: "transcribe", label: "Transcribe", icon: Eye },
+  { key: "transcribe", label: "OCR", icon: FileText },
   { key: "slice", label: "Slice", icon: Scissors },
   { key: "render", label: "Render", icon: Clapperboard },
   { key: "done", label: "Done", icon: CheckCircle2 },

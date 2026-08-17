@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Settings, Loader2, Download, Upload, RotateCcw, X } from "lucide-react";
+import { Settings, Loader2, Download, Upload, RotateCcw, X, FileText, Wifi, WifiOff, Zap } from "lucide-react";
 import {
   Drawer,
   DrawerContent,
@@ -79,6 +79,8 @@ export function SettingsDialog() {
   const [form, setForm] = useState<SettingsForm>(DEFAULTS);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [ocrStatus, setOcrStatus] = useState<{ ready: boolean; model: string } | null>(null);
+  const [ocrChecking, setOcrChecking] = useState(false);
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -116,8 +118,28 @@ export function SettingsDialog() {
   }, []);
 
   useEffect(() => {
-    if (open) loadSettings();
+    if (open) {
+      loadSettings();
+      checkOcrHealth();
+    }
   }, [open, loadSettings]);
+
+  const checkOcrHealth = useCallback(async () => {
+    setOcrChecking(true);
+    try {
+      const res = await fetch("/api/ocr/health?XTransformPort=3002");
+      if (res.ok) {
+        const data = await res.json();
+        setOcrStatus({ ready: data.ready, model: data.model || "unknown" });
+      } else {
+        setOcrStatus({ ready: false, model: "unavailable" });
+      }
+    } catch {
+      setOcrStatus({ ready: false, model: "unavailable" });
+    } finally {
+      setOcrChecking(false);
+    }
+  }, []);
 
   const handleSave = async () => {
     setSaving(true);
@@ -274,6 +296,46 @@ export function SettingsDialog() {
                   </Select>
                 </div>
               </div>
+
+              {/* OCR Engine Status */}
+              <div className="rounded-xl border border-border bg-card/50 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-semibold flex items-center gap-2">
+                    <Zap className="h-3.5 w-3.5 text-primary" />
+                    OCR Transcription
+                  </p>
+                  <button
+                    onClick={checkOcrHealth}
+                    disabled={ocrChecking}
+                    className="text-[10px] text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+                  >
+                    {ocrChecking ? "Checking…" : "Refresh"}
+                  </button>
+                </div>
+                {ocrStatus ? (
+                  <div className="flex items-center gap-2.5 text-xs">
+                    {ocrStatus.ready ? (
+                      <>
+                        <Wifi className="h-3.5 w-3.5 text-emerald-400" />
+                        <span className="text-emerald-400 font-medium">PaddleOCR {ocrStatus.model} Active</span>
+                        <span className="text-muted-foreground/60">— primary transcriptor (no API keys needed)</span>
+                      </>
+                    ) : (
+                      <>
+                        <WifiOff className="h-3.5 w-3.5 text-muted-foreground" />
+                        <span className="text-muted-foreground">PaddleOCR not running — VLM providers will be used (API keys required)</span>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <FileText className="h-3.5 w-3.5" />
+                    <span>PP-OCRv5 is the default transcription engine. VLM providers serve as fallback.</span>
+                  </div>
+                )}
+              </div>
+
+              <Separator />
 
               {/* Chapter limit */}
               <div className="space-y-2">

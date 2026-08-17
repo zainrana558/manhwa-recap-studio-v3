@@ -46,6 +46,9 @@ import {
   downloadImageForSource,
   extFromFilename,
   generateImageNarrations,
+  generateImageNarrationsOCR,
+  isPaddleOCRAvailable,
+  getOCRModelName,
   filterCreditPanels,
   sleep,
   fileExists,
@@ -837,13 +840,32 @@ async function processJob(jobId: string): Promise<void> {
   }
 
   // -----------------------------
-  // Phase 2: TRANSCRIBE (VLM) — read bubble/caption text from each panel
+  // Phase 2: TRANSCRIBE — read bubble/caption text from each panel.
+  // Strategy: PaddleOCR PP-OCRv5 (PRIMARY, local, no API keys needed) →
+  //           VLM providers (FALLBACK, requires API keys, slower)
   // -----------------------------
   await db.job.update({
     where: { id: jobId },
-    data: { status: 'transcribing', stage: 'transcribe', message: 'Reading panel text with VLM' },
+    data: { status: 'transcribing', stage: 'transcribe', message: 'Transcribing panel text' },
   })
   await emitStatus(jobId)
+
+  // Check PaddleOCR availability ONCE at the start of transcription phase.
+  // If the service is up, we use it for ALL chapters. If not, we fall back
+  // to VLM for ALL chapters (no per-chapter switching — that would waste
+  // time re-initializing providers).
+  const ocrAvailable = await isPaddleOCRAvailable()
+  let ocrModelName = 'unknown'
+  if (ocrAvailable) {
+    ocrModelName = await getOCRModelName()
+    await emitLog(jobId, 'success', 'transcribe',
+      `PaddleOCR ${ocrModelName} detected — using as PRIMARY transcriptor (fast, local, no API keys needed)`,
+    )
+  } else {
+    await emitLog(jobId, 'info', 'transcribe',
+      'PaddleOCR service not available — falling back to VLM providers (requires API keys)',
+    )
+  }
   await emitLog(jobId, 'info', 'transcribe', 'Transcribing speech bubbles and captions from each panel image')
 
   // Set VLM API keys from the per-job record (user-entered in the UI).
@@ -950,11 +972,47 @@ async function processJob(jobId: string): Promise<void> {
 
     try {
       const modeLabel = frameKeyed ? 'sliced panels' : 'full-page images'
-      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel}...`)
-      const rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
-        // Per-image progress within this chapter.
-        void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
-      })
+      let rawNarrations: Array<{ image: string; text: string }>
+      let usedMethod = 'unknown'
+
+      if (ocrAvailable) {
+        // ── PRIMARY: PaddleOCR PP-OCRv5 (fast, local, no API keys) ──
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with PaddleOCR ${ocrModelName}...`)
+        try {
+          rawNarrations = await generateImageNarrationsOCR(imageFiles, (done, total) => {
+            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} OCR'd`)
+          })
+          usedMethod = `PaddleOCR ${ocrModelName}`
+
+          // Check if OCR returned mostly empty results (low quality / wrong language).
+          // If >80% of panels are empty, fall back to VLM for better coverage.
+          const emptyCount = rawNarrations.filter((n) => !n.text.trim()).length
+          const emptyRatio = emptyCount / rawNarrations.length
+          if (emptyRatio > 0.8 && rawNarrations.length > 3) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: OCR returned ${emptyCount}/${rawNarrations.length} empty panels (${Math.round(emptyRatio * 100)}%) — falling back to VLM for this chapter`,
+            )
+            throw new Error(`OCR empty ratio too high: ${Math.round(emptyRatio * 100)}%`)
+          }
+        } catch (ocrErr) {
+          // OCR failed or returned poor results — fall back to VLM for this chapter.
+          const ocrMsg = ocrErr instanceof Error ? ocrErr.message : String(ocrErr)
+          await emitLog(jobId, 'warn', 'transcribe',
+            `Chapter ${ch.index}: PaddleOCR failed or low quality (${ocrMsg.slice(0, 100)}) — falling back to VLM`,
+          )
+          rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed via VLM`)
+          })
+          usedMethod = 'VLM (fallback)'
+        }
+      } else {
+        // ── FALLBACK: VLM providers (requires API keys) ──
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with VLM...`)
+        rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+          void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
+        })
+        usedMethod = 'VLM'
+      }
 
       // FILTER CREDIT/AUTHOR/WEBSITE PANELS — these are non-story panels
       // (scanlation credits, Discord links, Patreon, "next chapter" teasers,
@@ -981,7 +1039,7 @@ async function processJob(jobId: string): Promise<void> {
         jobId,
         'success',
         'transcribe',
-        `Chapter ${ch.index} transcribed: ${narrations.length} ${frameKeyed ? 'panels' : 'images'}${creditsRemoved > 0 ? ` (${creditsRemoved} credits filtered)` : ''}`
+        `Chapter ${ch.index} transcribed (${usedMethod}): ${narrations.length} ${frameKeyed ? 'panels' : 'images'}${creditsRemoved > 0 ? ` (${creditsRemoved} credits filtered)` : ''}`
       )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)

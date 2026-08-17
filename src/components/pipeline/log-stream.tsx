@@ -20,7 +20,7 @@ const stageConfig: Record<string, { color: string; bg: string; label: string }> 
   search: { color: "text-sky-400", bg: "bg-sky-500/10", label: "SEARCH" },
   scrape: { color: "text-amber-400", bg: "bg-amber-500/10", label: "SCRAPE" },
   slice: { color: "text-cyan-400", bg: "bg-cyan-500/10", label: "SLICE" },
-  transcribe: { color: "text-orange-400", bg: "bg-orange-500/10", label: "VLM" },
+  transcribe: { color: "text-orange-400", bg: "bg-orange-500/10", label: "OCR" },
   translate: { color: "text-purple-400", bg: "bg-purple-500/10", label: "TRANSLATE" },
   render: { color: "text-emerald-400", bg: "bg-emerald-500/10", label: "RENDER" },
   merge: { color: "text-teal-400", bg: "bg-teal-500/10", label: "MERGE" },
