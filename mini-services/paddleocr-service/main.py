@@ -288,7 +288,7 @@ def _run_ocr_on_image(img):
                 text = texts[k] if k < len(texts) else ''
                 confidence = float(scores[k]) if k < len(scores) else 0.0
                 poly = polys[k] if k < len(polys) else []
-                if not poly:
+                if not isinstance(poly, (list, tuple)) or len(poly) == 0:
                     continue
                 xs = [pt[0] for pt in poly]
                 ys = [pt[1] for pt in poly]
