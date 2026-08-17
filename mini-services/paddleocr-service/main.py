@@ -8,15 +8,13 @@ from speech bubbles and captions.
 Port: 3002
 """
 
-from __future__ import annotations
-
 import base64
 import io
 import logging
 import os
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import uvicorn
@@ -39,16 +37,16 @@ logger = logging.getLogger("paddleocr-service")
 # PaddleOCR initialisation (warm-start — loaded once at import time)
 # ---------------------------------------------------------------------------
 
-ocr: Any = None
-MODEL_NAME: str = "unknown"
-MODEL_READY: bool = False
+ocr = None  # type: Any
+MODEL_NAME = "unknown"  # type: str
+MODEL_READY = False  # type: bool
 
 
-def _init_ocr() -> None:
+def _init_ocr():
+    # type: () -> None
     """Attempt to initialise PaddleOCR PP-OCRv5, falling back to PP-OCRv4."""
     global ocr, MODEL_NAME, MODEL_READY
 
-    # Try PP-OCRv5 first (+13% accuracy over v4)
     try:
         from paddleocr import PaddleOCR
 
@@ -97,35 +95,36 @@ app = FastAPI(
 
 class OCRErrorInfo(BaseModel):
     """Per-image error details when a single image in a batch fails."""
-    index: int
-    path: str
-    error: str
+    index = 0
+    path = ""
+    error = ""
 
 
 class OCRResult(BaseModel):
     """OCR output for a single image."""
-    index: int
-    text: str
-    confidence: float
-    regions: int
+    index = 0
+    text = ""
+    confidence = 0.0
+    regions = 0
 
 
 class OCROptions(BaseModel):
     """Optional per-request OCR tuning parameters."""
-    lang: str = Field(default="en", description="Language code (e.g. 'en', 'ch', 'japan', 'korean')")
+    lang: str = Field(default="en", description="Language code")
     use_angle_cls: bool = Field(default=True, description="Enable text orientation classification")
     det_db_unclip_ratio: float = Field(
         default=1.8,
         ge=0.5,
         le=3.0,
-        description="Unclip ratio for DB detector. Higher values better capture rounded speech bubbles.",
+        description="Unclip ratio for DB detector.",
     )
 
 
 class BatchOCRRequest(BaseModel):
     """Request body for batch OCR over file paths."""
-    images: list[str] = Field(
-        ..., description="List of absolute file paths to images on this machine.",
+    images: List[str] = Field(
+        ...,
+        description="List of absolute file paths to images on this machine.",
         min_length=1,
         max_length=500,
     )
@@ -134,7 +133,7 @@ class BatchOCRRequest(BaseModel):
 
 class BatchOCRResponse(BaseModel):
     """Response for batch OCR."""
-    results: list[OCRResult]
+    results: List[OCRResult]
     model: str
     processing_time_ms: float
 
@@ -178,56 +177,43 @@ class HealthResponse(BaseModel):
 @dataclass
 class _TextRegion:
     """A single detected text region with position metadata."""
-    text: str
-    confidence: float
-    # Bounding-box top-left coordinates for reading-order sorting
-    x_min: float
-    y_min: float
-    y_max: float
-    x_max: float
+    text = ""  # type: str
+    confidence = 0.0  # type: float
+    x_min = 0.0  # type: float
+    y_min = 0.0  # type: float
+    y_max = 0.0  # type: float
+    x_max = 0.0  # type: float
 
 
-def _sort_regions_reading_order(regions: list[_TextRegion]) -> list[_TextRegion]:
-    """Sort detected text regions in natural reading order.
-
-    Strategy:
-    1. Sort primarily by vertical position (y_min — top-to-bottom).
-    2. Within the same vertical band (±20% of mean line height),
-       sort left-to-right by x_min.
-    """
+def _sort_regions_reading_order(regions):
+    # type: (List[_TextRegion]) -> List[_TextRegion]
+    """Sort detected text regions in natural reading order."""
     if not regions:
         return regions
 
-    # Compute a reasonable "line height" threshold from the data itself.
     heights = [r.y_max - r.y_min for r in regions]
     mean_height = sum(heights) / len(heights) if heights else 20.0
-    vertical_tolerance = max(mean_height * 0.4, 10.0)  # 40% of mean height, min 10px
+    vertical_tolerance = max(mean_height * 0.4, 10.0)
 
-    def _sort_key(r: _TextRegion) -> tuple[float, float]:
-        # Bucket y into discrete rows
+    def _sort_key(r):
         row = r.y_min // vertical_tolerance
         return (row, r.x_min)
 
     return sorted(regions, key=_sort_key)
 
 
-def _merge_regions(regions: list[_TextRegion]) -> tuple[str, float, int]:
-    """Merge sorted text regions into a single coherent string.
-
-    Regions on different vertical lines are separated by newlines.
-    Regions on the same line are joined with spaces.
-    """
+def _merge_regions(regions):
+    # type: (List[_TextRegion]) -> Tuple[str, float, int]
+    """Merge sorted text regions into a single coherent string."""
     if not regions:
         return "", 0.0, 0
 
     sorted_regions = _sort_regions_reading_order(regions)
 
-    lines: list[list[_TextRegion]] = []
-    current_line: list[_TextRegion] = [sorted_regions[0]]
+    lines = []  # type: List[List[_TextRegion]]
+    current_line = [sorted_regions[0]]  # type: List[_TextRegion]
 
     for region in sorted_regions[1:]:
-        # If this region starts at roughly the same vertical position as the
-        # last region in the current line, treat it as part of the same line.
         prev = current_line[-1]
         vertical_gap = abs(region.y_min - prev.y_min)
         mean_h = (region.y_max - region.y_min + prev.y_max - prev.y_min) / 2
@@ -239,14 +225,12 @@ def _merge_regions(regions: list[_TextRegion]) -> tuple[str, float, int]:
             lines.append(current_line)
             current_line = [region]
 
-    lines.append(current_line)  # don't forget the last line
+    lines.append(current_line)
 
-    # Build the final text
-    text_parts: list[str] = []
-    all_confidences: list[float] = []
+    text_parts = []  # type: List[str]
+    all_confidences = []  # type: List[float]
 
     for line in lines:
-        # Sort each line left-to-right
         line_sorted = sorted(line, key=lambda r: r.x_min)
         line_text = " ".join(r.text.strip() for r in line_sorted if r.text.strip())
         if line_text:
@@ -261,9 +245,8 @@ def _merge_regions(regions: list[_TextRegion]) -> tuple[str, float, int]:
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
 
 
-def _run_ocr_on_image(
-    img: np.ndarray,
-) -> list[_TextRegion]:
+def _run_ocr_on_image(img):
+    # type: (np.ndarray) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
     global ocr
     if ocr is None:
@@ -275,11 +258,8 @@ def _run_ocr_on_image(
         logger.warning("OCR inference failed: %s", exc)
         return []
 
-    regions: list[_TextRegion] = []
+    regions = []  # type: List[_TextRegion]
 
-    # PaddleOCR returns: list[page_results] where each page_result is
-    # a list of (bbox, (text, confidence)) tuples.
-    # bbox is [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
     if not raw_result:
         return regions
 
@@ -289,13 +269,12 @@ def _run_ocr_on_image(
         for line in page:
             if len(line) < 2:
                 continue
-            bbox = line[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-            text_info = line[1]  # (text, confidence)
+            bbox = line[0]
+            text_info = line[1]
 
             text = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
             confidence = float(text_info[1]) if isinstance(text_info, (list, tuple)) and len(text_info) > 1 else 0.0
 
-            # Extract bounding box coordinates
             xs = [pt[0] for pt in bbox]
             ys = [pt[1] for pt in bbox]
 
@@ -313,7 +292,8 @@ def _run_ocr_on_image(
     return regions
 
 
-def _load_image_from_path(file_path: str) -> Optional[np.ndarray]:
+def _load_image_from_path(file_path):
+    # type: (str) -> Optional[np.ndarray]
     """Load an image from an absolute file path into a numpy array."""
     if not os.path.isfile(file_path):
         logger.warning("Image file not found: %s", file_path)
@@ -326,10 +306,10 @@ def _load_image_from_path(file_path: str) -> Optional[np.ndarray]:
         return None
 
 
-def _decode_base64_image(b64_string: str) -> Optional[np.ndarray]:
+def _decode_base64_image(b64_string):
+    # type: (str) -> Optional[np.ndarray]
     """Decode a base64 string (with optional data-URI prefix) into a numpy array."""
     try:
-        # Strip data-URI prefix if present
         if "," in b64_string and ";base64," in b64_string:
             b64_string = b64_string.split(";base64,", 1)[1]
 
@@ -361,16 +341,12 @@ async def ocr_batch(request: BatchOCRRequest):
     """
     Accepts a list of absolute file paths to images.
     Returns an array of {index, text, confidence, regions} objects.
-
-    Uses PaddleOCR to extract text from each image.
-    For manhwa/manga, text is extracted from speech bubbles and captions.
-    The results are ordered by reading position (top-to-bottom, left-to-right).
     """
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="OCR model not initialised")
 
     t_start = time.perf_counter()
-    results: list[OCRResult] = []
+    results = []  # type: List[OCRResult]
 
     for idx, img_path in enumerate(request.images):
         img_array = _load_image_from_path(img_path)
@@ -410,9 +386,6 @@ async def ocr_batch(request: BatchOCRRequest):
 async def ocr_base64(request: Base64OCRRequest):
     """
     Accepts a single base64-encoded image and returns OCR transcription.
-
-    The image string may include a data-URI prefix (e.g. "data:image/png;base64,...")
-    which will be stripped automatically.
     """
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="OCR model not initialised")
@@ -447,8 +420,6 @@ async def ocr_base64(request: Base64OCRRequest):
 async def ocr_single(request: Base64OCRRequest):
     """
     Legacy single-image OCR endpoint.
-    Accepts a single base64-encoded image and returns transcription text.
-    Alias for /ocr/base64 with a slightly different response shape.
     """
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="OCR model not initialised")
@@ -484,5 +455,5 @@ async def ocr_single(request: Base64OCRRequest):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logger.info("Starting PaddleOCR service on port 3002 …")
+    logger.info("Starting PaddleOCR service on port 3002 ...")
     uvicorn.run(app, host="0.0.0.0", port=3002, workers=1)
