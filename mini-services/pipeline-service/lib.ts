@@ -1079,13 +1079,13 @@ export async function generateImageNarrations(
   // transcription time ~4-5x. Configurable via VLM_CONCURRENCY env var
   // (default 4). Each batch writes to disjoint indices in the results array
   // so there are no race conditions. If a batch call fails or returns
-  // BATCH_SIZE: number of panel images sent per VLM API call.
-  // 6 is the sweet spot — large enough to reduce API calls, small enough to
-  // avoid token-limit truncation and keep response times reasonable.
-  // In low-mem mode (VLM_CONCURRENCY=1), reduced to 3 since each child
-  // process loads all images into memory.
   const LOW_MEM = process.env.VLM_LOW_MEM === '1' || process.env.VLM_CONCURRENCY === '1'
-  const BATCH_SIZE = LOW_MEM ? 3 : 6
+  // BATCH_SIZE: number of panel images sent per VLM API call.
+  // 3 is the safe default — smaller batches mean less chance of a
+  // skipped-panel shift, and cheaper to detect if it still happens.
+  // Previously 6 (3 in LOW_MEM) — too large, a single mis-ordered index
+  // silently displaced the rest of the batch.
+  const BATCH_SIZE = 3
   // Concurrency: batches at a time. In low-mem mode, force 1.
   const CONCURRENCY = Math.max(
     1,
@@ -2414,16 +2414,34 @@ function parseBatchResponse(raw: string, expectedCount: number): string[] {
     throw new Error('VLM batch response is not a JSON array')
   }
 
+  // ── Sanity check: length mismatch ──
+  // This alone catches the skipped-panel shift bug immediately.
+  // If the VLM drops or duplicates an item, we log it rather than
+  // silently filling gaps with empty text.
+  if (parsed.length !== expectedCount) {
+    console.warn(
+      `[VLM] parseBatchResponse WARNING: parsed ${parsed.length} items but expected ${expectedCount}. ` +
+      `Possible skipped/duplicate panel — ${expectedCount - parsed.length > 0 ? `${expectedCount - parsed.length} panel(s) will be silent` : 'extra items will be dropped'}.`,
+    )
+  }
+
   const texts: string[] = new Array(expectedCount).fill('')
   for (let i = 0; i < parsed.length && i < expectedCount; i++) {
     const item = parsed[i]
     if (typeof item === 'object' && item !== null) {
       const obj = item as { index?: number; text?: string }
       const text = typeof obj.text === 'string' ? obj.text : ''
-      const idx = typeof obj.index === 'number' ? obj.index - 1 : i
+      // VLM returns 1-based index per the prompt ("Panel 1 through Panel N")
+      // Clamp 0-based: if index is already 0-based, keep it; if 1-based, subtract 1.
+      const idx = typeof obj.index === 'number'
+        ? (obj.index >= 1 ? obj.index - 1 : obj.index)
+        : i
       if (idx >= 0 && idx < expectedCount) {
         texts[idx] = text
       } else {
+        console.warn(
+          `[VLM] parseBatchResponse: out-of-range index ${obj.index} (valid 0-${expectedCount - 1}), placing at position ${i}`,
+        )
         texts[i] = text
       }
     } else if (typeof item === 'string') {

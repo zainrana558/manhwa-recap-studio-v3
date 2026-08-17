@@ -46,15 +46,51 @@ async function setVlmCached(key: string, text: string): Promise<void> {
 
 function parseBatchResponse(raw: string, expectedCount: number): string[] {
   const jsonMatch = raw.match(/\[[\s\S]*?\]/)
-  if (!jsonMatch) return Array(expectedCount).fill('')
+  if (!jsonMatch) {
+    process.stderr.write(`[vlm-worker] no JSON array in response (expected ${expectedCount})\n`)
+    return Array(expectedCount).fill('')
+  }
   try {
     const parsed = JSON.parse(jsonMatch[0])
     if (!Array.isArray(parsed)) return Array(expectedCount).fill('')
-    return parsed.map((item: any) => {
-      if (typeof item === 'string') return item
-      if (item?.text !== undefined) return String(item.text)
-      return ''
-    })
+
+    // ── Sanity check: length mismatch ──
+    if (parsed.length !== expectedCount) {
+      process.stderr.write(
+        `[vlm-worker] WARNING: parsed ${parsed.length} items but expected ${expectedCount}. ` +
+        `Possible skipped panel — filling gaps with empty text.\n`,
+      )
+    }
+
+    // ── Index-aware placement ──
+    // The VLM prompt requests {"index": 1, "text": "..."} (1-based).
+    // Map by index when available, fall back to array position.
+    // BUG FIX: previous version ignored index entirely, causing silent
+    // panel shifts when the VLM returned items out of order.
+    const texts: string[] = new Array(expectedCount).fill('')
+    for (let i = 0; i < parsed.length && i < expectedCount; i++) {
+      const item = parsed[i]
+      if (typeof item === 'string') {
+        texts[i] = item
+      } else if (typeof item === 'object' && item !== null) {
+        const text = typeof item.text === 'string' ? item.text : ''
+        // VLM returns 1-based index per the prompt ("Panel 1 through Panel N")
+        if (typeof item.index === 'number') {
+          const idx = item.index >= 1 ? item.index - 1 : item.index
+          if (idx >= 0 && idx < expectedCount) {
+            texts[idx] = text
+          } else {
+            process.stderr.write(
+              `[vlm-worker] WARNING: out-of-range index ${item.index} (valid: 0-${expectedCount - 1}), placing at position ${i}\n`,
+            )
+            texts[i] = text
+          }
+        } else {
+          texts[i] = text
+        }
+      }
+    }
+    return texts
   } catch {
     return Array(expectedCount).fill('')
   }
