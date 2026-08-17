@@ -255,7 +255,15 @@ def _run_ocr_on_image(img):
         return []
 
     try:
-        raw_result = ocr.ocr(img, cls=True)
+        # PaddleOCR v3.7+ uses predict(); older versions use ocr()
+        raw_result = ocr.predict(img)
+    except TypeError:
+        # Fallback for older PaddleOCR that uses ocr()
+        try:
+            raw_result = ocr.ocr(img)
+        except Exception as exc:
+            logger.warning("OCR inference failed: %s", exc)
+            return []
     except Exception as exc:
         logger.warning("OCR inference failed: %s", exc)
         return []
@@ -265,31 +273,50 @@ def _run_ocr_on_image(img):
     if not raw_result:
         return regions
 
-    for page in raw_result:
-        if page is None:
+    # Handle both old format (list of pages) and new PaddleX format (PipelineResult)
+    for item in raw_result:
+        # Skip non-dict/non-list items
+        if item is None:
             continue
-        for line in page:
-            if len(line) < 2:
-                continue
-            bbox = line[0]
-            text_info = line[1]
 
-            text = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
-            confidence = float(text_info[1]) if isinstance(text_info, (list, tuple)) and len(text_info) > 1 else 0.0
+        # --- New PaddleX v3.7 format: dict with rec_texts, rec_scores, dt_polys ---
+        if isinstance(item, dict):
+            texts = item.get('rec_texts', [])
+            scores = item.get('rec_scores', [])
+            polys = item.get('dt_polys', [])
+            for k in range(len(texts)):
+                text = texts[k] if k < len(texts) else ''
+                confidence = float(scores[k]) if k < len(scores) else 0.0
+                poly = polys[k] if k < len(polys) else []
+                if not poly:
+                    continue
+                xs = [pt[0] for pt in poly]
+                ys = [pt[1] for pt in poly]
+                regions.append(_TextRegion(
+                    text=str(text),
+                    confidence=confidence,
+                    x_min=min(xs), y_min=min(ys),
+                    y_max=max(ys), x_max=max(xs),
+                ))
+            continue
 
-            xs = [pt[0] for pt in bbox]
-            ys = [pt[1] for pt in bbox]
-
-            regions.append(
-                _TextRegion(
+        # --- Old format: list of pages, each page is list of (bbox, (text, conf)) ---
+        if isinstance(item, list):
+            for line in item:
+                if not isinstance(line, (list, tuple)) or len(line) < 2:
+                    continue
+                bbox = line[0]
+                text_info = line[1]
+                text = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
+                confidence = float(text_info[1]) if isinstance(text_info, (list, tuple)) and len(text_info) > 1 else 0.0
+                xs = [pt[0] for pt in bbox]
+                ys = [pt[1] for pt in bbox]
+                regions.append(_TextRegion(
                     text=text,
                     confidence=confidence,
-                    x_min=min(xs),
-                    y_min=min(ys),
-                    y_max=max(ys),
-                    x_max=max(xs),
-                )
-            )
+                    x_min=min(xs), y_min=min(ys),
+                    y_max=max(ys), x_max=max(xs),
+                ))
 
     return regions
 
