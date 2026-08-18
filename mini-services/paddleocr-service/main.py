@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -254,11 +254,14 @@ def _run_ocr_on_image(img):
     if ocr is None:
         return []
 
+    # One-time debug flag to dump result structure
+    if not hasattr(_run_ocr_on_image, '_debugged'):
+        _run_ocr_on_image._debugged = False  # type: ignore
+
     try:
         # PaddleOCR v3.7+ uses predict(); older versions use ocr()
         raw_result = ocr.predict(img)
     except TypeError:
-        # Fallback for older PaddleOCR that uses ocr()
         try:
             raw_result = ocr.ocr(img)
         except Exception as exc:
@@ -273,27 +276,88 @@ def _run_ocr_on_image(img):
     if not raw_result:
         return regions
 
-    # Handle both old format (list of pages) and new PaddleX format (PipelineResult)
+    # Convert generator to list
+    if not isinstance(raw_result, list):
+        try:
+            raw_result = list(raw_result)
+        except Exception:
+            pass
+
     for item in raw_result:
-        # Skip non-dict/non-list items
         if item is None:
             continue
 
-        # --- New PaddleX v3.7 format: dict with rec_texts, rec_scores, dt_polys ---
-        if isinstance(item, dict):
-            texts = item.get('rec_texts', [])
-            scores = item.get('rec_scores', [])
-            polys = item.get('dt_polys', [])
+        # --- Debug: dump first result structure ---
+        if not _run_ocr_on_image._debugged:  # type: ignore
+            _run_ocr_on_image._debugged = True  # type: ignore
+            logger.info("[DEBUG] result item type: %s", type(item).__name__)
+            if hasattr(item, 'keys'):
+                try:
+                    logger.info("[DEBUG] result item keys: %s", list(item.keys()))  # type: ignore
+                except Exception:
+                    pass
+            if hasattr(item, '__dict__'):
+                logger.info("[DEBUG] result item attrs: %s", list(item.__dict__.keys()))
+
+        # --- PaddleX PipelineResult: has .keys() or dict-like access ---
+        # Try to extract data from dict-like objects (PipelineResult, dict, etc.)
+        extracted = None  # type: Optional[dict]
+
+        if hasattr(item, 'keys') or hasattr(item, 'get'):
+            try:
+                extracted = dict(item) if not isinstance(item, dict) else item
+            except Exception:
+                try:
+                    extracted = {k: item[k] for k in item.keys()}  # type: ignore
+                except Exception:
+                    pass
+
+        if extracted:
+            # PaddleX wraps results in 'output' key
+            data = extracted.get('output', extracted)
+
+            # Try various key naming conventions
+            texts = None  # type: Optional[list]
+            scores = None  # type: Optional[list]
+            polys = None  # type: Optional[list]
+
+            for tk in ('rec_texts', 'rec_text', 'texts', 'text'):
+                if tk in data:
+                    texts = data[tk]
+                    break
+            for sk in ('rec_scores', 'rec_score', 'scores', 'score', 'confs'):
+                if sk in data:
+                    scores = data[sk]
+                    break
+            for pk in ('dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
+                if pk in data:
+                    polys = data[pk]
+                    break
+
+            if texts is None:
+                # Debug: log available keys so we can fix
+                logger.debug("OCR result keys: %s", list(data.keys()) if hasattr(data, 'keys') else type(data))
+                continue
+
+            texts = list(texts) if not isinstance(texts, list) else texts
+            scores = list(scores) if scores and not isinstance(scores, list) else (scores or [])
+            polys = list(polys) if polys and not isinstance(polys, list) else (polys or [])
+
             for k in range(len(texts)):
-                text = texts[k] if k < len(texts) else ''
+                text = str(texts[k]) if k < len(texts) else ''
                 confidence = float(scores[k]) if k < len(scores) else 0.0
-                poly = polys[k] if k < len(polys) else []
+                poly = polys[k] if k < len(polys) else None
+                if poly is None:
+                    continue
+                # Handle numpy arrays for polys
+                if hasattr(poly, 'tolist'):
+                    poly = poly.tolist()
                 if not isinstance(poly, (list, tuple)) or len(poly) == 0:
                     continue
-                xs = [pt[0] for pt in poly]
-                ys = [pt[1] for pt in poly]
+                xs = [float(pt[0]) for pt in poly]
+                ys = [float(pt[1]) for pt in poly]
                 regions.append(_TextRegion(
-                    text=str(text),
+                    text=text,
                     confidence=confidence,
                     x_min=min(xs), y_min=min(ys),
                     y_max=max(ys), x_max=max(xs),
