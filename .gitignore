@@ -74,3 +74,4 @@ pipeline/__pycache__/
 
 # Log directory (created by setup.sh tmux fallback)
 logs/
+*.pyc
