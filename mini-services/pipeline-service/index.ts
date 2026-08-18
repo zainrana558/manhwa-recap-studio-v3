@@ -979,20 +979,47 @@ async function processJob(jobId: string): Promise<void> {
         // ── PRIMARY: PaddleOCR PP-OCRv5 (fast, local, no API keys) ──
         await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with PaddleOCR ${ocrModelName}...`)
         try {
-          rawNarrations = await generateImageNarrationsOCR(imageFiles, (done, total) => {
+          const ocrOutcome = await generateImageNarrationsOCR(imageFiles, (done, total) => {
             void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} OCR'd`)
           })
+          rawNarrations = ocrOutcome.results
           usedMethod = `PaddleOCR ${ocrModelName}`
 
-          // Check if OCR returned mostly empty results (low quality / wrong language).
-          // If >80% of panels are empty, fall back to VLM for better coverage.
           const emptyCount = rawNarrations.filter((n) => !n.text.trim()).length
           const emptyRatio = emptyCount / rawNarrations.length
-          if (emptyRatio > 0.8 && rawNarrations.length > 3) {
+
+          // Genuine OCR failure signals — worth falling back to VLM for:
+          //  1. The service call itself errored (network/service down).
+          //  2. The text DETECTOR never fired once across the whole chapter
+          //     (totalRegionsDetected === 0) despite processing panels.
+          //     This is what a broken model/init/preprocessing bug looks
+          //     like — not just "few panels have dialogue".
+          // A high empty-text ratio ALONE is explicitly NOT treated as
+          // failure: manhwa/manhua chapters are often mostly action,
+          // establishing, or transition panels with no bubbles at all, so
+          // 80%+ silent panels is frequently correct output, not broken OCR.
+          const { totalRegionsDetected, batchCallFailures, freshlyProcessed } = ocrOutcome.stats
+          const detectorNeverFired = freshlyProcessed > 3 && totalRegionsDetected === 0
+
+          if (batchCallFailures > 0) {
             await emitLog(jobId, 'warn', 'transcribe',
-              `Chapter ${ch.index}: OCR returned ${emptyCount}/${rawNarrations.length} empty panels (${Math.round(emptyRatio * 100)}%) — falling back to VLM for this chapter`,
+              `Chapter ${ch.index}: PaddleOCR service call failed ${batchCallFailures}x — falling back to VLM for this chapter`,
             )
-            throw new Error(`OCR empty ratio too high: ${Math.round(emptyRatio * 100)}%`)
+            throw new Error(`OCR service unreachable/erroring (${batchCallFailures} batch failures)`)
+          }
+          if (detectorNeverFired) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: PaddleOCR detected zero text regions across ${freshlyProcessed} panels — likely a broken OCR pipeline, not just silent panels. Falling back to VLM.`,
+            )
+            throw new Error(`OCR detector never fired across ${freshlyProcessed} panels`)
+          }
+          if (emptyRatio > 0.8 && rawNarrations.length > 3) {
+            // Informational only — do NOT throw / fall back to VLM. The
+            // detector did fire (totalRegionsDetected > 0), so this is most
+            // likely a genuinely quiet chapter, not a broken pipeline.
+            await emitLog(jobId, 'info', 'transcribe',
+              `Chapter ${ch.index}: ${emptyCount}/${rawNarrations.length} panels (${Math.round(emptyRatio * 100)}%) have no dialogue — this is normal for action-heavy chapters. OCR detector is active (${totalRegionsDetected} regions found), keeping PaddleOCR results.`,
+            )
           }
         } catch (ocrErr) {
           // OCR failed or returned poor results — fall back to VLM for this chapter.

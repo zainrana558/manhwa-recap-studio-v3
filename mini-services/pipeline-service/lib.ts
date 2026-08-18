@@ -937,19 +937,34 @@ async function setOcrCached(key: string, text: string): Promise<void> {
  *
  * @param imagePaths - Absolute paths to panel/page images
  * @param onProgress - Optional callback (done, total) for progress tracking
- * @returns Array of { image, text } in the same order as imagePaths
+ * @returns { results, stats } — results in the same order as imagePaths;
+ *   stats reports whether the detector ever actually fired, distinct from
+ *   how many panels simply have no dialogue.
  * @throws Error if the PaddleOCR service is unreachable or returns an error
  */
 export async function generateImageNarrationsOCR(
   imagePaths: string[],
   onProgress?: (done: number, total: number) => void,
-): Promise<Array<{ image: string; text: string }>> {
-  if (imagePaths.length === 0) return []
+): Promise<{
+  results: Array<{ image: string; text: string }>
+  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number }
+}> {
+  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0 } }
 
   const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
   const OCR_BATCH_SIZE = 20 // PaddleOCR is fast on CPU; larger batches reduce HTTP overhead
   const results: Array<{ image: string; text: string }> = new Array(imagePaths.length)
   let completedCount = 0
+  // Tracked separately from "empty text ratio" — manhwa/manhua panels are
+  // frequently text-free by design (action beats, establishing shots,
+  // transitions), so a high empty-text ratio is often CORRECT output, not
+  // a failure. What actually indicates a broken OCR pipeline (bad model
+  // init, doc-preprocessing distortion, wrong image format, etc.) is the
+  // TEXT DETECTOR never firing at all across an entire chapter — i.e.
+  // totalRegionsDetected stays at 0 even though panels were processed.
+  let totalRegionsDetected = 0
+  let batchCallFailures = 0
+  let freshlyProcessed = 0
 
   // Process in batches
   for (let i = 0; i < imagePaths.length; i += OCR_BATCH_SIZE) {
@@ -965,6 +980,9 @@ export async function generateImageNarrationsOCR(
       const cached = await getOcrCached(cacheKey)
       if (cached !== null) {
         results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached }
+        // Cached non-empty text is itself evidence the detector fired at
+        // some point in the past — count it toward the "detector works" signal.
+        if (cached.trim()) totalRegionsDetected += 1
         completedCount++
       } else {
         uncachedIndices.push(j)
@@ -1000,8 +1018,11 @@ export async function generateImageNarrationsOCR(
       }
 
       const elapsed = Date.now() - t0
+      const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
+      totalRegionsDetected += batchRegions
+      freshlyProcessed += data.results.length
       console.log(
-        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model})`,
+        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected`,
       )
 
       // Map results back to the correct positions in the results array
@@ -1026,6 +1047,7 @@ export async function generateImageNarrationsOCR(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.warn(`[OCR] Batch failed: ${msg.slice(0, 200)}`)
+      batchCallFailures++
       // Fill remaining uncached results with empty text
       for (let j = 0; j < uncachedIndices.length; j++) {
         const globalIdx = startIdx + uncachedIndices[j]
@@ -1041,7 +1063,7 @@ export async function generateImageNarrationsOCR(
     onProgress?.(completedCount, imagePaths.length)
   }
 
-  return results
+  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed } }
 }
 
 // ---------------------------------------------------------------------------
