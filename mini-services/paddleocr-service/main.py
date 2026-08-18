@@ -329,7 +329,7 @@ def _run_ocr_on_image(img):
                 if sk in data:
                     scores = data[sk]
                     break
-            for pk in ('dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
+            for pk in ('rec_polys', 'dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
                 if pk in data:
                     polys = data[pk]
                     break
