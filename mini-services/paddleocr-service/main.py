@@ -299,70 +299,75 @@ def _run_ocr_on_image(img):
             if hasattr(item, '__dict__'):
                 logger.info("[DEBUG] result item attrs: %s", list(item.__dict__.keys()))
 
-        # --- PaddleX PipelineResult: has .keys() or dict-like access ---
-        # Try to extract data from dict-like objects (PipelineResult, dict, etc.)
-        extracted = None  # type: Optional[dict]
-
-        if hasattr(item, 'keys') or hasattr(item, 'get'):
+        # --- PaddleX PipelineResult / OCRResult: supports item[key] access ---
+        if hasattr(item, 'keys'):
+            # Try direct key access (works for OCRResult, PipelineResult, dict)
+            all_keys = []  # type: List[str]
             try:
-                extracted = dict(item) if not isinstance(item, dict) else item
+                all_keys = list(item.keys())  # type: ignore
             except Exception:
-                try:
-                    extracted = {k: item[k] for k in item.keys()}  # type: ignore
-                except Exception:
-                    pass
+                pass
 
-        if extracted:
-            # PaddleX wraps results in 'output' key
-            data = extracted.get('output', extracted)
+            if all_keys:
+                # Find the right key names
+                texts = None  # type: Optional[list]
+                scores = None  # type: Optional[list]
+                polys = None  # type: Optional[list]
 
-            # Try various key naming conventions
-            texts = None  # type: Optional[list]
-            scores = None  # type: Optional[list]
-            polys = None  # type: Optional[list]
+                for tk in ('rec_texts', 'rec_text', 'texts', 'text'):
+                    if tk in all_keys:
+                        try:
+                            texts = item[tk]  # type: ignore
+                        except Exception:
+                            pass
+                        if texts is not None:
+                            break
+                for sk in ('rec_scores', 'rec_score', 'scores', 'score', 'confs'):
+                    if sk in all_keys:
+                        try:
+                            scores = item[sk]  # type: ignore
+                        except Exception:
+                            pass
+                        if scores is not None:
+                            break
+                for pk in ('rec_polys', 'dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
+                    if pk in all_keys:
+                        try:
+                            polys = item[pk]  # type: ignore
+                        except Exception:
+                            pass
+                        if polys is not None:
+                            break
 
-            for tk in ('rec_texts', 'rec_text', 'texts', 'text'):
-                if tk in data:
-                    texts = data[tk]
-                    break
-            for sk in ('rec_scores', 'rec_score', 'scores', 'score', 'confs'):
-                if sk in data:
-                    scores = data[sk]
-                    break
-            for pk in ('rec_polys', 'dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
-                if pk in data:
-                    polys = data[pk]
-                    break
+                if texts is not None:
+                    texts = list(texts) if not isinstance(texts, list) else texts
+                    scores = list(scores) if scores and not isinstance(scores, list) else (scores or [])
+                    polys = list(polys) if polys and not isinstance(polys, list) else (polys or [])
 
-            if texts is None:
-                # Debug: log available keys so we can fix
-                logger.debug("OCR result keys: %s", list(data.keys()) if hasattr(data, 'keys') else type(data))
-                continue
+                    logger.info("[OCR] Extracted %d texts, %d scores, %d polys from OCRResult", len(texts), len(scores), len(polys))
 
-            texts = list(texts) if not isinstance(texts, list) else texts
-            scores = list(scores) if scores and not isinstance(scores, list) else (scores or [])
-            polys = list(polys) if polys and not isinstance(polys, list) else (polys or [])
-
-            for k in range(len(texts)):
-                text = str(texts[k]) if k < len(texts) else ''
-                confidence = float(scores[k]) if k < len(scores) else 0.0
-                poly = polys[k] if k < len(polys) else None
-                if poly is None:
+                    for k in range(len(texts)):
+                        text = str(texts[k]) if k < len(texts) else ''
+                        confidence = float(scores[k]) if k < len(scores) else 0.0
+                        poly = polys[k] if k < len(polys) else None
+                        if poly is None:
+                            continue
+                        if hasattr(poly, 'tolist'):
+                            poly = poly.tolist()
+                        if not isinstance(poly, (list, tuple)) or len(poly) == 0:
+                            continue
+                        xs = [float(pt[0]) for pt in poly]
+                        ys = [float(pt[1]) for pt in poly]
+                        regions.append(_TextRegion(
+                            text=text,
+                            confidence=confidence,
+                            x_min=min(xs), y_min=min(ys),
+                            y_max=max(ys), x_max=max(xs),
+                        ))
                     continue
-                # Handle numpy arrays for polys
-                if hasattr(poly, 'tolist'):
-                    poly = poly.tolist()
-                if not isinstance(poly, (list, tuple)) or len(poly) == 0:
-                    continue
-                xs = [float(pt[0]) for pt in poly]
-                ys = [float(pt[1]) for pt in poly]
-                regions.append(_TextRegion(
-                    text=text,
-                    confidence=confidence,
-                    x_min=min(xs), y_min=min(ys),
-                    y_max=max(ys), x_max=max(xs),
-                ))
-            continue
+
+                # If we had keys but no texts, log for debug
+                logger.warning("[OCR] OCRResult had keys %s but no rec_texts found", all_keys)
 
         # --- Old format: list of pages, each page is list of (bbox, (text, conf)) ---
         if isinstance(item, list):
