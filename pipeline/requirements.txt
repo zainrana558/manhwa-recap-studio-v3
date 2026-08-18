@@ -1,14 +1,17 @@
-edge-tts>=7.2.8
-openai>=2.49.0
-Pillow>=11.3.0
-opencv-python>=4.13.0
-numpy>=2.1.0
+# Compatible-release pins (~=) instead of open-ended >= — allows patch
+# updates but blocks the unannounced major-version jumps that broke the
+# PaddleOCR integration repeatedly (see mini-services/paddleocr-service).
+edge-tts~=7.2.8
+openai~=2.49.0
+Pillow~=11.3.0
+opencv-python~=4.13.0
+numpy~=2.1.0
 # NOTE: torch/torchvision are installed SEPARATELY by setup.sh via
 # --index-url https://download.pytorch.org/whl/cpu (CPU-only build).
 # The versions below just record the minimum — pip will skip them
 # if the CPU build already satisfies the constraint.
 # Do NOT add --extra-index-url here or pip may pull a GPU build.
-torch>=2.0.0
-torchvision>=0.15.0
-ultralytics>=8.0.0
-huggingface-hub>=0.20.0
+torch>=2.0.0,<3.0.0
+torchvision>=0.15.0,<1.0.0
+ultralytics~=8.0
+huggingface-hub~=0.20

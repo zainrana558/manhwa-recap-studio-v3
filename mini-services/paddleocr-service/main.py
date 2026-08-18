@@ -44,38 +44,82 @@ MODEL_READY = False  # type: bool
 
 def _init_ocr():
     # type: () -> None
-    """Attempt to initialise PaddleOCR PP-OCRv5, falling back to PP-OCRv4."""
+    """Attempt to initialise PaddleOCR PP-OCRv5, falling back to PP-OCRv4.
+
+    Retries each version a few times with a short delay before giving up —
+    first-run model downloads (from HuggingFace/ModelScope/AIStudio/BOS) can
+    hit transient network blips on cloud boxes with flaky egress, and a
+    single failed attempt used to permanently mark the service unavailable
+    for the rest of the process lifetime (every job would then silently fall
+    through to VLM until the service was manually restarted).
+    """
     global ocr, MODEL_NAME, MODEL_READY
 
-    try:
-        from paddleocr import PaddleOCR
+    # Skip the AIStudio connectivity pre-check (adds a slow round-trip and
+    # can itself fail on restrictive egress even when the actual download
+    # host is reachable) — let the real download attempt be the test.
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
-        ocr = PaddleOCR(
-            ocr_version="PP-OCRv5",
-            lang="en",
-        )
+    MODEL_INIT_RETRIES = 3
+    RETRY_DELAY_SEC = 10
+
+    def _try_init(ocr_version):
+        # type: (str) -> Any
+        from paddleocr import PaddleOCR
+        last_exc = None  # type: Optional[Exception]
+        for attempt in range(1, MODEL_INIT_RETRIES + 1):
+            try:
+                return PaddleOCR(ocr_version=ocr_version, lang="en")
+            except Exception as exc:
+                last_exc = exc
+                if attempt < MODEL_INIT_RETRIES:
+                    logger.warning(
+                        "%s init attempt %d/%d failed (%s) — retrying in %ds",
+                        ocr_version, attempt, MODEL_INIT_RETRIES, exc, RETRY_DELAY_SEC,
+                    )
+                    time.sleep(RETRY_DELAY_SEC)
+        raise last_exc  # type: ignore
+
+    try:
+        ocr = _try_init("PP-OCRv5")
         MODEL_NAME = "PP-OCRv5"
         MODEL_READY = True
         logger.info("PaddleOCR PP-OCRv5 initialised successfully")
     except Exception as exc_v5:
-        logger.warning("PP-OCRv5 init failed (%s), falling back to PP-OCRv4", exc_v5)
+        logger.warning("PP-OCRv5 init failed after retries (%s), falling back to PP-OCRv4", exc_v5)
         try:
-            from paddleocr import PaddleOCR
-
-            ocr = PaddleOCR(
-                ocr_version="PP-OCRv4",
-                lang="en",
-            )
+            ocr = _try_init("PP-OCRv4")
             MODEL_NAME = "PP-OCRv4"
             MODEL_READY = True
             logger.info("PaddleOCR PP-OCRv4 initialised successfully (fallback)")
         except Exception as exc_v4:
-            logger.error("Both PP-OCRv5 and PP-OCRv4 failed to initialise: %s", exc_v4)
+            logger.error("Both PP-OCRv5 and PP-OCRv4 failed to initialise after retries: %s", exc_v4)
             MODEL_READY = False
 
 
 # Run initialisation at module load so the model is ready before the first request.
 _init_ocr()
+
+# If startup init failed outright (not just slow — genuinely exhausted its
+# retries), keep trying in the background instead of staying broken until
+# someone notices and restarts the process. A transient network blip during
+# boot shouldn't take down transcription for the rest of the box's uptime.
+if not MODEL_READY:
+    import threading
+
+    def _background_retry_loop():
+        # type: () -> None
+        backoff_sec = 60
+        max_backoff_sec = 600
+        while not MODEL_READY:
+            time.sleep(backoff_sec)
+            logger.info("Retrying PaddleOCR initialisation in background...")
+            _init_ocr()
+            if not MODEL_READY:
+                backoff_sec = min(backoff_sec * 2, max_backoff_sec)
+
+    threading.Thread(target=_background_retry_loop, daemon=True).start()
+    logger.warning("PaddleOCR not ready at startup — background retry loop started")
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -247,8 +291,8 @@ def _merge_regions(regions):
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
 
 
-def _run_ocr_on_image(img):
-    # type: (np.ndarray) -> List[_TextRegion]
+def _run_ocr_on_image(img, options=None):
+    # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
     global ocr
     if ocr is None:
@@ -258,15 +302,41 @@ def _run_ocr_on_image(img):
     if not hasattr(_run_ocr_on_image, '_debugged'):
         _run_ocr_on_image._debugged = False  # type: ignore
 
+    opts = options or OCROptions()
+
+    # --- CRITICAL: disable document preprocessing for manga/manhwa panels ---
+    # PaddleOCR 3.x's predict() runs a document-orientation classifier and a
+    # document-unwarping model by default (use_doc_orientation_classify=True,
+    # use_doc_unwarping=True at the pipeline level). Those models are trained
+    # for photographed/scanned PAPER documents. Run against a stylized comic
+    # panel, doc-unwarping in particular can warp/distort the image before
+    # detection ever runs, causing the detector to find zero text regions —
+    # OCR "succeeds" (no exception) but silently returns empty text for every
+    # panel. This was very likely the cause of empty transcriptions + silent
+    # output video. Explicitly disabling both restores normal detection.
+    predict_kwargs = dict(
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=opts.use_angle_cls,
+        text_det_unclip_ratio=opts.det_db_unclip_ratio,
+    )
+
     try:
         # PaddleOCR v3.7+ uses predict(); older versions use ocr()
-        raw_result = ocr.predict(img)
-    except TypeError:
+        raw_result = ocr.predict(img, **predict_kwargs)
+    except TypeError as exc:
+        # predict() exists but rejected one of our kwargs (older/newer API
+        # drift) — retry without the extra kwargs before falling back to the
+        # legacy ocr() method entirely.
+        logger.warning("predict() kwarg mismatch (%s) — retrying without extra kwargs", exc)
         try:
-            raw_result = ocr.ocr(img)
-        except Exception as exc:
-            logger.warning("OCR inference failed: %s", exc)
-            return []
+            raw_result = ocr.predict(img)
+        except Exception:
+            try:
+                raw_result = ocr.ocr(img)
+            except Exception as exc2:
+                logger.warning("OCR inference failed: %s", exc2)
+                return []
     except Exception as exc:
         logger.warning("OCR inference failed: %s", exc)
         return []
@@ -434,6 +504,17 @@ async def health_check():
     )
 
 
+@app.post("/reload")
+async def reload_model():
+    """Force a synchronous re-attempt at model initialisation.
+
+    Useful after fixing a network/firewall issue without needing to restart
+    the whole process (systemd unit / pm2 process / docker container).
+    """
+    _init_ocr()
+    return {"ready": MODEL_READY, "model": MODEL_NAME}
+
+
 @app.post("/ocr/batch", response_model=BatchOCRResponse)
 async def ocr_batch(request: BatchOCRRequest):
     """
@@ -453,8 +534,11 @@ async def ocr_batch(request: BatchOCRRequest):
             results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0))
             continue
 
-        regions = _run_ocr_on_image(img_array)
+        regions = _run_ocr_on_image(img_array, request.options)
         merged_text, avg_conf, region_count = _merge_regions(regions)
+
+        if region_count == 0:
+            logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
 
         results.append(
             OCRResult(
@@ -494,7 +578,7 @@ async def ocr_base64(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array)
+    regions = _run_ocr_on_image(img_array, request.options)
     merged_text, avg_conf, region_count = _merge_regions(regions)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -528,7 +612,7 @@ async def ocr_single(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array)
+    regions = _run_ocr_on_image(img_array, request.options)
     merged_text, avg_conf, region_count = _merge_regions(regions)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)

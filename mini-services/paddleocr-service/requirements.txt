@@ -1,7 +1,12 @@
-paddleocr>=2.9.1
-paddlepaddle>=2.6.0
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-python-multipart>=0.0.18
-Pillow>=11.0.0
-numpy>=1.26.0
+# Pinned exact — PaddleOCR's 2.x -> 3.x jump changed ocr()->predict(), result
+# object format (dt_polys/rec_polys/OCRResult), and dropped params (show_log,
+# det_db_*). An unpinned range silently pulls breaking changes on every fresh
+# install. Verified working combo as of Aug 2026 — do not loosen without
+# re-testing the full main.py parsing path against the new version's output.
+paddleocr==3.7.0
+paddlepaddle==3.0.0
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.18
+Pillow==11.0.0
+numpy==1.26.4

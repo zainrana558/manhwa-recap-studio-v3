@@ -1680,8 +1680,22 @@ async function narrateImageBatchGemini(imgPaths: string[], batchStart: number): 
     } catch (err) {
       lastErr = err
       const msg = err instanceof Error ? err.message : String(err)
-      // 429 = rate limited — retry with longer backoff (free tier friendly).
+      // 429 = rate limited. Two distinct cases that need different handling:
+      //  - RESOURCE_EXHAUSTED / "quota" = daily quota is gone (free tier is
+      //    now ~15-20 req/day). No amount of backoff fixes this today —
+      //    retrying just burns 15s+30s+60s+120s (~225s) per batch for
+      //    nothing, and the outer orchestrator's own retry loop in lib.ts
+      //    can call back into this function again, multiplying the hang.
+      //    Fail immediately so the circuit breaker can disable this
+      //    provider and move on.
+      //  - plain RPM rate limit (no quota keyword) = transient, worth a
+      //    short backoff.
       if (msg.includes('429')) {
+        const isQuotaExhausted = /RESOURCE_EXHAUSTED|quota/i.test(msg)
+        if (isQuotaExhausted) {
+          console.warn(`[VLM:gemini] daily quota exhausted — failing fast (no retry) so the circuit breaker can switch providers`)
+          throw err
+        }
         if (attempt === MAX_RETRIES) throw err
         const delayMs = 15000 * Math.pow(2, attempt) // 15s, 30s, 60s
         console.warn(`[VLM:gemini] rate limited — retrying in ${delayMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES + 1})`)
