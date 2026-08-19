@@ -291,6 +291,37 @@ def _merge_regions(regions):
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
 
 
+def _ensure_list(x):
+    # type: (Any) -> list
+    """Safely coerce a value to a list WITHOUT ever char-splitting a string.
+
+    Python's bare list("hello") produces ['h','e','l','l','o'] — a classic
+    footgun when a value that's supposed to be "a list of N items" turns out
+    to actually be a single already-joined string. This happens with
+    PaddleOCR result parsing because different versions/formats of the
+    result object don't always agree on whether a field is per-region
+    (list) or whole-image (string). A single mis-typed field here silently
+    turns real words into individual space-separated letters after
+    _merge_regions' downstream space-join — e.g. "Ohh no a dungeon"
+    becomes "O H H N O A D U N G E O N".
+    """
+    if x is None:
+        return []
+    if isinstance(x, str):
+        return [x]
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    if hasattr(x, 'tolist'):  # numpy array
+        try:
+            return x.tolist()
+        except Exception:
+            pass
+    try:
+        return list(x)
+    except TypeError:
+        return [x]
+
+
 def _run_ocr_on_image(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
@@ -384,7 +415,16 @@ def _run_ocr_on_image(img, options=None):
                 scores = None  # type: Optional[list]
                 polys = None  # type: Optional[list]
 
-                for tk in ('rec_texts', 'rec_text', 'texts', 'text'):
+                # NOTE: deliberately does NOT include a bare 'text' key here.
+                # A bare 'text' key is far more likely to hold a single
+                # whole-image joined STRING than a per-region list, and
+                # Python's list() on a string silently char-splits it
+                # ('Ohh no' -> ['O','h','h',' ','n','o']) rather than
+                # wrapping it — which, after _merge_regions' space-join,
+                # produces exactly "O H H N O" letter-by-letter output
+                # instead of real words. rec_texts is the real PaddleOCR
+                # 3.x per-region key; that's what we want here.
+                for tk in ('rec_texts', 'rec_text', 'texts'):
                     if tk in all_keys:
                         try:
                             texts = item[tk]  # type: ignore
@@ -410,9 +450,16 @@ def _run_ocr_on_image(img, options=None):
                             break
 
                 if texts is not None:
-                    texts = list(texts) if not isinstance(texts, list) else texts
-                    scores = list(scores) if scores and not isinstance(scores, list) else (scores or [])
-                    polys = list(polys) if polys and not isinstance(polys, list) else (polys or [])
+                    # _ensure_list is the critical fix: plain list()/isinstance
+                    # checks treat a bare string as an iterable-of-characters,
+                    # which silently shatters "Ohh no a dungeon" into
+                    # ['O','h','h',...]. A string must always be wrapped as a
+                    # single-element list, never iterated. Applied uniformly
+                    # to texts/scores/polys as defense in depth even though
+                    # scores/polys are far less likely to be a bare string.
+                    texts = _ensure_list(texts)
+                    scores = _ensure_list(scores)
+                    polys = _ensure_list(polys)
 
                     logger.info("[OCR] Extracted %d texts, %d scores, %d polys from OCRResult", len(texts), len(scores), len(polys))
 
