@@ -1574,12 +1574,22 @@ def _generate_silence(path: Path, duration: float) -> None:
     )
 
 
-def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> Path:
+def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
     """Generate ONE continuous narration clip (or silence) for a whole segment
     (a single source panel, or the whole chapter in legacy mode). Resumable
     per segment. This is the only place edge-tts is invoked per chapter run,
     so the resulting speech has none of the artificial start/end pauses that
-    per-word synthesis introduced."""
+    per-word synthesis introduced.
+
+    Returns (path, tts_failed) — tts_failed is True only when there WAS text
+    to narrate but edge-tts (or the WAV conversion) failed and silence was
+    substituted. It's False for segments that were always meant to be silent
+    (no dialogue on that panel). This distinction matters: previously a
+    total edge-tts outage (e.g. the Microsoft speech endpoint being blocked
+    by egress rules) would silently degrade every segment to silence with
+    only a per-segment log warning — a fully-broken chapter looked identical
+    in the logs to a normal, mostly-quiet one, and the pipeline reported
+    success with a genuinely silent output video."""
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
     # Output WAV (not MP3) — WAV has no encoder delay/padding, so concatenation
@@ -1587,12 +1597,12 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     # accumulated in the second half of videos when using MP3 intermediates.
     final_path = seg_audio_dir / f"{tag}.wav"
     if final_path.exists():
-        return final_path
+        return final_path, False
 
     text = text.strip()
     if not text:
         _generate_silence(final_path, SILENT_FRAME_DURATION)
-        return final_path
+        return final_path, False
 
     import asyncio
     import edge_tts
@@ -1614,7 +1624,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         log.warning("[%s] edge-tts failed for segment %s (%s) — using silence", chapter.tag, tag, e)
         _generate_silence(final_path, SILENT_FRAME_DURATION)
         raw_path.unlink(missing_ok=True)
-        return final_path
+        return final_path, True
 
     # Re-encode at the pipeline's standard sample rate + bitrate, AND apply
     # a short fade-in/fade-out. The fades eliminate the zero-crossing
@@ -1642,9 +1652,11 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     except Exception as e:
         log.warning("[%s] ffmpeg audio conversion failed for segment %s (%s) — using silence", chapter.tag, tag, e)
         _generate_silence(final_path, SILENT_FRAME_DURATION)
+        raw_path.unlink(missing_ok=True)
+        return final_path, True
 
     raw_path.unlink(missing_ok=True)
-    return final_path
+    return final_path, False
 
 
 def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path]) -> Path:
@@ -2069,11 +2081,17 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
         segment_audio_paths: List[Path] = []
         chapter_offset = 0.0
+        tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
+        tts_failed = 0      # of those, how many fell back to silence due to a real failure
 
         for seg_idx, (tag, text, positions) in enumerate(segments):
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
-            audio_path_seg = synthesize_segment_audio(cfg, chapter, tag, text)
+            if text.strip():
+                tts_attempted += 1
+            audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+            if seg_tts_failed:
+                tts_failed += 1
             duration = get_audio_duration(audio_path_seg)
 
             # Ensure the segment audio is at least long enough for all its
@@ -2095,6 +2113,34 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 duration = last_end
             segment_audio_paths.append(audio_path_seg)
             chapter_offset += duration
+
+        # If most/all segments that HAD real dialogue to speak ended up
+        # falling back to silence, this isn't "a quiet chapter" — it's a
+        # broken TTS pipeline (most commonly: edge-tts's endpoint,
+        # speech.platform.bing.com, is unreachable from this network —
+        # firewall/security-list egress rules on cloud hosts are a common
+        # cause). Every prior signal along the way (translation, rephrase,
+        # loudnorm, mux) looks completely normal even when this has happened,
+        # because each stage just sees "silence" as valid audio input and
+        # passes it through without error. Surface it loudly here instead of
+        # letting the job report success with a genuinely silent video.
+        if tts_attempted > 0:
+            tts_fail_ratio = tts_failed / tts_attempted
+            if tts_fail_ratio >= 0.9:
+                log.error(
+                    "[%s] TTS FAILED for %d/%d narrated segments (%.0f%%) — "
+                    "edge-tts is not producing audio. Check network access to "
+                    "speech.platform.bing.com from this host (firewall/security-"
+                    "list egress rules are a common cause on cloud VMs). The "
+                    "output video for this chapter will be SILENT.",
+                    chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+                )
+            elif tts_fail_ratio > 0.2:
+                log.warning(
+                    "[%s] TTS failed for %d/%d narrated segments (%.0f%%) — "
+                    "partial audio dropout, check edge-tts connectivity",
+                    chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+                )
 
         # Build final per-frame durations from the timings.
         # Guard against None entries (can happen if a segment had no positions
