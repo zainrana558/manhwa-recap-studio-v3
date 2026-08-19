@@ -7,16 +7,24 @@ cd "$(dirname "$0")"
 
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
-source "$HOME/.venv/bin/activate"
 
 echo "🚀 Starting Manhwa Recap Studio..."
 echo ""
 
 # Kill any existing processes
 pkill -f "next-server" 2>/dev/null || true
+fuser -k 3002/tcp 2>/dev/null || true
 pkill -f "pipeline-service" 2>/dev/null || true
 pkill -f "index.ts" 2>/dev/null || true
 sleep 2
+
+# Start paddleocr-service (port 3002)
+echo "▶ Starting paddleocr-service (port 3002)..."
+cd mini-services/paddleocr-service
+nohup bash start.sh > /home/ubuntu/manhwa-recap-studio-v3/paddleocr.log 2>&1 &
+PADDLEOCR_PID=$!
+cd ../..
+sleep 3
 
 # Start pipeline-service (port 3001)
 echo "▶ Starting pipeline-service (port 3001)..."
@@ -40,6 +48,12 @@ else
     echo "⚠️  Pipeline-service may not be ready yet (check pipeline.log)"
 fi
 
+if curl -s http://localhost:3002/health | grep -q "\"status\":\"ok\""; then
+    echo "✅ PaddleOCR-service is running (PID: $PADDLEOCR_PID)"
+else
+    echo "⚠️  PaddleOCR-service may not be ready yet (check paddleocr.log)"
+fi
+
 if curl -s -o /dev/null -w "" http://localhost:3000/ 2>/dev/null; then
     echo "✅ Next.js is running (PID: $NEXT_PID)"
 else
@@ -59,6 +73,6 @@ echo "  🔧 Pipeline: http://$PUBLIC_IP:3001/internal/health"
 echo ""
 echo "  To stop:     pkill -f 'next-server|index.ts'"
 echo "  To restart:  bash start.sh"
-echo "  Logs:        tail -f nextjs.log pipeline.log"
+echo "  Logs:        tail -f nextjs.log pipeline.log paddleocr.log"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
