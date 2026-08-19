@@ -1,11 +1,27 @@
 # Compatible-release pins (~=) instead of open-ended >= — allows patch
 # updates but blocks the unannounced major-version jumps that broke the
 # PaddleOCR integration repeatedly (see mini-services/paddleocr-service).
+#
+# IMPORTANT: the actual deployment target (OCI free-tier Ampere instance)
+# runs Python 3.8.10. Several packages below have bumped their Python floor
+# well past 3.8 in recent releases, and a pin that ignores this fails with
+# "Could not find a version that satisfies..." even when the pinned version
+# genuinely exists on PyPI — pip is silently filtering it out for being
+# incompatible with the running interpreter. Every pin below was verified
+# with `pip download --python-version 3.8 --only-binary=:all:` against the
+# real Python 3.8 wheel availability, not just checked for existing on PyPI.
 edge-tts~=7.2.8
-openai~=2.49.0
-Pillow~=11.3.0
+# openai 2.11.0+ requires Python >=3.9; 2.49.0+ requires Python >=3.10.
+# 2.7.1 is the actual latest release still installable on Python 3.8.
+openai~=2.7.1
+# Pillow 11.x requires Python >=3.9. 10.4.0 is the last 3.8-compatible
+# release (same constraint as mini-services/paddleocr-service).
+Pillow>=10.4.0,<11.0.0
 opencv-python~=4.13.0
-numpy~=2.1.0
+# numpy 1.25+ requires Python >=3.9. Capped below 1.25 for the same reason
+# as the paddleocr-service pin — keep both services on a numpy line that
+# actually installs on the real deployment target.
+numpy>=1.21.0,<1.25
 # NOTE: torch/torchvision are installed SEPARATELY by setup.sh via
 # --index-url https://download.pytorch.org/whl/cpu (CPU-only build).
 # The versions below just record the minimum — pip will skip them
