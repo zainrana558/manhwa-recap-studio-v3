@@ -174,7 +174,11 @@ const CREDIT_PATTERNS: RegExp[] = [
   /donate/i,
   /support\s+(?:us|the\s+(?:team|scanlat))/i,
   /join\s+(?:our\s+)?(?:discord|server)/i,
-  /follow\s+(?:us|on)/i,
+  /follow\s+(?:us|me)\s+(?:on|at)\b/i,   // "follow us on [platform]" — narrowed
+                                          // from a bare "follow (us|on)" match,
+                                          // which could false-positive on real
+                                          // story dialogue like "follow us!"
+                                          // or "I'll follow on your orders"
   /@[\w-]+\s*(?:on\s+)?(?:twitter|insta|tiktok|youtube)/i,  // social handles
   /website\s*:/i,
   /visit\s+(?:our\s+)?(?:site|website)/i,

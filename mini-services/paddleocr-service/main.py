@@ -285,7 +285,7 @@ def _merge_regions(regions):
             if r.confidence > 0:
                 all_confidences.append(r.confidence)
 
-    merged_text = "\n".join(text_parts)
+    merged_text = " ".join(text_parts)
     avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
     return merged_text, round(avg_confidence, 4), len(sorted_regions)

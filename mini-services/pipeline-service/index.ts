@@ -1071,10 +1071,16 @@ async function processJob(jobId: string): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await emitLog(jobId, 'error', 'transcribe', `Chapter ${ch.index} transcription failed: ${msg}`)
-      // narration.json absence signals failure to Python pipeline.
+      // Total failure (both PaddleOCR and VLM threw) — previously this still
+      // marked the chapter `transcribed: true` / status 'transcribed', which
+      // is misleading: the chapter has no narration.json at all, and the
+      // Python render step will silently produce a fully-silent chapter for
+      // it. Record it as a genuine error instead so the UI and job status
+      // reflect what actually happened, using the `status`/`error` fields
+      // that already exist in the schema for exactly this.
       const updated = await db.chapter.update({
         where: { id: ch.id },
-        data: { status: 'transcribed', transcribed: true },
+        data: { status: 'error', error: msg.slice(0, 1000), transcribed: false },
       })
       await emitChapter(jobId, updated)
     }

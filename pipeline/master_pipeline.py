@@ -1396,7 +1396,14 @@ def _strip_forbidden(text: str) -> str:
     cleaned = text
     for pat in FORBIDDEN_PATTERNS:
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
+    # \s+ (not \s{2,}) — a LONE embedded newline/tab from OCR's per-line
+    # region joining must also collapse to a single space. This matters for
+    # --narration-provider none (verbatim mode): edge-tts's internal
+    # sanitizer explicitly preserves \n/\t/\r (they're outside the control-
+    # character ranges it strips), so a raw newline between OCR'd speech
+    # bubbles previously survived all the way into the spoken narration,
+    # producing an unnatural pause/break mid-panel instead of a clean space.
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str) -> str:
