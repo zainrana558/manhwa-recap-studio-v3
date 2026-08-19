@@ -15,7 +15,7 @@ python-multipart==0.0.18
 # instead of exact for this one package specifically so it installs the
 # right build for whichever interpreter is actually present.
 Pillow>=10.4.0,<12.0.0
-numpy>=1.21.0,<1.25
+numpy<1.25
 # ^ Same issue as Pillow above: numpy 1.26.x requires Python 3.9+ (NumPy's
 # own 1.26.4 release notes state "Python versions supported ... are
 # 3.9-3.12"). Range-pinned below 1.25 so it resolves on Python 3.8 too

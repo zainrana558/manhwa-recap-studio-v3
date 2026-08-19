@@ -16,12 +16,12 @@ edge-tts~=7.2.8
 openai~=2.7.1
 # Pillow 11.x requires Python >=3.9. 10.4.0 is the last 3.8-compatible
 # release (same constraint as mini-services/paddleocr-service).
-Pillow>=10.4.0,<11.0.0
+Pillow~=11.3.0
 opencv-python~=4.13.0
 # numpy 1.25+ requires Python >=3.9. Capped below 1.25 for the same reason
 # as the paddleocr-service pin — keep both services on a numpy line that
 # actually installs on the real deployment target.
-numpy>=1.21.0,<1.25
+numpy~=2.1.0
 # NOTE: torch/torchvision are installed SEPARATELY by setup.sh via
 # --index-url https://download.pytorch.org/whl/cpu (CPU-only build).
 # The versions below just record the minimum — pip will skip them
