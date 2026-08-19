@@ -8,5 +8,16 @@ paddlepaddle==3.0.0
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.18
-Pillow==11.0.0
-numpy==1.26.4
+# Pillow 11.x dropped Python 3.8 support (last 3.8-compatible release is
+# 10.4.0). This service's actual deployment target (OCI free-tier Ampere
+# instance) runs Python 3.8.10, so a hard ==11.0.0 pin is uninstallable
+# there even though it resolves fine anywhere with Python 3.9+. Range-pinned
+# instead of exact for this one package specifically so it installs the
+# right build for whichever interpreter is actually present.
+Pillow>=10.4.0,<12.0.0
+numpy>=1.21.0,<1.25
+# ^ Same issue as Pillow above: numpy 1.26.x requires Python 3.9+ (NumPy's
+# own 1.26.4 release notes state "Python versions supported ... are
+# 3.9-3.12"). Range-pinned below 1.25 so it resolves on Python 3.8 too
+# (1.24.x is the last line with 3.8 wheels) while still excluding numpy
+# 2.x, which paddlepaddle 3.0.0 compatibility isn't verified against.
