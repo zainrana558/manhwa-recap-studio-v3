@@ -52,6 +52,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+try:
+    from pipeline.production import (
+        QAResult, ResourceGuard, RetryCategory, SQLiteStateStore, Stage, State,
+        atomic_promote, checksum_file, classify_retry, reconcile_artifact,
+    )
+except ModuleNotFoundError:  # allows running as python /path/to/pipeline/master_pipeline.py
+    from production import (  # type: ignore
+        QAResult, ResourceGuard, RetryCategory, SQLiteStateStore, Stage, State,
+        atomic_promote, checksum_file, classify_retry, reconcile_artifact,
+    )
+
 # ---------------------------------------------------------------------------
 # Third-party deps. cv2 + numpy are imported eagerly because they're needed by
 # the panel-slicing step (the most performance-critical path) and the lazy
@@ -120,6 +131,10 @@ class PipelineConfig:
     narration_model: Optional[str] = None  # override model for narration
     progress_file: Optional[Path] = None  # JSON file the Node service polls
     slice_only: bool = False  # if True, only run panel slicing then exit (used by the Node orchestrator so VLM can read individual sliced panels)
+    production_mode: bool = False
+    job_id: str = "local"
+    min_free_disk_mb: int = int(os.environ.get("PIPELINE_MIN_FREE_DISK_MB", "1024"))
+    min_available_ram_mb: int = int(os.environ.get("PIPELINE_MIN_AVAILABLE_RAM_MB", "512"))
 
     @property
     def temp_audio_dir(self) -> Path:
@@ -140,6 +155,10 @@ class PipelineConfig:
     @property
     def state_file(self) -> Path:
         return self.work_dir / "pipeline_state.json"
+
+    @property
+    def sqlite_state_file(self) -> Path:
+        return self.work_dir / "pipeline_state.sqlite"
 
     def ensure_dirs(self) -> None:
         for d in (
@@ -1472,6 +1491,86 @@ def _compose_canvas(crop, ImageFilter):
     return canvas
 
 
+
+# ---------------------------------------------------------------------------
+# Production state/resource/artifact helpers
+# ---------------------------------------------------------------------------
+
+def _state_store(cfg: PipelineConfig) -> SQLiteStateStore:
+    return SQLiteStateStore(cfg.sqlite_state_file)
+
+
+def _resource_guard(cfg: PipelineConfig) -> ResourceGuard:
+    return ResourceGuard(
+        min_free_disk_bytes=max(0, cfg.min_free_disk_mb) * 1024 * 1024,
+        min_available_ram_bytes=max(0, cfg.min_available_ram_mb) * 1024 * 1024,
+        state=_state_store(cfg),
+    )
+
+
+def ensure_resources(cfg: PipelineConfig, stage: Stage, chapter: Optional[Chapter] = None, panel_id: str = "") -> None:
+    status = _resource_guard(cfg).check(
+        cfg.work_dir,
+        job_id=cfg.job_id,
+        stage=stage,
+    )
+    if not status.ok:
+        cid = chapter.tag if chapter else ""
+        _state_store(cfg).record(
+            cfg.job_id,
+            stage,
+            State.RETRYABLE,
+            chapter_id=cid,
+            panel_id=panel_id,
+            error_code="RESOURCE",
+            error_message=status.reason,
+            retry_category=RetryCategory.RESOURCE,
+            increment_attempt=False,
+        )
+        cfg.write_progress(stage.value.lower(), chapter.index if chapter else 0, 0, status.reason, status="retryable")
+        raise RuntimeError(f"Resource guard blocked {stage.value}: {status.reason}")
+
+
+def _record_stage(cfg: PipelineConfig, stage: Stage, state: State, chapter: Optional[Chapter] = None, panel_id: str = "", **kwargs) -> None:
+    _state_store(cfg).record(cfg.job_id, stage, state, chapter_id=chapter.tag if chapter else "", panel_id=panel_id, **kwargs)
+
+
+def audio_qa_result(path: Path, allow_silence: bool = False) -> QAResult:
+    try:
+        ok = _audio_qa(path, allow_silence=allow_silence)
+        duration = get_audio_duration(path) if path.exists() else 0.0
+        return QAResult(ok=ok, reason="" if ok else "audio QA failed", duration=duration)
+    except Exception as exc:
+        return QAResult(False, str(exc), 0.0)
+
+
+def video_qa_result(path: Path, expect_audio: bool = False, expected_duration: Optional[float] = None) -> QAResult:
+    if not path.exists() or path.stat().st_size <= 0:
+        return QAResult(False, "video artifact missing or empty")
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+            "-of", "json", str(path),
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        if result.returncode != 0:
+            return QAResult(False, f"ffprobe failed: {result.stderr[-200:]}")
+        data = json.loads(result.stdout or "{}")
+        streams = data.get("streams", [])
+        has_video = any(s.get("codec_type") == "video" for s in streams)
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        duration = float(data.get("format", {}).get("duration") or 0.0)
+        if not has_video:
+            return QAResult(False, "missing video stream", duration)
+        if expect_audio and not has_audio:
+            return QAResult(False, "missing expected audio stream", duration)
+        if duration <= 0.05:
+            return QAResult(False, "invalid video duration", duration)
+        if expected_duration is not None and abs(duration - expected_duration) > max(3.0, expected_duration * 0.10):
+            return QAResult(False, f"duration {duration:.2f}s outside tolerance for expected {expected_duration:.2f}s", duration)
+        return QAResult(True, duration=duration, metadata={"has_audio": has_audio, "has_video": has_video})
+    except Exception as exc:
+        return QAResult(False, str(exc))
+
 # ---------------------------------------------------------------------------
 # 3a. TRANSLATION (Groq, OpenAI-compatible endpoint)
 # ---------------------------------------------------------------------------
@@ -1737,7 +1836,7 @@ def split_into_segments(text: str, n: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. CONTINUOUS NEURAL TEXT-TO-SPEECH (edge-tts)
+# 4. LOCAL-FIRST PRODUCTION TEXT-TO-SPEECH (Piper -> Piper retry -> eSpeak NG)
 # ---------------------------------------------------------------------------
 # NOTE: narration used to be synthesized one tiny word-chunk at a time (one
 # edge-tts call per sliced frame) and then concatenated. edge-tts inserts a
@@ -1776,90 +1875,106 @@ def _generate_silence(path: Path, duration: float) -> None:
     )
 
 
-def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
-    """Generate ONE continuous narration clip (or silence) for a whole segment
-    (a single source panel, or the whole chapter in legacy mode). Resumable
-    per segment. This is the only place edge-tts is invoked per chapter run,
-    so the resulting speech has none of the artificial start/end pauses that
-    per-word synthesis introduced.
+def _audio_qa(path: Path, allow_silence: bool = False) -> bool:
+    if not path.exists() or path.stat().st_size < 44:
+        return False
+    try:
+        duration = get_audio_duration(path)
+        if duration <= 0.05:
+            return False
+        if allow_silence:
+            return True
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        probe = result.stderr + result.stdout
+        m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", probe)
+        return bool(m and float(m.group(1)) > -50.0)
+    except Exception:
+        return False
 
-    Returns (path, tts_failed) — tts_failed is True only when there WAS text
-    to narrate but edge-tts (or the WAV conversion) failed and silence was
-    substituted. It's False for segments that were always meant to be silent
-    (no dialogue on that panel). This distinction matters: previously a
-    total edge-tts outage (e.g. the Microsoft speech endpoint being blocked
-    by egress rules) would silently degrade every segment to silence with
-    only a per-segment log warning — a fully-broken chapter looked identical
-    in the logs to a normal, mostly-quiet one, and the pipeline reported
-    success with a genuinely silent output video."""
+
+def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not espeak:
+        raise RuntimeError("espeak-ng binary unavailable")
+    result = subprocess.run([espeak, "-w", str(out_wav), text], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed: {result.stderr[-200:]}")
+
+
+def _synthesize_with_piper(text: str, out_wav: Path) -> None:
+    piper = shutil.which("piper")
+    model = os.environ.get("PIPER_VOICE_MODEL")
+    if not piper or not model:
+        raise RuntimeError("piper binary/model unavailable")
+    with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        _out, err = proc.communicate(text, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(f"piper failed: {err[-200:]}")
+
+
+def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
+    """Generate atomic segment audio. Production never uses edge-tts or network TTS."""
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
-    # Output WAV (not MP3) — WAV has no encoder delay/padding, so concatenation
-    # is sample-accurate. This eliminates the audio/video sync drift that
-    # accumulated in the second half of videos when using MP3 intermediates.
     final_path = seg_audio_dir / f"{tag}.wav"
-    if final_path.exists():
-        return final_path, False
-
     text = text.strip()
-    if not text:
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
+    if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
         return final_path, False
+    final_path.unlink(missing_ok=True)
+    tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
+    tmp_path.unlink(missing_ok=True)
+    if not text:
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        if not _audio_qa(tmp_path, allow_silence=True):
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"silent audio QA failed for {tag}")
+        os.replace(tmp_path, final_path)
+        return final_path, False
+    failures = []
+    if getattr(cfg, "production_mode", False):
+        for provider in ("piper", "piper", "espeak"):
+            tmp_path.unlink(missing_ok=True)
+            try:
+                if provider == "piper":
+                    _synthesize_with_piper(text, tmp_path)
+                else:
+                    _synthesize_with_espeak(text, tmp_path)
+                if not _audio_qa(tmp_path, allow_silence=False):
+                    raise RuntimeError(f"{provider} output failed audio QA")
+                os.replace(tmp_path, final_path)
+                return final_path, False
+            except Exception as e:
+                failures.append(f"{provider}: {e}")
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Production TTS failed; no silent substitution: " + " | ".join(failures))
 
     import asyncio
     import edge_tts
-
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
-
     async def _run():
         communicate = edge_tts.Communicate(text, cfg.voice)
         await communicate.save(str(raw_path))
-
     try:
         asyncio.run(_run())
-        # Verify the raw audio file is non-empty (edge-tts can produce a
-        # 0-byte file for text it can't synthesize, e.g. single characters
-        # or pure punctuation).
         if not raw_path.exists() or raw_path.stat().st_size < 100:
             raise RuntimeError("edge-tts produced an empty audio file")
-    except Exception as e:
-        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        raw_path.unlink(missing_ok=True)
-        return final_path, True
-
-    # Re-encode at the pipeline's standard sample rate + bitrate, AND apply
-    # a short fade-in/fade-out. The fades eliminate the zero-crossing
-    # discontinuity at the start/end of each TTS clip, which is the #1 cause
-    # of audible "clicks" and "pops" when clips are concatenated back-to-back.
-    # 25ms in / 40ms out is imperceptible to human hearing but removes the
-    # transient completely. (edge-tts output often starts/ends mid-waveform.)
-    try:
         raw_dur = get_audio_duration(raw_path)
         fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
-        seg_af = (
-            f"afade=t=in:st=0:d={SEGMENT_FADE_IN},"
-            f"afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
-        )
-        # Convert edge-tts MP3 → WAV with fades. WAV output = no encoder
-        # delay/padding = sample-accurate concatenation later.
-        run_ffmpeg(
-            [
-                "ffmpeg", "-y", "-i", str(raw_path),
-                "-af", seg_af,
-                "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
-                str(final_path),
-            ]
-        )
+        seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-af", seg_af, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+        if not _audio_qa(tmp_path, allow_silence=False):
+            raise RuntimeError("edge-tts output failed audio QA")
+        os.replace(tmp_path, final_path)
+        return final_path, False
     except Exception as e:
-        log.warning("[%s] ffmpeg audio conversion failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        raw_path.unlink(missing_ok=True)
+        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence in legacy mode", chapter.tag, tag, e)
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        os.replace(tmp_path, final_path)
         return final_path, True
-
-    raw_path.unlink(missing_ok=True)
-    return final_path, False
-
+    finally:
+        raw_path.unlink(missing_ok=True)
 
 def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path]) -> Path:
     """Concatenate per-segment (per-panel) audio clips into one continuous
@@ -1868,9 +1983,13 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
     word), the only joins left are the natural breath-like gaps between
     panels/scenes — not mid-sentence chops. Resumable."""
     out_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3"  # final output still MP3 (re-encoded from WAV, so no padding issues)
-    if out_path.exists():
-        log.info("[%s] chapter audio track already assembled — skipping", chapter.tag)
+    ensure_resources(cfg, Stage.AUDIO_ASSEMBLY, chapter)
+    if reconcile_artifact(_state_store(cfg), cfg.job_id, Stage.AUDIO_ASSEMBLY, out_path, lambda p: audio_qa_result(p, allow_silence=True), chapter.tag):
+        log.info("[%s] chapter audio track already assembled and QA-valid — skipping", chapter.tag)
         return out_path
+    _record_stage(cfg, Stage.AUDIO_ASSEMBLY, State.RUNNING, chapter)
+    tmp_out_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
+    tmp_out_path.unlink(missing_ok=True)
 
     concat_list = cfg.temp_audio_dir / f"{chapter.tag}_audio_concat.txt"
     with concat_list.open("w", encoding="utf-8") as f:
@@ -1920,7 +2039,7 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
                 "ffmpeg", "-y", "-i", str(raw_path),
                 "-af", af,
                 "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "1",
-                str(out_path),
+                str(tmp_out_path),
             ]
         )
     except RuntimeError as e:
@@ -1928,7 +2047,14 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
             "[%s] audio post-processing failed (%s) — falling back to raw (unprocessed) audio track",
             chapter.tag, e,
         )
-        shutil.copy2(raw_path, out_path)
+        shutil.copy2(raw_path, tmp_out_path)
+    qa = audio_qa_result(tmp_out_path, allow_silence=True)
+    if not qa.ok:
+        tmp_out_path.unlink(missing_ok=True)
+        _record_stage(cfg, Stage.AUDIO_ASSEMBLY, State.RETRYABLE, chapter, error_code="AUDIO_QA_FAILED", error_message=qa.reason, retry_category=RetryCategory.QUALITY)
+        raise RuntimeError(f"[{chapter.tag}] chapter audio QA failed: {qa.reason}")
+    digest = atomic_promote(tmp_out_path, out_path)
+    _record_stage(cfg, Stage.AUDIO_ASSEMBLY, State.COMPLETE, chapter, artifact_path=out_path, artifact_checksum=digest, duration=qa.duration)
     raw_path.unlink(missing_ok=True)
     log.info("[%s] assembled + post-processed chapter audio (loudnorm) -> %s", chapter.tag, out_path.name)
     return out_path
@@ -2010,9 +2136,15 @@ def render_chapter(
     (frame_durations), so image swaps line up precisely with the narration.
     RESUME: skip entirely if chap_XXX.mp4 already exists on disk."""
     out_path = cfg.temp_chapters_dir / f"{chapter.tag}.mp4"
-    if out_path.exists():
-        log.info("[%s] chapter video already rendered — skipping (resume)", chapter.tag)
+    ensure_resources(cfg, Stage.VIDEO_RENDER, chapter)
+    expected_duration = sum(frame_durations) if frame_durations else None
+    expect_audio = bool(audio_path and audio_path.exists())
+    if reconcile_artifact(_state_store(cfg), cfg.job_id, Stage.VIDEO_RENDER, out_path, lambda p: video_qa_result(p, expect_audio=expect_audio, expected_duration=expected_duration), chapter.tag):
+        log.info("[%s] chapter video already rendered and QA-valid — skipping (resume)", chapter.tag)
         return out_path
+    _record_stage(cfg, Stage.VIDEO_RENDER, State.RUNNING, chapter)
+    tmp_out_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
+    tmp_out_path.unlink(missing_ok=True)
 
     if not frame_paths:
         log.warning("[%s] no frames to render — skipping chapter", chapter.tag)
@@ -2049,7 +2181,7 @@ def render_chapter(
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-r", str(FPS),
             "-shortest",
-            str(out_path),
+            str(tmp_out_path),
         ]
     else:
         cmd = [
@@ -2059,7 +2191,7 @@ def render_chapter(
             "-vf", video_filters,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-r", str(FPS),
-            str(out_path),
+            str(tmp_out_path),
         ]
 
     try:
@@ -2068,6 +2200,14 @@ def render_chapter(
         log.error("[%s] concat render failed: %s", chapter.tag, e)
         return None
 
+    qa = video_qa_result(tmp_out_path, expect_audio=expect_audio, expected_duration=expected_duration)
+    if not qa.ok:
+        tmp_out_path.unlink(missing_ok=True)
+        _record_stage(cfg, Stage.VIDEO_RENDER, State.RETRYABLE, chapter, error_code="VIDEO_QA_FAILED", error_message=qa.reason, retry_category=RetryCategory.CORRUPT_ARTIFACT)
+        log.error("[%s] chapter video QA failed: %s", chapter.tag, qa.reason)
+        return None
+    digest = atomic_promote(tmp_out_path, out_path)
+    _record_stage(cfg, Stage.VIDEO_RENDER, State.COMPLETE, chapter, artifact_path=out_path, artifact_checksum=digest, duration=qa.duration)
     concat_list.unlink(missing_ok=True)
 
     log.info("[%s] chapter video rendered -> %s", chapter.tag, out_path.name)
@@ -2122,9 +2262,14 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
             f.write(f"file '{cv.resolve().as_posix()}'\n")
 
     merged_path = cfg.work_dir / "master_merged.mp4"
-    if merged_path.exists():
-        log.info("Merged master file already exists — skipping merge step (resume)")
+    ensure_resources(cfg, Stage.MERGE)
+    expect_audio = any(video_qa_result(cv, expect_audio=False).metadata.get("has_audio") for cv in chapter_videos if cv.exists())
+    if reconcile_artifact(_state_store(cfg), cfg.job_id, Stage.MERGE, merged_path, lambda p: video_qa_result(p, expect_audio=expect_audio)):
+        log.info("Merged master file already exists and QA-valid — skipping merge step (resume)")
         return merged_path
+    _record_stage(cfg, Stage.MERGE, State.RUNNING)
+    tmp_merged_path = merged_path.with_name(f"{merged_path.stem}.tmp{merged_path.suffix}")
+    tmp_merged_path.unlink(missing_ok=True)
 
     log.info("Merging %d chapter videos via ffmpeg stream copy...", len(chapter_videos))
     run_ffmpeg(
@@ -2132,9 +2277,16 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
-            str(merged_path),
+            str(tmp_merged_path),
         ]
     )
+    qa = video_qa_result(tmp_merged_path, expect_audio=expect_audio)
+    if not qa.ok:
+        tmp_merged_path.unlink(missing_ok=True)
+        _record_stage(cfg, Stage.MERGE, State.RETRYABLE, error_code="MERGE_QA_FAILED", error_message=qa.reason, retry_category=RetryCategory.CORRUPT_ARTIFACT)
+        raise RuntimeError(f"Merged video QA failed: {qa.reason}")
+    digest = atomic_promote(tmp_merged_path, merged_path)
+    _record_stage(cfg, Stage.MERGE, State.COMPLETE, artifact_path=merged_path, artifact_checksum=digest, duration=qa.duration)
     log.info("Merge complete -> %s", merged_path.name)
     return merged_path
 
@@ -2147,8 +2299,22 @@ def finalize_output(cfg: PipelineConfig, merged_path: Path) -> Path:
     any background music distraction.
     """
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_resources(cfg, Stage.FINAL_QA)
+    if reconcile_artifact(_state_store(cfg), cfg.job_id, Stage.FINAL_QA, cfg.output_path, lambda p: video_qa_result(p, expect_audio=True)):
+        log.info("Final master video already exists and QA-valid — skipping final promotion")
+        return cfg.output_path
+    _record_stage(cfg, Stage.FINAL_QA, State.RUNNING)
+    tmp_final = cfg.output_path.with_name(f"{cfg.output_path.stem}.tmp{cfg.output_path.suffix}")
+    tmp_final.unlink(missing_ok=True)
     log.info("Copying merged video to final output (no BGM overlay)...")
-    shutil.copy2(merged_path, cfg.output_path)
+    shutil.copy2(merged_path, tmp_final)
+    qa = video_qa_result(tmp_final, expect_audio=True)
+    if not qa.ok:
+        tmp_final.unlink(missing_ok=True)
+        _record_stage(cfg, Stage.FINAL_QA, State.RETRYABLE, error_code="FINAL_QA_FAILED", error_message=qa.reason, retry_category=RetryCategory.CORRUPT_ARTIFACT)
+        raise RuntimeError(f"Final video QA failed: {qa.reason}")
+    digest = atomic_promote(tmp_final, cfg.output_path)
+    _record_stage(cfg, Stage.FINAL_QA, State.COMPLETE, artifact_path=cfg.output_path, artifact_checksum=digest, duration=qa.duration)
     log.info("Final master video written -> %s", cfg.output_path)
     return cfg.output_path
 
@@ -2172,6 +2338,8 @@ def cleanup_temp(cfg: PipelineConfig) -> None:
 def run_pipeline(cfg: PipelineConfig) -> None:
     start = time.time()
     cfg.ensure_dirs()
+    ensure_resources(cfg, Stage.JOB)
+    _record_stage(cfg, Stage.JOB, State.RUNNING)
     # Ensure the output directory exists.
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2202,6 +2370,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
         # horizontal AND vertical panel boundaries, so each manga panel
         # gets its own individual 1920x1080 frame.
+        ensure_resources(cfg, Stage.CHAPTER, chapter)
+        _record_stage(cfg, Stage.CHAPTER, State.RUNNING, chapter)
         cfg.write_progress("slice", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: slicing panels...")
         frame_data = slice_chapter_panels(cfg, chapter)
@@ -2241,6 +2411,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                          chapter.tag, len(frame_paths))
                 # One segment per frame — narration perfectly synced to each panel.
                 for pos, fp in enumerate(frame_paths):
+                    ensure_resources(cfg, Stage.NARRATION, chapter, panel_id=fp.name)
                     raw_text = chapter.image_narrations.get(fp.name, "")
                     img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
                     translated = translate_text(cfg, raw_text, img_tag)
@@ -2254,6 +2425,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 # Legacy: translate + rephrase each source image's narration.
                 panel_narrations: dict = {}  # panel_index -> narration text
                 for idx, panel_path in enumerate(chapter.panel_paths):
+                    ensure_resources(cfg, Stage.NARRATION, chapter, panel_id=panel_path.name)
                     raw_text = chapter.image_narrations.get(panel_path.name, "")
                     img_tag = f"{chapter.tag}_img{idx + 1:03d}"
                     translated = translate_text(cfg, raw_text, img_tag)
@@ -2289,9 +2461,20 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         for seg_idx, (tag, text, positions) in enumerate(segments):
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
+            ensure_resources(cfg, Stage.TTS, chapter, panel_id=tag)
             if text.strip():
                 tts_attempted += 1
-            audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+            try:
+                audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+                qa = audio_qa_result(audio_path_seg, allow_silence=not text.strip())
+                if not qa.ok:
+                    raise RuntimeError(qa.reason)
+                _record_stage(cfg, Stage.TTS, State.COMPLETE, chapter, panel_id=tag, provider="local-production" if cfg.production_mode else "edge-tts", artifact_path=audio_path_seg, artifact_checksum=checksum_file(audio_path_seg), duration=qa.duration)
+            except Exception as exc:
+                category = classify_retry(exc)
+                state = State.FAILED if category in (RetryCategory.INVALID_INPUT, RetryCategory.PERMANENT_FAILURE) else State.RETRYABLE
+                _record_stage(cfg, Stage.TTS, state, chapter, panel_id=tag, error_code=category.value, error_message=str(exc), retry_category=category)
+                raise
             if seg_tts_failed:
                 tts_failed += 1
             duration = get_audio_duration(audio_path_seg)
@@ -2367,6 +2550,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         if video_path:
             chapter_videos.append(video_path)
 
+        _record_stage(cfg, Stage.CHAPTER, State.COMPLETE, chapter)
         log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
         cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
 
@@ -2378,6 +2562,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     merged = merge_chapters(cfg, chapter_videos)
     cfg.write_progress("bgm", total, total, "Finalizing output")
     finalize_output(cfg, merged)
+    _record_stage(cfg, Stage.JOB, State.COMPLETE)
     cleanup_temp(cfg)
 
     elapsed = time.time() - start
@@ -2459,6 +2644,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging.",
     )
+    parser.add_argument("--production-mode", action="store_true", help="Use local-only production mode: no edge-tts/OpenAI dependency checks or runtime installs.")
+    parser.add_argument("--job-id", default="local", help="Stable job id for production state/recovery records.")
     parser.add_argument(
         "--slice-only", action="store_true",
         help="Only run the panel-slicing stage for all chapters, then exit. "
@@ -2491,6 +2678,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         narration_model=args.narration_model,
         progress_file=args.progress_file,
         slice_only=args.slice_only,
+        production_mode=args.production_mode,
+        job_id=args.job_id,
     )
 
 
@@ -2506,32 +2695,13 @@ def check_dependencies(cfg: Optional[PipelineConfig] = None) -> None:
     if shutil.which("ffmpeg") is None:
         log.error("ffmpeg not found on PATH. Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`).")
         sys.exit(1)
-    # edge-tts is only needed for the full render pipeline, not for --slice-only.
-    if cfg is not None and getattr(cfg, "slice_only", False):
+    if cfg is not None and (getattr(cfg, "slice_only", False) or getattr(cfg, "production_mode", False)):
         return
     try:
         import edge_tts  # noqa: F401
     except ImportError:
-        log.warning("edge-tts not installed — attempting auto-install via pip...")
-        import subprocess
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "edge-tts", "openai"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode == 0:
-                log.info("edge-tts + openai installed successfully")
-                # Verify it imports now
-                import importlib
-                importlib.invalidate_caches()
-                import edge_tts  # noqa: F401
-                log.info("edge-tts import verified")
-            else:
-                log.error("Failed to install edge-tts: %s", result.stderr[-300:])
-                sys.exit(1)
-        except Exception as e:
-            log.error("Failed to auto-install edge-tts: %s. Run: pip install edge-tts", e)
-            sys.exit(1)
+        log.error("edge-tts missing. Install pipeline dev dependencies or run --production-mode for local Piper/eSpeak TTS.")
+        sys.exit(1)
 
 
 def run_slice_only(cfg: PipelineConfig) -> None:

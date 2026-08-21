@@ -54,6 +54,6 @@ No environment variables required to start. Add `MEGA_EMAIL` / `MEGA_PASSWORD`
 - **PaddleOCR PP-OCRv5** primary transcription (+13% accuracy over v4, no API keys)
 - VLM providers (SiliconFlow, Gemini, Groq) as automatic OCR fallback
 - YOLO panel detection
-- edge-tts narration with clean audio (no pops/clicks)
+- Local-first production TTS (Piper → Piper retry → eSpeak NG) with QA-checked audio artifacts
 - Mega cloud archive (auto-upload + on-demand restore)
 - Full HTTP Range video streaming (seek support)

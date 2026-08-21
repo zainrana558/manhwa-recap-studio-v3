@@ -572,6 +572,8 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     '--work-dir', workDir(jobId),
     '--voice', 'en-US-AndrewNeural', // unused by slice-only, but required by argparse
     '--narration-provider', 'none',
+    '--job-id', jobId,
+    ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--slice-only',
     '--keep-temp',
   ]
@@ -1147,6 +1149,8 @@ async function processJob(jobId: string): Promise<void> {
     '--work-dir', workDir(jobId),
     '--voice', job.voice,
     '--narration-provider', 'none',
+    '--job-id', jobId,
+    ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--progress-file', progressFile,
     '--keep-temp',
   ]
@@ -1357,7 +1361,7 @@ async function processJob(jobId: string): Promise<void> {
           const archiveName = `${safeTitle}_recap.mp4`
 
           await new Promise<void>((resolve, reject) => {
-            const s = mega.Storage({
+            const s = new mega.Storage({
               email: megaEmail,
               password: megaPassword,
               autoload: true,
@@ -1365,7 +1369,7 @@ async function processJob(jobId: string): Promise<void> {
             s.on('ready', () => {
               try {
                 const uploadStream = s.upload(archiveName)
-                createReadStream(outFile).pipe(uploadStream)
+                createReadStream(outFile).pipe(uploadStream as any)
                 uploadStream.on('complete', () => {
                   try {
                     archiveProvider = 'mega'
@@ -1375,12 +1379,12 @@ async function processJob(jobId: string): Promise<void> {
                     reject(err)
                   }
                 })
-                uploadStream.on('error', (err: Error) => reject(err))
+                ;(uploadStream as any).on('error', (err: Error) => reject(err))
               } catch (err) {
                 reject(err)
               }
             })
-            s.on('error', (err: Error) => reject(err))
+            ;(s as any).on('error', (err: Error) => reject(err))
           })
 
           // Delete local file after successful upload.
@@ -1508,17 +1512,22 @@ function sendJson(res: ServerResponse, code: number, body: unknown) {
 httpServer.listen(PORT, async () => {
   console.log(`[pipeline-service] listening on port ${PORT} (socket.io path "/")`)
 
-  // PYTHON DEPENDENCY CHECK: verify that edge-tts, openai, PIL, cv2, numpy are
-  // installed in the Python environment. If any are missing, auto-install them
-  // via pip. This prevents the "edge-tts not installed" render failure that
-  // happens when the venv gets reset.
+  // PYTHON DEPENDENCY CHECK: production mode is local-first and must not require
+  // edge-tts/openai or install packages at runtime. Legacy/dev mode can still
+  // use pipeline/requirements.txt if explicitly selected with PRODUCTION_PIPELINE=0.
   try {
-    const checkResult = spawnSync(PYTHON_BIN, ['-c', 'import edge_tts, openai, PIL, cv2, numpy'], {
+    const productionPipeline = process.env.PRODUCTION_PIPELINE !== '0'
+    const depSnippet = productionPipeline ? 'import PIL, cv2, numpy' : 'import edge_tts, openai, PIL, cv2, numpy'
+    const checkResult = spawnSync(PYTHON_BIN, ['-c', depSnippet], {
       encoding: 'utf8',
       timeout: 10000,
     })
     if (checkResult.status !== 0) {
-      console.log('[pipeline-service] Python deps missing — auto-installing from pipeline/requirements.txt')
+      if (productionPipeline) {
+        console.error('[pipeline-service] Production Python deps missing; not auto-installing at runtime')
+        return
+      }
+      console.log('[pipeline-service] Legacy Python deps missing — auto-installing from pipeline/requirements.txt')
       const installResult = spawnSync(PYTHON_BIN, ['-m', 'pip', 'install', '-r', path.join(PROJECT_ROOT, 'pipeline', 'requirements.txt')], {
         encoding: 'utf8',
         timeout: 120000,
@@ -1530,7 +1539,7 @@ httpServer.listen(PORT, async () => {
         console.error('[pipeline-service] Failed to install Python deps:', installResult.stderr?.slice(-300))
       }
     } else {
-      console.log('[pipeline-service] Python deps OK (edge-tts, openai, PIL, cv2, numpy)')
+      console.log(`[pipeline-service] Python deps OK (${depSnippet})`)
     }
   } catch (err) {
     console.error('[pipeline-service] Python dep check failed:', err)
@@ -1623,7 +1632,7 @@ process.on('unhandledRejection', (err) => {
   console.error('[pipeline-service] unhandledRejection:', err)
 })
 process.on('exit', (code, signal) => {
-  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(process.memoryUsage.rss / 1024 / 1024)}MB`)
+  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`)
 })
 // Log memory usage every 30s to detect leaks.
 setInterval(() => {

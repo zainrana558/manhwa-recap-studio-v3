@@ -43,6 +43,8 @@ logger = logging.getLogger("paddleocr-service")
 ocr = None  # type: Any
 MODEL_NAME = "unknown"  # type: str
 MODEL_READY = False  # type: bool
+FALLBACK_OCR_ENGINES = {}  # type: dict
+UNAVAILABLE_PROVIDERS = {}  # type: dict
 
 
 def _init_ocr():
@@ -170,11 +172,15 @@ class OCRErrorInfo(BaseModel):
 
 
 class OCRResult(BaseModel):
-    """OCR output for a single image."""
+    """OCR output for a single image; status must be preserved downstream."""
     index: int = 0
     text: str = ""
     confidence: float = 0.0
     regions: int = 0
+    status: str = "FAILED"
+    quality_score: float = 0.0
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
 
 
 class OCROptions(BaseModel):
@@ -218,6 +224,10 @@ class Base64OCRResponse(BaseModel):
     text: str
     confidence: float
     regions: int
+    status: str
+    quality_score: float
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
     model: str
     processing_time_ms: float
 
@@ -227,6 +237,10 @@ class SingleOCRResponse(BaseModel):
     text: str
     confidence: float
     regions: int
+    status: str
+    quality_score: float
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
     model: str
     processing_time_ms: float
 
@@ -347,11 +361,12 @@ def _ensure_list(x):
         return [x]
 
 
-def _run_ocr_on_image(img, options=None):
-    # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
+def _run_ocr_on_image(img, options=None, engine=None):
+    # type: (np.ndarray, Optional[OCROptions], Any) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
     global ocr
-    if ocr is None:
+    engine = engine or ocr
+    if engine is None:
         return []
 
     # One-time debug flag to dump result structure
@@ -379,17 +394,17 @@ def _run_ocr_on_image(img, options=None):
 
     try:
         # PaddleOCR v3.7+ uses predict(); older versions use ocr()
-        raw_result = ocr.predict(img, **predict_kwargs)
+        raw_result = engine.predict(img, **predict_kwargs)
     except TypeError as exc:
         # predict() exists but rejected one of our kwargs (older/newer API
         # drift) — retry without the extra kwargs before falling back to the
         # legacy ocr() method entirely.
         logger.warning("predict() kwarg mismatch (%s) — retrying without extra kwargs", exc)
         try:
-            raw_result = ocr.predict(img)
+            raw_result = engine.predict(img)
         except Exception:
             try:
-                raw_result = ocr.ocr(img)
+                raw_result = engine.ocr(img)
             except Exception as exc2:
                 logger.warning("OCR inference failed: %s", exc2)
                 return []
@@ -561,6 +576,121 @@ def _decode_base64_image(b64_string):
         return None
 
 
+
+def _load_fallback_engine(label, ocr_version):
+    # type: (str, str) -> Any
+    if label in FALLBACK_OCR_ENGINES:
+        return FALLBACK_OCR_ENGINES[label]
+    if label in UNAVAILABLE_PROVIDERS:
+        return None
+    try:
+        from paddleocr import PaddleOCR
+        engine = PaddleOCR(ocr_version=ocr_version, lang="en")
+        FALLBACK_OCR_ENGINES[label] = engine
+        logger.info("Lazy-loaded OCR fallback %s (%s)", label, ocr_version)
+        return engine
+    except Exception as exc:
+        UNAVAILABLE_PROVIDERS[label] = str(exc)
+        logger.warning("OCR fallback unavailable: %s (%s)", label, exc)
+        return None
+
+
+def _enhance_for_ocr(img):
+    # type: (np.ndarray) -> np.ndarray
+    try:
+        import cv2
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 else img
+        gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        enhanced = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    except Exception as exc:
+        logger.warning("Enhanced OCR preprocessing unavailable: %s", exc)
+        return img
+
+
+def _run_tesseract_last_resort(img):
+    # type: (np.ndarray) -> Tuple[str, float, int]
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile
+    if _shutil.which("tesseract") is None:
+        UNAVAILABLE_PROVIDERS.setdefault("tesseract", "tesseract binary unavailable")
+        return "", 0.0, 0
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_name = tmp.name
+            Image.fromarray(img).save(tmp_name)
+        proc = _subprocess.run(["tesseract", tmp_name, "stdout", "-l", "eng", "--psm", "6"], stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, timeout=30)
+        if proc.returncode != 0:
+            UNAVAILABLE_PROVIDERS["tesseract"] = proc.stderr[-200:]
+            return "", 0.0, 0
+        text = " ".join(proc.stdout.split())
+        return text, 0.55 if text else 0.0, 1 if text else 0
+    except Exception as exc:
+        UNAVAILABLE_PROVIDERS["tesseract"] = str(exc)
+        return "", 0.0, 0
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+
+
+def _candidate_dict(provider, text, confidence, regions, status, quality_score, reason):
+    return {"provider": provider, "text": text, "confidence": confidence, "regions": regions, "status": status, "quality_score": quality_score, "selection_reason": reason}
+
+
+def _run_ocr_cascade(img, options=None):
+    # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, list, str]
+    candidates = []
+
+    def add_candidate(provider, regions):
+        text, conf, count = _merge_regions(regions)
+        status, quality, reason = _quality_status(text, conf, count)
+        candidates.append(_candidate_dict(provider, text, conf, count, status, quality, reason))
+        return text, conf, count, status, quality, reason
+
+    text, conf, count, status, quality, reason = add_candidate(MODEL_NAME or "PP-OCRv5", _run_ocr_on_image(img, options))
+    if status == "SUCCESS":
+        return text, conf, count, status, quality, candidates, reason
+
+    enhanced = _enhance_for_ocr(img)
+    text, conf, count, status, quality, reason = add_candidate(f"{MODEL_NAME}+enhanced", _run_ocr_on_image(enhanced, options))
+    if status == "SUCCESS":
+        return text, conf, count, status, quality, candidates, reason
+
+    if os.environ.get("ENABLE_PPOCRV6_FALLBACK") == "1":
+        engine = _load_fallback_engine("PP-OCRv6", "PP-OCRv6")
+        if engine is not None:
+            text, conf, count, status, quality, reason = add_candidate("PP-OCRv6", _run_ocr_on_image(img, options, engine=engine))
+            if status == "SUCCESS":
+                return text, conf, count, status, quality, candidates, reason
+        else:
+            candidates.append({"provider": "PP-OCRv6", "status": "UNAVAILABLE", "reason": UNAVAILABLE_PROVIDERS.get("PP-OCRv6", "unavailable")})
+
+    tess_text, tess_conf, tess_count = _run_tesseract_last_resort(enhanced)
+    tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_count)
+    candidates.append(_candidate_dict("tesseract", tess_text, tess_conf, tess_count, tess_status, tess_quality, tess_reason))
+    if tess_status == "SUCCESS":
+        return tess_text, tess_conf, tess_count, tess_status, tess_quality, candidates, tess_reason
+
+    best = max(candidates, key=lambda c: float(c.get("quality_score") or 0.0)) if candidates else _candidate_dict("none", "", 0.0, 0, "FAILED", 0.0, "no_candidates")
+    final_status = "UNCERTAIN" if candidates else "FAILED"
+    return str(best.get("text") or ""), float(best.get("confidence") or 0.0), int(best.get("regions") or 0), final_status, float(best.get("quality_score") or 0.0), candidates, "no_successful_ocr_candidate"
+
+def _quality_status(text, confidence, regions):
+    # Empty/no-region output is explicitly UNCERTAIN, not successful text.
+    quality = round(max(0.0, min(1.0, (confidence or 0.0))) * (1.0 if regions > 0 else 0.0), 4)
+    if regions > 0 and text.strip() and confidence >= 0.55:
+        return "SUCCESS", quality, "accepted_confident_candidate"
+    if regions > 0 or text.strip():
+        return "UNCERTAIN", quality, "low_confidence_or_incomplete_candidate"
+    return "UNCERTAIN", 0.0, "no_regions_detected_blank_or_failed"
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -603,14 +733,13 @@ async def ocr_batch(request: BatchOCRRequest):
         img_array = _load_image_from_path(img_path)
         if img_array is None:
             logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
-            results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0))
+            results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image"))
             continue
 
-        regions = _run_ocr_on_image(img_array, request.options)
-        merged_text, avg_conf, region_count = _merge_regions(regions)
+        merged_text, avg_conf, region_count, status, quality_score, candidates, reason = _run_ocr_cascade(img_array, request.options)
 
         if region_count == 0:
-            logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
+            logger.warning("[OCR] Zero regions detected for %s (index %d) after cascade — panel may be blank, or detection failed", img_path, idx)
 
         results.append(
             OCRResult(
@@ -618,6 +747,10 @@ async def ocr_batch(request: BatchOCRRequest):
                 text=merged_text,
                 confidence=avg_conf,
                 regions=region_count,
+                status=status,
+                quality_score=quality_score,
+                candidates=candidates,
+                selection_reason=reason,
             )
         )
 
@@ -650,8 +783,7 @@ async def ocr_base64(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array, request.options)
-    merged_text, avg_conf, region_count = _merge_regions(regions)
+    merged_text, avg_conf, region_count, status, quality_score, candidates, reason = _run_ocr_cascade(img_array, request.options)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
@@ -665,6 +797,10 @@ async def ocr_base64(request: Base64OCRRequest):
         text=merged_text,
         confidence=avg_conf,
         regions=region_count,
+        status=status,
+        quality_score=quality_score,
+        candidates=candidates,
+        selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,
     )
@@ -684,8 +820,7 @@ async def ocr_single(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array, request.options)
-    merged_text, avg_conf, region_count = _merge_regions(regions)
+    merged_text, avg_conf, region_count, status, quality_score, candidates, reason = _run_ocr_cascade(img_array, request.options)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
@@ -699,6 +834,10 @@ async def ocr_single(request: Base64OCRRequest):
         text=merged_text,
         confidence=avg_conf,
         regions=region_count,
+        status=status,
+        quality_score=quality_score,
+        candidates=candidates,
+        selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,
     )

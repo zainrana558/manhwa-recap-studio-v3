@@ -147,7 +147,7 @@ On your own laptop:
    ```bash
    python -m venv .venv
    source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install edge-tts openai Pillow opencv-python numpy torch torchvision ultralytics huggingface-hub
+   pip install -r pipeline/requirements.txt && pip install -r mini-services/paddleocr-service/requirements.txt
    ```
 
 3. Create a `.env` file on your laptop with the **same** Turso + R2 credentials

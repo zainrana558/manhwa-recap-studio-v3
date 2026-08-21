@@ -131,7 +131,7 @@ const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent
 // cache key was previously derived from the image path alone.
 // v2: raised det_db_unclip_ratio from PaddleOCR's document-tuned default
 // (1.8) to 2.4 for manhwa/manhua's bolder, hand-lettered speech-bubble text.
-const OCR_TUNING_VERSION = 'v2'
+const OCR_TUNING_VERSION = 'v3-status-aware'
 
 function vlmCacheKey(imagePath: string): string {
   return crypto.createHash('sha256').update(imagePath).digest('hex').slice(0, 16)
@@ -787,8 +787,8 @@ export async function fetchAsuraScansChapters(
   if (!res.ok) {
     throw new Error(`AsuraScans chapters ${res.status} for ${mangaSlug}`)
   }
-  const body = await res.json()
-  const chapters: AsuraChapter[] = body?.data ?? []
+  const body = (await res.json()) as { data?: AsuraChapter[] }
+  const chapters: AsuraChapter[] = body.data ?? []
 
   // API returns newest-first; reverse to oldest-first.
   const oldest = [...chapters].reverse()
@@ -824,8 +824,8 @@ export async function fetchAsuraScansChapterImages(
   if (!res.ok) {
     throw new Error(`AsuraScans chapter ${res.status} for ${mangaSlug}/${chapterSlug}`)
   }
-  const body = await res.json()
-  const pages: AsuraChapterPage[] = body?.data?.chapter?.pages ?? []
+  const body = (await res.json()) as { data?: { chapter?: { pages?: AsuraChapterPage[] } } }
+  const pages: AsuraChapterPage[] = body.data?.chapter?.pages ?? []
   return pages.map((p) => p.url).filter((u): u is string => Boolean(u))
 }
 
@@ -965,25 +965,27 @@ export async function getOCRModelName(): Promise<string> {
 }
 
 /** Get cached OCR result for an image, or null if not cached. */
-async function getOcrCached(key: string): Promise<string | null> {
+async function getOcrCached(key: string): Promise<{ text: string; status: string } | null> {
   try {
     const cacheFile = path.join(OCR_CACHE_DIR, `${key}.json`)
     const stat = await fs.stat(cacheFile)
     if (Date.now() - stat.mtimeMs > VLM_CACHE_TTL_MS) return null
     const data = JSON.parse(await fs.readFile(cacheFile, 'utf8'))
-    return data.text ?? null
+    const status = String(data.status || 'SUCCESS').toUpperCase()
+    if (status !== 'SUCCESS') return null
+    return { text: data.text ?? '', status }
   } catch {
     return null
   }
 }
 
 /** Save OCR result to cache. */
-async function setOcrCached(key: string, text: string): Promise<void> {
+async function setOcrCached(key: string, text: string, status = 'SUCCESS'): Promise<void> {
   try {
     await fs.mkdir(OCR_CACHE_DIR, { recursive: true })
     await fs.writeFile(
       path.join(OCR_CACHE_DIR, `${key}.json`),
-      JSON.stringify({ text, ts: Date.now() }),
+      JSON.stringify({ text, status, ts: Date.now() }),
       'utf8',
     )
   } catch {
@@ -1050,10 +1052,10 @@ export async function generateImageNarrationsOCR(
       const cacheKey = ocrCacheKey(batchPaths[j])
       const cached = await getOcrCached(cacheKey)
       if (cached !== null) {
-        results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached }
+        results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached.text }
         // Cached non-empty text is itself evidence the detector fired at
         // some point in the past — count it toward the "detector works" signal.
-        if (cached.trim()) totalRegionsDetected += 1
+        if (cached.text.trim()) totalRegionsDetected += 1
         completedCount++
       } else {
         uncachedIndices.push(j)
@@ -1100,12 +1102,14 @@ export async function generateImageNarrationsOCR(
       }
 
       const data = (await res.json()) as {
-        results: Array<{ index: number; text: string; confidence: number; regions: number }>
+        results: Array<{ index: number; text: string; confidence: number; regions: number; status?: string; quality_score?: number; candidates?: unknown[]; selection_reason?: string }>
         model: string
         processing_time_ms: number
       }
 
       const elapsed = Date.now() - t0
+      const uncertainCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'UNCERTAIN').length
+      const failedCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'FAILED').length
       const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
       totalRegionsDetected += batchRegions
       freshlyProcessed += data.results.length
@@ -1119,7 +1123,8 @@ export async function generateImageNarrationsOCR(
         if (localIdx === undefined) continue
 
         const globalIdx = startIdx + localIdx
-        const text = (ocrResult.text || '').trim()
+        const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
+        const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
 
         // Cache the result. setOcrCached uses the versioned OCR key (so a
         // future OCR_TUNING_VERSION bump invalidates it correctly);
@@ -1128,8 +1133,8 @@ export async function generateImageNarrationsOCR(
         // optimization (if VLM fallback runs later, it can reuse this text
         // instead of re-calling an LLM for a panel we already transcribed).
         const imgPath = uncachedPaths[ocrResult.index]
-        if (text) {
-          void setOcrCached(ocrCacheKey(imgPath), text)
+        if (text && status === 'SUCCESS') {
+          void setOcrCached(ocrCacheKey(imgPath), text, status)
           void setVlmCached(vlmCacheKey(imgPath), text)
         }
 
@@ -1410,7 +1415,7 @@ export async function generateImageNarrations(
     const providerLabel = pickProvider()
     console.log(`[VLM] batch ${num}/${totalBatches} → ${providerLabel} (${images.length} panels)`)
 
-    let batchTexts: string[]
+    let batchTexts: string[] = []
     let succeeded = false
     let countedPerImage = false  // set true if single-image fallback counted panels
     try {
