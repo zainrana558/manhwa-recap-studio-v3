@@ -55,7 +55,7 @@ import {
   fileExists,
 } from './lib'
 import { isR2Configured, uploadFileToR2 } from './r2'
-import * as mega from 'megajs'
+import { Storage as MegaStorage } from 'megajs'
 import { createReadStream } from 'fs'
 
 // ---------------------------------------------------------------------------
@@ -277,6 +277,45 @@ function extractJobId(payload: unknown): string | null {
     if (typeof p.jobId === 'string') return p.jobId
   }
   return null
+}
+
+
+type VideoQaResult = { ok: true; sizeBytes: number; durationSec: number } | { ok: false; error: string }
+
+async function validateFinalVideoArtifact(filePath: string): Promise<VideoQaResult> {
+  let st
+  try {
+    st = await fs.stat(filePath)
+  } catch (err) {
+    return { ok: false, error: `output file is missing or unreadable: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (!st.isFile() || st.size < 1024) {
+    return { ok: false, error: `output file is too small or not a regular file (${st.size} bytes)` }
+  }
+
+  const probe = spawnSync('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration:stream=codec_type',
+    '-of', 'json',
+    filePath,
+  ], { encoding: 'utf8', timeout: 30000, shell: false })
+
+  if (probe.error) return { ok: false, error: `ffprobe unavailable or failed to start: ${probe.error.message}` }
+  if (probe.status !== 0) return { ok: false, error: `ffprobe failed: ${(probe.stderr || probe.stdout || '').slice(0, 500)}` }
+
+  try {
+    const parsed: unknown = JSON.parse(probe.stdout || '{}')
+    if (typeof parsed !== 'object' || parsed === null) return { ok: false, error: 'ffprobe returned malformed JSON' }
+    const rec = parsed as { format?: { duration?: unknown }; streams?: Array<{ codec_type?: unknown }> }
+    const duration = Number(rec.format?.duration)
+    const streams = Array.isArray(rec.streams) ? rec.streams : []
+    if (!Number.isFinite(duration) || duration <= 0) return { ok: false, error: 'video has no positive duration' }
+    if (!streams.some((stream) => stream.codec_type === 'video')) return { ok: false, error: 'video stream missing' }
+    if (!streams.some((stream) => stream.codec_type === 'audio')) return { ok: false, error: 'audio stream missing' }
+    return { ok: true, sizeBytes: st.size, durationSec: duration }
+  } catch (err) {
+    return { ok: false, error: `could not parse ffprobe output: ${err instanceof Error ? err.message : String(err)}` }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,6 +1331,20 @@ async function processJob(jobId: string): Promise<void> {
       io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
       return
     }
+    const qa = await validateFinalVideoArtifact(outFile)
+    if (!qa.ok) {
+      const msg = `Rendered artifact failed video QA: ${qa.error}`
+      await emitLog(jobId, 'error', 'render', msg)
+      await db.job.update({
+        where: { id: jobId },
+        data: { status: 'error', error: msg, stage: 'render' },
+      })
+      await emitStatus(jobId)
+      io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
+      return
+    }
+    await emitLog(jobId, 'success', 'render', `Video QA passed (${Math.round(qa.sizeBytes / 1024 / 1024)}MB, ${Math.round(qa.durationSec)}s, audio+video streams present)`)
+
     const outName = path.basename(outFile)
 
     // -----------------------------
@@ -1361,7 +1414,7 @@ async function processJob(jobId: string): Promise<void> {
           const archiveName = `${safeTitle}_recap.mp4`
 
           await new Promise<void>((resolve, reject) => {
-            const s = mega.Storage({
+            const s = new MegaStorage({
               email: megaEmail,
               password: megaPassword,
               autoload: true,
@@ -1369,22 +1422,27 @@ async function processJob(jobId: string): Promise<void> {
             s.on('ready', () => {
               try {
                 const uploadStream = s.upload(archiveName)
-                createReadStream(outFile).pipe(uploadStream)
-                uploadStream.on('complete', () => {
-                  try {
+                const source = createReadStream(outFile)
+                source.on('error', (err) => reject(err))
+
+                // megajs ships Deno-oriented stream declarations, while at
+                // runtime this is a Node writable stream. Keep that mismatch
+                // isolated at the library boundary instead of weakening the
+                // rest of the upload path.
+                source.pipe(uploadStream as unknown as NodeJS.WritableStream)
+
+                uploadStream.complete
+                  .then(async (file) => {
                     archiveProvider = 'mega'
-                    archiveFileId = (uploadStream as any).link()
+                    archiveFileId = await file.link(false)
                     resolve()
-                  } catch (err) {
-                    reject(err)
-                  }
-                })
-                uploadStream.on('error', (err: Error) => reject(err))
+                  })
+                  .catch((err: unknown) => reject(err))
               } catch (err) {
                 reject(err)
               }
             })
-            s.on('error', (err: Error) => reject(err))
+            ;(s as unknown as { on(event: 'error', listener: (err: Error) => void): void }).on('error', (err) => reject(err))
           })
 
           // Delete local file after successful upload.
@@ -1632,7 +1690,8 @@ process.on('unhandledRejection', (err) => {
   console.error('[pipeline-service] unhandledRejection:', err)
 })
 process.on('exit', (code, signal) => {
-  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(process.memoryUsage.rss / 1024 / 1024)}MB`)
+  const m = process.memoryUsage()
+  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(m.rss / 1024 / 1024)}MB`)
 })
 // Log memory usage every 30s to detect leaks.
 setInterval(() => {
