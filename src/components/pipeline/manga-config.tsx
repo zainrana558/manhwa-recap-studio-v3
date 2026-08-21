@@ -64,7 +64,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [megaEmail, setMegaEmail] = useState("");
   const [megaPassword, setMegaPassword] = useState("");
   const [autoArchive, setAutoArchive] = useState(false);
-  const [translate, setTranslate] = useState(true);
+  const [translate, setTranslate] = useState(false);
 
   // Chapter selection mode: "first-n" = slider, "specific" = grid picker
   const [chapterSelectionMode, setChapterSelectionMode] = useState<"first-n" | "specific">("first-n");

@@ -1075,6 +1075,7 @@ export async function generateImageNarrationsOCR(
       const res = await fetch(`${baseUrl}/ocr/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+<<<<<<< Updated upstream
         body: JSON.stringify({
           images: uncachedPaths,
           // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
@@ -1094,6 +1095,10 @@ export async function generateImageNarrationsOCR(
           options: { det_db_unclip_ratio: 2.4 },
         }),
         signal: AbortSignal.timeout(120000), // 2 min timeout for large batches
+=======
+        body: JSON.stringify({ images: uncachedPaths }),
+        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000), // CPU OCR ~13s/image observed; generous margin per image
+>>>>>>> Stashed changes
       })
 
       if (!res.ok) {

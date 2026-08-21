@@ -12,7 +12,7 @@ echo "🚀 Starting Manhwa Recap Studio..."
 echo ""
 
 # Kill any existing processes
-pkill -f "next-server" 2>/dev/null || true
+fuser -k 3000/tcp 2>/dev/null || true
 fuser -k 3002/tcp 2>/dev/null || true
 pkill -f "pipeline-service" 2>/dev/null || true
 pkill -f "index.ts" 2>/dev/null || true
@@ -71,7 +71,7 @@ echo "  🌐 Website:  http://$PUBLIC_IP"
 echo "  📊 API:      http://$PUBLIC_IP/api/stats"
 echo "  🔧 Pipeline: http://$PUBLIC_IP:3001/internal/health"
 echo ""
-echo "  To stop:     pkill -f 'next-server|index.ts'"
+echo "  To stop:     fuser -k 3000/tcp; pkill -f 'index.ts'"
 echo "  To restart:  bash start.sh"
 echo "  Logs:        tail -f nextjs.log pipeline.log paddleocr.log"
 echo ""
