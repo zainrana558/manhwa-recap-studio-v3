@@ -300,7 +300,7 @@ def generate_youtube_metadata(
         "",
         "--- TAGS ---",
         f"#manhwa #manga #recap #{title_base.replace(' ', '').lower()} #webtoon ",
-        f"#manhwarecap #mangarecap #storyexplained #fullrecap",
+        "#manhwarecap #mangarecap #storyexplained #fullrecap",
     ])
 
     description = "\n".join(description_parts)
@@ -414,26 +414,26 @@ def main() -> int:
 
     # 4. Summary
     print(f"\n{'=' * 60}")
-    print(f"[YT] === YOUTUBE-READY OUTPUT (SEO OPTIMIZED) ===")
+    print("[YT] === YOUTUBE-READY OUTPUT (SEO OPTIMIZED) ===")
     print(f"{'=' * 60}")
     print(f"[YT] Video:      {yt_video_path}")
     print(f"[YT] Thumbnail:  {thumb_path}")
     print(f"[YT] Metadata:   {metadata_path}")
-    print(f"[YT]")
+    print("[YT]")
     print(f"[YT] Title:      {metadata['title']}")
     print(f"[YT] Tags ({len(metadata['tags'])}):  {', '.join(metadata['tags'][:8])}...")
     print(f"[YT] Hashtags:   {' '.join(metadata['hashtags'])}")
-    print(f"[YT] Category:   Entertainment (24)")
-    print(f"[YT] Privacy:    Private (review before publishing)")
+    print("[YT] Category:   Entertainment (24)")
+    print("[YT] Privacy:    Private (review before publishing)")
     print(f"{'=' * 60}")
-    print(f"[YT] Upload steps:")
-    print(f"[YT]   1. Go to studio.youtube.com → Create")
-    print(f"[YT]   2. Upload youtube_ready.mp4")
-    print(f"[YT]   3. Set thumbnail to thumbnail.jpg")
-    print(f"[YT]   4. Copy title + description from youtube_metadata.json")
-    print(f"[YT]   5. Add tags from youtube_metadata.json")
-    print(f"[YT]   6. Set category to Entertainment")
-    print(f"[YT]   7. Publish when ready!")
+    print("[YT] Upload steps:")
+    print("[YT]   1. Go to studio.youtube.com → Create")
+    print("[YT]   2. Upload youtube_ready.mp4")
+    print("[YT]   3. Set thumbnail to thumbnail.jpg")
+    print("[YT]   4. Copy title + description from youtube_metadata.json")
+    print("[YT]   5. Add tags from youtube_metadata.json")
+    print("[YT]   6. Set category to Entertainment")
+    print("[YT]   7. Publish when ready!")
 
     return 0
 

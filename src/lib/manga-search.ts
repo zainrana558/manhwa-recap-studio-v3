@@ -81,7 +81,7 @@ async function searchJikan(query: string, limit = 12): Promise<MangadexManga[]> 
 
   let res: Response;
   try {
-    res = await fetchWithTimeout(url, {
+    res = await fetchWithTimeout(url.toString(), {
       headers: { accept: "application/json" },
       cache: "no-store",
     });

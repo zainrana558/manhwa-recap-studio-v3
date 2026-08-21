@@ -273,10 +273,10 @@ export function JobComparison({ jobs }: JobComparisonProps) {
                           <span className="text-xs font-medium text-muted-foreground">{row.label}</span>
                         </div>
                         <div className="flex items-center text-sm">
-                          {row.format ? row.format(jobA!) : String((jobA as Record<string, unknown>)[row.key] ?? "—")}
+                          {row.format ? row.format(jobA!) : String((jobA as unknown as Record<string, unknown>)[row.key] ?? "—")}
                         </div>
                         <div className="flex items-center text-sm">
-                          {row.format ? row.format(jobB!) : String((jobB as Record<string, unknown>)[row.key] ?? "—")}
+                          {row.format ? row.format(jobB!) : String((jobB as unknown as Record<string, unknown>)[row.key] ?? "—")}
                         </div>
                       </div>
                     ))}

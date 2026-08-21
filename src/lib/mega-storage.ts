@@ -14,6 +14,7 @@
 import { Storage, File } from "megajs";
 import type { Storage as MegaStorage } from "megajs";
 import { createReadStream, createWriteStream } from "fs";
+import type { EventEmitter } from "events";
 
 let storage: MegaStorage | null = null;
 
@@ -37,7 +38,9 @@ function getMegaStorage(): Promise<MegaStorage> {
       storage = s;
       resolve(s);
     });
-    s.on("error", (err: Error) => {
+    // megajs's typed `Storage.on()` overloads don't include "error"; fall back
+    // to the underlying EventEmitter signature to register the handler.
+    (s as unknown as EventEmitter).on("error", (err: Error) => {
       reject(new Error(`Mega login failed: ${err.message}`));
     });
   });
@@ -61,7 +64,7 @@ export async function uploadToMega(
   return new Promise((resolve, reject) => {
     const uploadStream = s.upload(filename);
     const source = createReadStream(filePath);
-    source.pipe(uploadStream);
+    source.pipe(uploadStream as unknown as NodeJS.WritableStream);
 
     uploadStream.on("complete", () => {
       try {
@@ -98,7 +101,7 @@ export async function downloadFromMega(
       }
 
       const dest = createWriteStream(destPath);
-      const stream = file.download();
+      const stream = file.download({});
 
       stream.pipe(dest);
       stream.on("end", () => resolve());
