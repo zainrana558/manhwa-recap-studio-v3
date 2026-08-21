@@ -308,7 +308,7 @@ fi
 PY_MAJOR=$($_py_bin -c 'import sys; print(sys.version_info.major)')
 PY_MINOR=$($_py_bin -c 'import sys; print(sys.version_info.minor)')
 if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; then
-    log_error "Python $($_py_bin --version 2>&1 | awk '{print $2}') is too old — Python 3.10+ required (openai>=2.49 needs it)"
+    log_error "Python $($_py_bin --version 2>&1 | awk '{print $2}') is too old — production requires Python 3.10.x (target 3.10.4)"
     log_error ""
     log_error "QUICKEST FIX — install Miniconda (works on any Ubuntu version, ARM or x86):"
     log_error "  wget -qO- https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh | bash"
@@ -370,8 +370,6 @@ pip install -r pipeline/requirements.txt 2>&1 | tail -5
 # FIX #14: Verify critical imports
 log_info "Verifying Python environment..."
 if python3 -c "
-import edge_tts; print(f'  edge-tts: {edge_tts.__version__}')
-import openai; print(f'  openai: {openai.__version__}')
 import PIL; print(f'  Pillow: {PIL.__version__}')
 import cv2; print(f'  opencv: {cv2.__version__}')
 import numpy; print(f'  numpy: {numpy.__version__}')
