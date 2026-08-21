@@ -120,6 +120,8 @@ class PipelineConfig:
     narration_model: Optional[str] = None  # override model for narration
     progress_file: Optional[Path] = None  # JSON file the Node service polls
     slice_only: bool = False  # if True, only run panel slicing then exit (used by the Node orchestrator so VLM can read individual sliced panels)
+    production_mode: bool = False
+    job_id: str = "local"
 
     @property
     def temp_audio_dir(self) -> Path:
@@ -1737,7 +1739,7 @@ def split_into_segments(text: str, n: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. CONTINUOUS NEURAL TEXT-TO-SPEECH (edge-tts)
+# 4. LOCAL-FIRST PRODUCTION TEXT-TO-SPEECH (Piper -> Piper retry -> eSpeak NG)
 # ---------------------------------------------------------------------------
 # NOTE: narration used to be synthesized one tiny word-chunk at a time (one
 # edge-tts call per sliced frame) and then concatenated. edge-tts inserts a
@@ -1776,90 +1778,106 @@ def _generate_silence(path: Path, duration: float) -> None:
     )
 
 
-def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
-    """Generate ONE continuous narration clip (or silence) for a whole segment
-    (a single source panel, or the whole chapter in legacy mode). Resumable
-    per segment. This is the only place edge-tts is invoked per chapter run,
-    so the resulting speech has none of the artificial start/end pauses that
-    per-word synthesis introduced.
+def _audio_qa(path: Path, allow_silence: bool = False) -> bool:
+    if not path.exists() or path.stat().st_size < 44:
+        return False
+    try:
+        duration = get_audio_duration(path)
+        if duration <= 0.05:
+            return False
+        if allow_silence:
+            return True
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        probe = result.stderr + result.stdout
+        m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", probe)
+        return bool(m and float(m.group(1)) > -50.0)
+    except Exception:
+        return False
 
-    Returns (path, tts_failed) — tts_failed is True only when there WAS text
-    to narrate but edge-tts (or the WAV conversion) failed and silence was
-    substituted. It's False for segments that were always meant to be silent
-    (no dialogue on that panel). This distinction matters: previously a
-    total edge-tts outage (e.g. the Microsoft speech endpoint being blocked
-    by egress rules) would silently degrade every segment to silence with
-    only a per-segment log warning — a fully-broken chapter looked identical
-    in the logs to a normal, mostly-quiet one, and the pipeline reported
-    success with a genuinely silent output video."""
+
+def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not espeak:
+        raise RuntimeError("espeak-ng binary unavailable")
+    result = subprocess.run([espeak, "-w", str(out_wav), text], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed: {result.stderr[-200:]}")
+
+
+def _synthesize_with_piper(text: str, out_wav: Path) -> None:
+    piper = shutil.which("piper")
+    model = os.environ.get("PIPER_VOICE_MODEL")
+    if not piper or not model:
+        raise RuntimeError("piper binary/model unavailable")
+    with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        _out, err = proc.communicate(text, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(f"piper failed: {err[-200:]}")
+
+
+def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
+    """Generate atomic segment audio. Production never uses edge-tts or network TTS."""
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
-    # Output WAV (not MP3) — WAV has no encoder delay/padding, so concatenation
-    # is sample-accurate. This eliminates the audio/video sync drift that
-    # accumulated in the second half of videos when using MP3 intermediates.
     final_path = seg_audio_dir / f"{tag}.wav"
-    if final_path.exists():
-        return final_path, False
-
     text = text.strip()
-    if not text:
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
+    if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
         return final_path, False
+    final_path.unlink(missing_ok=True)
+    tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
+    tmp_path.unlink(missing_ok=True)
+    if not text:
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        if not _audio_qa(tmp_path, allow_silence=True):
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"silent audio QA failed for {tag}")
+        os.replace(tmp_path, final_path)
+        return final_path, False
+    failures = []
+    if getattr(cfg, "production_mode", False):
+        for provider in ("piper", "piper", "espeak"):
+            tmp_path.unlink(missing_ok=True)
+            try:
+                if provider == "piper":
+                    _synthesize_with_piper(text, tmp_path)
+                else:
+                    _synthesize_with_espeak(text, tmp_path)
+                if not _audio_qa(tmp_path, allow_silence=False):
+                    raise RuntimeError(f"{provider} output failed audio QA")
+                os.replace(tmp_path, final_path)
+                return final_path, False
+            except Exception as e:
+                failures.append(f"{provider}: {e}")
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Production TTS failed; no silent substitution: " + " | ".join(failures))
 
     import asyncio
     import edge_tts
-
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
-
     async def _run():
         communicate = edge_tts.Communicate(text, cfg.voice)
         await communicate.save(str(raw_path))
-
     try:
         asyncio.run(_run())
-        # Verify the raw audio file is non-empty (edge-tts can produce a
-        # 0-byte file for text it can't synthesize, e.g. single characters
-        # or pure punctuation).
         if not raw_path.exists() or raw_path.stat().st_size < 100:
             raise RuntimeError("edge-tts produced an empty audio file")
-    except Exception as e:
-        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        raw_path.unlink(missing_ok=True)
-        return final_path, True
-
-    # Re-encode at the pipeline's standard sample rate + bitrate, AND apply
-    # a short fade-in/fade-out. The fades eliminate the zero-crossing
-    # discontinuity at the start/end of each TTS clip, which is the #1 cause
-    # of audible "clicks" and "pops" when clips are concatenated back-to-back.
-    # 25ms in / 40ms out is imperceptible to human hearing but removes the
-    # transient completely. (edge-tts output often starts/ends mid-waveform.)
-    try:
         raw_dur = get_audio_duration(raw_path)
         fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
-        seg_af = (
-            f"afade=t=in:st=0:d={SEGMENT_FADE_IN},"
-            f"afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
-        )
-        # Convert edge-tts MP3 → WAV with fades. WAV output = no encoder
-        # delay/padding = sample-accurate concatenation later.
-        run_ffmpeg(
-            [
-                "ffmpeg", "-y", "-i", str(raw_path),
-                "-af", seg_af,
-                "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
-                str(final_path),
-            ]
-        )
+        seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-af", seg_af, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+        if not _audio_qa(tmp_path, allow_silence=False):
+            raise RuntimeError("edge-tts output failed audio QA")
+        os.replace(tmp_path, final_path)
+        return final_path, False
     except Exception as e:
-        log.warning("[%s] ffmpeg audio conversion failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        raw_path.unlink(missing_ok=True)
+        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence in legacy mode", chapter.tag, tag, e)
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        os.replace(tmp_path, final_path)
         return final_path, True
-
-    raw_path.unlink(missing_ok=True)
-    return final_path, False
-
+    finally:
+        raw_path.unlink(missing_ok=True)
 
 def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path]) -> Path:
     """Concatenate per-segment (per-panel) audio clips into one continuous
@@ -2459,6 +2477,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging.",
     )
+    parser.add_argument("--production-mode", action="store_true", help="Use local-only production mode: no edge-tts/OpenAI dependency checks or runtime installs.")
+    parser.add_argument("--job-id", default="local", help="Stable job id for production state/recovery records.")
     parser.add_argument(
         "--slice-only", action="store_true",
         help="Only run the panel-slicing stage for all chapters, then exit. "
@@ -2491,6 +2511,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         narration_model=args.narration_model,
         progress_file=args.progress_file,
         slice_only=args.slice_only,
+        production_mode=args.production_mode,
+        job_id=args.job_id,
     )
 
 
@@ -2506,32 +2528,13 @@ def check_dependencies(cfg: Optional[PipelineConfig] = None) -> None:
     if shutil.which("ffmpeg") is None:
         log.error("ffmpeg not found on PATH. Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`).")
         sys.exit(1)
-    # edge-tts is only needed for the full render pipeline, not for --slice-only.
-    if cfg is not None and getattr(cfg, "slice_only", False):
+    if cfg is not None and (getattr(cfg, "slice_only", False) or getattr(cfg, "production_mode", False)):
         return
     try:
         import edge_tts  # noqa: F401
     except ImportError:
-        log.warning("edge-tts not installed — attempting auto-install via pip...")
-        import subprocess
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "edge-tts", "openai"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode == 0:
-                log.info("edge-tts + openai installed successfully")
-                # Verify it imports now
-                import importlib
-                importlib.invalidate_caches()
-                import edge_tts  # noqa: F401
-                log.info("edge-tts import verified")
-            else:
-                log.error("Failed to install edge-tts: %s", result.stderr[-300:])
-                sys.exit(1)
-        except Exception as e:
-            log.error("Failed to auto-install edge-tts: %s. Run: pip install edge-tts", e)
-            sys.exit(1)
+        log.error("edge-tts missing. Install pipeline dev dependencies or run --production-mode for local Piper/eSpeak TTS.")
+        sys.exit(1)
 
 
 def run_slice_only(cfg: PipelineConfig) -> None:

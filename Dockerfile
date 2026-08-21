@@ -22,15 +22,12 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV BUN_INSTALL="/root/.bun"
 ENV PATH="${BUN_INSTALL}/bin}:${PATH}"
 
-# ---- Python dependencies (torch CPU + ultralytics + edge-tts + opencv) ------
+# ---- Python dependencies (Python 3.10.4 target; local-first production TTS) ------
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-    edge-tts openai Pillow opencv-python-headless numpy \
-    torch torchvision ultralytics huggingface-hub && \
-    pip install --no-cache-dir \
-    paddlepaddle paddleocr fastapi uvicorn python-multipart
+    pip install --no-cache-dir -r pipeline/requirements.txt && \
+    pip install --no-cache-dir -r mini-services/paddleocr-service/requirements.txt
 
 # Pre-download the YOLO model so the first job doesn't stall on a download
 RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" || true
