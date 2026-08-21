@@ -50,6 +50,7 @@ import {
   isPaddleOCRAvailable,
   getOCRModelName,
   filterCreditPanels,
+  filterJunkTextPanels,
   sleep,
   fileExists,
 } from './lib'
@@ -1045,9 +1046,20 @@ async function processJob(jobId: string): Promise<void> {
       // (scanlation credits, Discord links, Patreon, "next chapter" teasers,
       // etc.) that shouldn't be narrated. Their text is set to empty so the
       // Python render step treats them as silent/skipped frames.
-      const { filtered: narrations, creditsRemoved } = filterCreditPanels(rawNarrations)
+      const { filtered: creditFiltered, creditsRemoved } = filterCreditPanels(rawNarrations)
       if (creditsRemoved > 0) {
         await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: filtered out ${creditsRemoved} credit/author panel(s)`)
+      }
+
+      // FILTER PUNCTUATION-ONLY PANELS — bubbles that are only "......",
+      // "?!!", "!!" etc. (real stylistic "silence beat" bubbles, common in
+      // manhwa). OCR reads these correctly, but feeding literal punctuation
+      // to edge-tts produces garbage narration, not silence. Silence these
+      // instead of narrating them — same shape as the credit filter above,
+      // applied after it so it only sees panels the credit filter left alone.
+      const { filtered: narrations, junkRemoved } = filterJunkTextPanels(creditFiltered)
+      if (junkRemoved > 0) {
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: silenced ${junkRemoved} punctuation-only panel(s) (e.g. "...", "?!!") instead of narrating them literally`)
       }
 
       // Save narrations as narration.json. When frameKeyed, keys are sliced

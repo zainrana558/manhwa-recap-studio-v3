@@ -121,8 +121,31 @@ import crypto from 'crypto'
 const VLM_CACHE_DIR = path.join(DATA_DIR, 'cache', 'vlm')
 const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent)
 
+// Bump this whenever OCR tuning parameters (det_db_unclip_ratio, model
+// version, etc.) change in a way that could produce different text for the
+// same image. The 1-year TTL above means a stale cached EMPTY result from
+// before a detector fix would otherwise never get re-checked — confirmed
+// as a real cause of permanently-silent panels: an early run cached "no
+// text detected" for a panel, and no later code fix (including this one)
+// would ever re-process that panel without a version bump here, since the
+// cache key was previously derived from the image path alone.
+// v2: raised det_db_unclip_ratio from PaddleOCR's document-tuned default
+// (1.8) to 2.4 for manhwa/manhua's bolder, hand-lettered speech-bubble text.
+const OCR_TUNING_VERSION = 'v2'
+
 function vlmCacheKey(imagePath: string): string {
   return crypto.createHash('sha256').update(imagePath).digest('hex').slice(0, 16)
+}
+
+// Separate key function for OCR specifically (VLM has its own prompt/model
+// versioning concerns and isn't affected by det_db_unclip_ratio, so it keeps
+// the plain path-only key via vlmCacheKey above).
+function ocrCacheKey(imagePath: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${OCR_TUNING_VERSION}:${imagePath}`)
+    .digest('hex')
+    .slice(0, 16)
 }
 
 async function getVlmCached(key: string): Promise<string | null> {
@@ -236,6 +259,46 @@ export function filterCreditPanels(
     return n
   })
   return { filtered, creditsRemoved }
+}
+
+// A panel whose OCR'd text is nothing but punctuation/ellipsis/exclamation
+// marks — e.g. "......", "?!!", "!!" — with zero actual letters or digits.
+// These are real, common manhwa bubbles used as a stylistic "silence" beat
+// (a character trailing off, a wordless shock reaction). OCR reads them
+// correctly — that IS all the ink in the bubble — but feeding literal
+// punctuation into edge-tts produces garbage narration ("dot dot dot dot"
+// or nothing intelligible at all), not silence and not real dialogue.
+// Confirmed on real output: a "?!!"-only bubble at ~3:40 in a test video
+// produced exactly this failure mode.
+//
+// Deliberately narrow: requires ZERO letters/digits anywhere in the text.
+// A bubble like "Wait...!" has a real word in it and must NOT be caught
+// here — only pure symbol/punctuation bubbles qualify.
+const PUNCTUATION_ONLY_RE = /^[\s.,!?…\-–—~*'"()\[\]]+$/u
+
+export function isJunkOnlyText(text: string): boolean {
+  if (!text || !text.trim()) return false
+  return PUNCTUATION_ONLY_RE.test(text.trim())
+}
+
+/**
+ * Filter an array of {image, text} narrations, silencing panels whose text
+ * is nothing but punctuation (no letters/digits at all). Same shape as
+ * filterCreditPanels — text is set to empty (not the entry removed) so
+ * frame indices stay aligned with the Python render step's frame list.
+ */
+export function filterJunkTextPanels(
+  narrations: Array<{ image: string; text: string }>,
+): { filtered: Array<{ image: string; text: string }>; junkRemoved: number } {
+  let junkRemoved = 0
+  const filtered = narrations.map((n) => {
+    if (isJunkOnlyText(n.text)) {
+      junkRemoved++
+      return { ...n, text: '' }
+    }
+    return n
+  })
+  return { filtered, junkRemoved }
 }
 
 // ---------------------------------------------------------------------------
@@ -980,7 +1043,11 @@ export async function generateImageNarrationsOCR(
     const uncachedPaths: string[] = []
 
     for (let j = 0; j < batchPaths.length; j++) {
-      const cacheKey = vlmCacheKey(batchPaths[j]) // reuse same hash for cross-method cache sharing
+      // ocrCacheKey (not vlmCacheKey) — versioned so a change to OCR tuning
+      // (det_db_unclip_ratio etc., see OCR_TUNING_VERSION above) invalidates
+      // stale cached results instead of a permanently-empty result from an
+      // old detector setting being reused forever under the 1-year TTL.
+      const cacheKey = ocrCacheKey(batchPaths[j])
       const cached = await getOcrCached(cacheKey)
       if (cached !== null) {
         results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached }
@@ -1006,7 +1073,24 @@ export async function generateImageNarrationsOCR(
       const res = await fetch(`${baseUrl}/ocr/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ images: uncachedPaths }),
+        body: JSON.stringify({
+          images: uncachedPaths,
+          // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
+          // text — thicker strokes, looser character spacing, bolder fonts
+          // — not dense printed-document text. PaddleOCR's stock default
+          // (1.8) is tuned for the latter. Without this override, the
+          // request body previously had NO options field at all, so every
+          // panel silently used the document-tuned default on every run.
+          // Verified on real output: clean, high-contrast bubbles like
+          // "HOW DARE THEY DISHONOR MY MOTHER...?!" were detected as zero
+          // regions and produced a fully silent frame despite being
+          // trivially legible to a human. 2.4 is a looser unclip that
+          // merges nearby strokes into one region more readily, which
+          // trades a small amount of detection precision (very rare
+          // over-merging of two adjacent, unrelated bubbles) for
+          // substantially fewer missed bubbles overall.
+          options: { det_db_unclip_ratio: 2.4 },
+        }),
         signal: AbortSignal.timeout(120000), // 2 min timeout for large batches
       })
 
@@ -1037,12 +1121,16 @@ export async function generateImageNarrationsOCR(
         const globalIdx = startIdx + localIdx
         const text = (ocrResult.text || '').trim()
 
-        // Cache the result
-        const cacheKey = vlmCacheKey(uncachedPaths[ocrResult.index])
+        // Cache the result. setOcrCached uses the versioned OCR key (so a
+        // future OCR_TUNING_VERSION bump invalidates it correctly);
+        // setVlmCached uses the plain path key since VLM has no tuning
+        // parameters to version and this is purely a cross-method reuse
+        // optimization (if VLM fallback runs later, it can reuse this text
+        // instead of re-calling an LLM for a panel we already transcribed).
+        const imgPath = uncachedPaths[ocrResult.index]
         if (text) {
-          void setOcrCached(cacheKey, text)
-          // Also write to VLM cache so VLM path can reuse it
-          void setVlmCached(cacheKey, text)
+          void setOcrCached(ocrCacheKey(imgPath), text)
+          void setVlmCached(vlmCacheKey(imgPath), text)
         }
 
         results[globalIdx] = { image: path.basename(uncachedPaths[ocrResult.index]), text }
