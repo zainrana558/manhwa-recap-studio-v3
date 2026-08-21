@@ -170,11 +170,15 @@ class OCRErrorInfo(BaseModel):
 
 
 class OCRResult(BaseModel):
-    """OCR output for a single image."""
+    """OCR output for a single image; status must be preserved downstream."""
     index: int = 0
     text: str = ""
     confidence: float = 0.0
     regions: int = 0
+    status: str = "FAILED"
+    quality_score: float = 0.0
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
 
 
 class OCROptions(BaseModel):
@@ -218,6 +222,10 @@ class Base64OCRResponse(BaseModel):
     text: str
     confidence: float
     regions: int
+    status: str
+    quality_score: float
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
     model: str
     processing_time_ms: float
 
@@ -227,6 +235,10 @@ class SingleOCRResponse(BaseModel):
     text: str
     confidence: float
     regions: int
+    status: str
+    quality_score: float
+    candidates: List[dict] = Field(default_factory=list)
+    selection_reason: str = ""
     model: str
     processing_time_ms: float
 
@@ -561,6 +573,16 @@ def _decode_base64_image(b64_string):
         return None
 
 
+def _quality_status(text, confidence, regions):
+    # Empty/no-region output is explicitly UNCERTAIN, not successful text.
+    quality = round(max(0.0, min(1.0, (confidence or 0.0))) * (1.0 if regions > 0 else 0.0), 4)
+    if regions > 0 and text.strip() and confidence >= 0.55:
+        return "SUCCESS", quality, "accepted_confident_candidate"
+    if regions > 0 or text.strip():
+        return "UNCERTAIN", quality, "low_confidence_or_incomplete_candidate"
+    return "UNCERTAIN", 0.0, "no_regions_detected_blank_or_failed"
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -603,7 +625,7 @@ async def ocr_batch(request: BatchOCRRequest):
         img_array = _load_image_from_path(img_path)
         if img_array is None:
             logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
-            results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0))
+            results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image"))
             continue
 
         regions = _run_ocr_on_image(img_array, request.options)
@@ -612,12 +634,17 @@ async def ocr_batch(request: BatchOCRRequest):
         if region_count == 0:
             logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
 
+        status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
         results.append(
             OCRResult(
                 index=idx,
                 text=merged_text,
                 confidence=avg_conf,
                 regions=region_count,
+                status=status,
+                quality_score=quality_score,
+                candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+                selection_reason=reason,
             )
         )
 
@@ -661,10 +688,15 @@ async def ocr_base64(request: Base64OCRRequest):
         MODEL_NAME,
     )
 
+    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
     return Base64OCRResponse(
         text=merged_text,
         confidence=avg_conf,
         regions=region_count,
+        status=status,
+        quality_score=quality_score,
+        candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+        selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,
     )
@@ -695,10 +727,15 @@ async def ocr_single(request: Base64OCRRequest):
         MODEL_NAME,
     )
 
+    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
     return SingleOCRResponse(
         text=merged_text,
         confidence=avg_conf,
         regions=region_count,
+        status=status,
+        quality_score=quality_score,
+        candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+        selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,
     )

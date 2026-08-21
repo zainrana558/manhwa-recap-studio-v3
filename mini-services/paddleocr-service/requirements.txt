@@ -1,23 +1,12 @@
-# Pinned exact — PaddleOCR's 2.x -> 3.x jump changed ocr()->predict(), result
-# object format (dt_polys/rec_polys/OCRResult), and dropped params (show_log,
-# det_db_*). An unpinned range silently pulls breaking changes on every fresh
-# install. Verified working combo as of Aug 2026 — do not loosen without
-# re-testing the full main.py parsing path against the new version's output.
+# Production target: Python 3.10.4, Oracle Cloud Free Tier CPU-only.
+# PaddleOCR 3.7.0 is retained; PaddlePaddle is aligned to the 3.1.x framework
+# line documented by PaddleOCR 3.x as fully supported while staying close to the
+# prior 3.0.0 pin. Use binary wheels; do not build PaddlePaddle from source on OCI.
 paddleocr==3.7.0
-paddlepaddle==3.0.0
+paddlepaddle==3.1.1
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.18
-# Pillow 11.x dropped Python 3.8 support (last 3.8-compatible release is
-# 10.4.0). This service's actual deployment target (OCI free-tier Ampere
-# instance) runs Python 3.8.10, so a hard ==11.0.0 pin is uninstallable
-# there even though it resolves fine anywhere with Python 3.9+. Range-pinned
-# instead of exact for this one package specifically so it installs the
-# right build for whichever interpreter is actually present.
 Pillow>=10.4.0,<12.0.0
-numpy<1.25
-# ^ Same issue as Pillow above: numpy 1.26.x requires Python 3.9+ (NumPy's
-# own 1.26.4 release notes state "Python versions supported ... are
-# 3.9-3.12"). Range-pinned below 1.25 so it resolves on Python 3.8 too
-# (1.24.x is the last line with 3.8 wheels) while still excluding numpy
-# 2.x, which paddlepaddle 3.0.0 compatibility isn't verified against.
+numpy>=1.24.4,<2.0.0
+opencv-python-headless>=4.10.0,<4.11.0
