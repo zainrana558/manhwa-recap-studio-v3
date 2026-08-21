@@ -21,6 +21,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -130,6 +133,28 @@ app = FastAPI(
     description="OCR engine for manhwa/manga recap pipeline using PaddleOCR PP-OCRv5",
     version="1.0.0",
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Sanitize validation error payloads before JSON-encoding them.
+    Prevents a 500 (UnicodeDecodeError) when a malformed request body
+    contains non-UTF8 bytes, e.g. multipart data sent to a JSON-only route.
+    """
+    def sanitize(obj):
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        if isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [sanitize(v) for v in obj]
+        return obj
+
+    return JSONResponse(
+        status_code=422,
+        content={"detail": sanitize(exc.errors())},
+    )
 
 
 # ---------------------------------------------------------------------------

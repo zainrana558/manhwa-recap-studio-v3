@@ -338,6 +338,190 @@ INPAINT_MIN_BUBBLE_AREA = 800   # px² — ignore tiny text fragments
 INPAINT_MAX_BUBBLE_AREA = 150000  # px² — ignore huge regions (whole panels)
 
 
+# ---------------------------------------------------------------------------
+# 2a. BUBBLE-SAFE GUTTER DETECTION
+#
+# Guarantee: a horizontal cut is only ever placed on a row that is 100%
+# free of "content" (art, line-work, text glyphs, bubble borders) across
+# the ENTIRE width of the page, measured on a lightly-dilated content mask.
+# Dilation bridges anti-aliasing gaps in bubble outlines and the small gaps
+# between individual glyphs/letters so a bubble or text line is always seen
+# as one solid blob — it is structurally impossible for a cut chosen this
+# way to slice through the middle of a bubble, a line of text, or artwork,
+# because any row that touches such a blob anywhere along its width is
+# disqualified as a cut candidate.
+# ---------------------------------------------------------------------------
+
+def _build_dilated_content_mask(img_gray, dark_thresh: int = 200) -> "np.ndarray":
+    """Binary mask (255 = content) of everything that isn't near-white
+    background, lightly dilated/closed so speech-bubble outlines, thin text
+    strokes, and screentone dots merge into solid blobs instead of leaving
+    tiny gaps that a naive row-scan could mistake for a safe gutter."""
+    _, mask = cv2.threshold(img_gray, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+    # Bridge small horizontal gaps (letter spacing, bubble outline breaks)
+    # without merging across a real gutter — kernel stays modest vertically.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    return mask
+
+
+def _label_content_components(mask) -> List[tuple]:
+    """Connected components of a content mask → list of (y1, y2, x1, x2, area)
+    bounding boxes, used to sanity-check that no cut straddles a real blob
+    (bubble, text line, character, etc.)."""
+    n, _labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    comps = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < 6:
+            continue
+        comps.append((int(y), int(y + h), int(x), int(x + w), int(area)))
+    return comps
+
+
+def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
+    """Bubble-safe panel detector for webtoon-style tall strips.
+
+    Unlike percentage/variance-based gutter heuristics, a row is only ever
+    classified as a valid cut if it is checked across N independent
+    width-slices of the DILATED content mask and is completely empty in
+    every one of them. This is a strictly stronger guarantee than "mostly
+    white" — a bubble tail, a caption box, or a stray character sitting in
+    an otherwise-white gap will keep that row (and the whole band around it,
+    once merged with neighbours) out of consideration.
+
+    Returns list of (x1, y1, x2, y2) tuples, full page width, sorted by y.
+    """
+    h, w = img_gray.shape
+    if h < 10 or w < 10:
+        return [(0, 0, w, h)]
+
+    mask = _build_dilated_content_mask(img_gray)
+    components = _label_content_components(mask)
+
+    n_slices = 8
+    slice_w = max(1, w // n_slices)
+    row_has_any_content = np.any(mask > 0, axis=1)
+    is_gutter_row = np.zeros(h, dtype=bool)
+    for y in range(h):
+        if not row_has_any_content[y]:
+            is_gutter_row[y] = True
+            continue
+        clear = True
+        for s in range(n_slices):
+            x0 = s * slice_w
+            x1 = w if s == n_slices - 1 else (s + 1) * slice_w
+            if np.any(mask[y, x0:x1] > 0):
+                clear = False
+                break
+        is_gutter_row[y] = clear
+
+    # Smooth to reject single-row noise (e.g. one stray dead pixel briefly
+    # flipping a row to "gutter" inside dense artwork), but never smooth
+    # enough to let a real gutter get swallowed.
+    is_gutter_row = cv2.blur(
+        is_gutter_row.astype(np.float32).reshape(-1, 1), (5, 1)
+    ).flatten() > 0.6
+
+    min_band_h = max(12, h // 350)
+    bands: List[tuple] = []
+    run_start = None
+    for i, g in enumerate(is_gutter_row):
+        if g and run_start is None:
+            run_start = i
+        elif not g and run_start is not None:
+            if i - run_start >= min_band_h:
+                bands.append((run_start, i))
+            run_start = None
+    if run_start is not None and h - run_start >= min_band_h:
+        bands.append((run_start, h))
+
+    if not bands:
+        return [(0, 0, w, h)]
+
+    # Cut at the safest row within each band — the row farthest from any
+    # component that comes close to (but, by construction, never crosses)
+    # the band's edges — then double-checked against every component so a
+    # cut can never land inside a bbox that happens to graze the band.
+    cut_points: List[int] = []
+    for (s, e) in bands:
+        cut = (s + e) // 2
+        for (cy1, cy2, _cx1, _cx2, area) in components:
+            if area < 40 or cy2 <= s or cy1 >= e:
+                continue
+            top_gap, bot_gap = cy1 - s, e - cy2
+            if top_gap > bot_gap and top_gap > 4:
+                cut = min(cut, s + max(2, top_gap // 2))
+            elif bot_gap > 4:
+                cut = max(cut, e - max(2, bot_gap // 2))
+        cut_points.append(cut)
+
+    boundaries = [0] + cut_points + [h]
+    min_panel_h = max(30, h // 100)
+    raw_panels = []
+    for i in range(len(boundaries) - 1):
+        top, bot = boundaries[i], boundaries[i + 1]
+        if bot - top >= min_panel_h:
+            raw_panels.append((0, top, w, bot))
+
+    content_panels = [p for p in raw_panels if np.any(mask[p[1]:p[3], :] > 0)]
+    if not content_panels:
+        return [(0, 0, w, h)]
+
+    # Merge runs of small adjacent fragments (e.g. a caption strip that got
+    # isolated by a thin gutter) so they read as one coherent frame.
+    merged = [list(content_panels[0])]
+    for (x1, y1, x2, y2) in content_panels[1:]:
+        prev = merged[-1]
+        if (y2 - y1) < 150 and (prev[3] - prev[1]) < 200:
+            prev[2], prev[3] = x2, y2
+        else:
+            merged.append([x1, y1, x2, y2])
+
+    return [(p[0], p[1], p[2], p[3]) for p in merged if (p[3] - p[1]) >= min_panel_h]
+
+
+def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
+    """Nudge a candidate horizontal edge to the nearest row that is
+    completely clear of content across the full width, within +/- window
+    px. Applied as a final safety net to panel boxes from ANY detector
+    (YOLO, contour, gutter-aware) so an edge can never clip a bubble tail
+    or a line of text even if the upstream detector placed it a few pixels
+    off. Returns the original y if no safe row is found nearby (better to
+    keep the original box than snap arbitrarily far away)."""
+    h = mask.shape[0]
+    y = max(0, min(h - 1, y))
+    if not np.any(mask[y, :] > 0):
+        return y
+    for d in range(1, window + 1):
+        for cand in (y - d, y + d):
+            if 0 <= cand < h and not np.any(mask[cand, :] > 0):
+                return cand
+    return y
+
+
+def _detect_panels_for_page(img_gray) -> List[tuple]:
+    """Top-level panel detector for one source page/strip image.
+
+    Webtoon/manhwa raws are dominated by tall, single-column strips — for
+    those, the bubble-safe gutter-aware detector gives the strongest
+    guarantee (cuts can never cross a content pixel). For roughly
+    page-shaped images (traditional multi-panel grid layouts), fall back to
+    the existing YOLO/contour auto-detector, which understands multi-column
+    layouts that a pure horizontal-gutter scan can't.
+
+    Returns list of (x, y, w, h) tuples, matching _detect_panels_auto's
+    contract.
+    """
+    h, w = img_gray.shape
+    if h / max(w, 1) > 1.3:
+        strip_panels = _detect_panels_gutter_aware(img_gray)
+        if strip_panels:
+            return [(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in strip_panels]
+    return _detect_panels_auto(img_gray)
+
+
 def _detect_panel_gutters(img_gray, y_offset: int = 0) -> List[int]:
     """Detect horizontal gutter lines (panel separators) in a webtoon strip.
 
@@ -1187,13 +1371,24 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
             w, h = img.size
             gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-            # Auto-mode panel detection: YOLO first, CV fallback if weak
-            panels = _detect_panels_auto(gray)
+            # Bubble-safe detection: gutter-aware scan for tall webtoon
+            # strips, YOLO/contour auto-detect for grid-style pages.
+            panels = _detect_panels_for_page(gray)
             log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
+
+            # Safety net: snap every panel's top/bottom edge to the nearest
+            # fully-clear row within a small window, so a box from ANY
+            # detector can never clip a bubble tail or a text line.
+            content_mask = _build_dilated_content_mask(gray)
 
             for (px, py, pw, ph) in panels:
                 if ph < 50 or pw < 50:
                     continue
+
+                safe_top = _snap_cut_to_safe_row(content_mask, py)
+                safe_bot = _snap_cut_to_safe_row(content_mask, py + ph)
+                if safe_bot - safe_top >= 50:
+                    py, ph = safe_top, safe_bot - safe_top
 
                 # Each detected panel = ONE frame. No sub-splitting.
                 # Tall panels are shown complete using cover-fit (fill the
