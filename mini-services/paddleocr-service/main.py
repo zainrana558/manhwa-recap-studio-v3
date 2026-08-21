@@ -270,7 +270,19 @@ class _TextRegion:
 
 def _sort_regions_reading_order(regions):
     # type: (List[_TextRegion]) -> List[_TextRegion]
-    """Sort detected text regions in natural reading order."""
+    """Sort detected text regions in natural reading order (top-to-bottom,
+    left-to-right within each line).
+
+    Previously this bucketed each region into a "row" via fixed-size floor
+    division (y_min // vertical_tolerance). Two regions only a couple
+    pixels apart can straddle a bucket boundary and land in different
+    buckets, while two regions genuinely on different lines can land in
+    the same bucket purely by chance — silently scrambling word/line order
+    within a merged panel's narration text (e.g. interleaving two
+    side-by-side speech bubbles). Cluster by actual vertical proximity to
+    the row being built instead, which has no arbitrary boundary to
+    straddle.
+    """
     if not regions:
         return regions
 
@@ -278,11 +290,25 @@ def _sort_regions_reading_order(regions):
     mean_height = sum(heights) / len(heights) if heights else 20.0
     vertical_tolerance = max(mean_height * 0.4, 10.0)
 
-    def _sort_key(r):
-        row = r.y_min // vertical_tolerance
-        return (row, r.x_min)
+    remaining = sorted(regions, key=lambda r: r.y_min)
+    rows = []  # type: List[List[_TextRegion]]
+    for r in remaining:
+        placed = False
+        for row in rows:
+            row_y = sum(rr.y_min for rr in row) / len(row)
+            if abs(r.y_min - row_y) < vertical_tolerance:
+                row.append(r)
+                placed = True
+                break
+        if not placed:
+            rows.append([r])
 
-    return sorted(regions, key=_sort_key)
+    rows.sort(key=lambda row: sum(rr.y_min for rr in row) / len(row))
+    ordered = []  # type: List[_TextRegion]
+    for row in rows:
+        row.sort(key=lambda rr: rr.x_min)
+        ordered.extend(row)
+    return ordered
 
 
 def _merge_regions(regions):

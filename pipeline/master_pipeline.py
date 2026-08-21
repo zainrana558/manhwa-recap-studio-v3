@@ -1173,11 +1173,53 @@ def _detect_panels_yolo(img_gray) -> List[tuple]:
 
         # NMS to remove near-duplicates (keep insets)
         panels = _suppress_nested(panels, iou_thresh=0.65)
-        panels.sort(key=lambda p: (p[1], p[0]))
+        panels = _order_panels_reading_order(panels)
         return panels
     except Exception as e:
         log.warning("YOLO panel detection failed: %s", e)
         return []
+
+
+def _order_panels_reading_order(panels: List[tuple]) -> List[tuple]:
+    """Order panel boxes (x, y, w, h) into natural top-to-bottom,
+    left-to-right reading order for LTR-read manhwa/comic grid pages.
+
+    A naive sort purely by top-y coordinate (p[1], p[0]) breaks whenever
+    panels in the same visual row are staggered or have different heights
+    — extremely common in dynamic comic layouts with diagonal panel cuts
+    or a tall splash panel next to two stacked smaller ones. That naive
+    sort can place a panel from the NEXT row before the second panel of
+    the CURRENT row, silently narrating story events out of order. This
+    clusters panels into rows by vertical overlap first, then sorts each
+    row left-to-right, before ordering rows top-to-bottom.
+    """
+    if not panels:
+        return panels
+
+    remaining = sorted(panels, key=lambda p: p[1])
+    rows: List[List[tuple]] = []
+    for p in remaining:
+        x, y, w, h = p
+        y2 = y + h
+        placed = False
+        for row in rows:
+            ry1 = min(rp[1] for rp in row)
+            ry2 = max(rp[1] + rp[3] for rp in row)
+            overlap = min(y2, ry2) - max(y, ry1)
+            min_h = min(h, ry2 - ry1)
+            if min_h > 0 and overlap / min_h > 0.4:
+                row.append(p)
+                placed = True
+                break
+        if not placed:
+            rows.append([p])
+
+    rows.sort(key=lambda row: min(rp[1] for rp in row))
+    ordered: List[tuple] = []
+    for row in rows:
+        row.sort(key=lambda rp: rp[0])
+        ordered.extend(row)
+    return ordered
 
 
 def _detect_panels_auto(img_gray) -> List[tuple]:
@@ -1324,8 +1366,9 @@ def _detect_panels_contour(img_gray) -> List[tuple]:
     if len(panels) == 1 and panels[0][2] * panels[0][3] >= 0.70 * page_area:
         return [(0, 0, w, h)]
 
-    # Sort by y position (top to bottom), then x (left to right)
-    panels.sort(key=lambda p: (p[1], p[0]))
+    # Sort into natural reading order: rows by vertical overlap (handles
+    # staggered/diagonal layouts), then left-to-right within each row.
+    panels = _order_panels_reading_order(panels)
     return panels
 
 
@@ -2377,6 +2420,32 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         cfg.write_progress("render", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: building audio track")
         audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
+
+        # The video timeline (frame_durations) was built to match the RAW,
+        # pre-loudnorm segment audio exactly. But build_chapter_audio_track's
+        # loudnorm pass (a single-pass/dynamic normalization, not two-pass
+        # "measured" mode) can shift the final audio's duration by a small
+        # but real amount due to its internal lookahead/limiter buffering.
+        # render_chapter muxes with `-shortest`, so if the post-loudnorm
+        # audio ends up LONGER than the video timeline, the tail of the
+        # narration gets silently cut off mid-sentence. Re-probe the actual
+        # final audio duration here and extend the last frame's hold time
+        # to cover it, so narration is never truncated.
+        if audio_path and audio_path.exists():
+            try:
+                final_audio_duration = get_audio_duration(audio_path)
+                video_duration = sum(frame_durations)
+                if final_audio_duration > video_duration + 0.05 and frame_durations:
+                    shortfall = final_audio_duration - video_duration
+                    frame_durations[-1] += shortfall
+                    log.info(
+                        "[%s] extended last frame by %.3fs to cover loudnorm "
+                        "duration drift (audio %.3fs vs video %.3fs) — "
+                        "prevents narration from being cut off",
+                        chapter.tag, shortfall, final_audio_duration, video_duration,
+                    )
+            except RuntimeError as e:
+                log.warning("[%s] could not verify final audio duration: %s", chapter.tag, e)
 
         cfg.write_progress("render", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
