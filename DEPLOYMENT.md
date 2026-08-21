@@ -271,3 +271,51 @@ the job's `r2Key` field is populated in Turso.
 → `NEXT_PUBLIC_PIPELINE_SERVICE_URL` must be set on Vercel (client-side env var)
 and point to your laptop's tunnel URL. The tunnel must allow WebSocket
 upgrades (Cloudflare Tunnels do this by default).
+
+## Oracle Cloud production deployment (CPU-only)
+
+Validated production deployments should use an isolated Python 3.10.4 install such as `/opt/python3.10`; never replace Ubuntu's system Python. Create the runtime environment with:
+
+```bash
+sudo mkdir -p /opt/manhwa-recap-studio
+/opt/python3.10/bin/python3.10 -m venv /opt/manhwa-recap-studio/.venv
+source /opt/manhwa-recap-studio/.venv/bin/activate
+python --version  # must be Python 3.10.4 for the pinned production target
+pip install --upgrade pip setuptools wheel
+pip install -r pipeline/requirements.txt
+pip install -r mini-services/paddleocr-service/requirements.txt \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -c "import paddle; print(paddle.__version__)"      # expected 3.1.1
+python -c "import paddleocr; print(paddleocr.__version__)" # expected 3.7.0
+```
+
+Install local media/OCR/TTS runtime components:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg espeak-ng
+# Install Piper into PATH, then download one CPU-friendly English ONNX voice.
+export PIPER_VOICE_MODEL=/opt/piper/voices/en_US-lessac-medium.onnx
+piper --version
+espeak-ng --version
+ffmpeg -version
+ffprobe -version
+```
+
+Production work uses stable job IDs and a work directory. The SQLite state file is `<work-dir>/state.sqlite`; artifacts are promoted only after QA to `<work-dir>/artifacts`; corrupt or partial files are moved to `<work-dir>/quarantine`.
+
+```bash
+export PRODUCTION_PIPELINE=1
+export PYTHONPATH=/path/to/manhwa-recap-studio
+export PIPER_VOICE_MODEL=/opt/piper/voices/en_US-lessac-medium.onnx
+python pipeline/production_canary.py --work-dir /tmp/mrs-canary --job-id canary
+for stage in OCR TTS AUDIO_ASSEMBLY VIDEO_RENDER MERGE; do
+  python pipeline/crash_resume_harness.py --work-dir /tmp/mrs-crash-$stage --job-id crash-$stage --stage $stage
+done
+python pipeline/master_pipeline.py --input-dir /data/input --output-path /data/output/final.mp4 \
+  --work-dir /data/work --production-mode --job-id real-job-001
+```
+
+Recovery procedure: restart the same command with the same `--job-id` and `--work-dir`. RUNNING stages are reconciled against their real artifacts; valid artifacts become COMPLETE, while missing/corrupt artifacts become RETRYABLE and are rebuilt. Use `ffprobe` on the final MP4 and inspect `state.sqlite` before declaring a job complete.
+
+Resource baseline for Oracle CPU-only production is 2+ vCPU, at least 11 GiB RAM, swap enabled when possible, and tens of GiB of free disk. `ResourceGuard` checks disk and available RAM before expensive stages and records RESOURCE/RETRYABLE instead of proceeding when thresholds are not met.

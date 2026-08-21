@@ -115,3 +115,72 @@ def reconcile_artifact(state: SQLiteStateStore, job_id: str, stage: Stage, artif
     if row.get('artifact_checksum') and row['artifact_checksum'] != digest: return False
     if row['state'] != 'COMPLETE': state.record(job_id, stage, State.COMPLETE, chapter_id, panel_id, artifact_path=artifact, artifact_checksum=digest, duration=q.duration)
     return True
+
+class ArtifactStore:
+    """QA-gated artifact store with temporary writes and quarantine."""
+    def __init__(self, root: Path):
+        self.root = root; self.tmp_dir = root/'tmp'; self.final_dir = root/'artifacts'; self.quarantine_dir = root/'quarantine'
+        for d in (self.tmp_dir, self.final_dir, self.quarantine_dir): d.mkdir(parents=True, exist_ok=True)
+    def temporary_path(self, name: str) -> Path:
+        return self.tmp_dir / f'{name}.{os.getpid()}.{int(time.time()*1000)}.tmp'
+    def final_path(self, name: str) -> Path:
+        return self.final_dir / name
+    def quarantine(self, path: Path, reason: str='corrupt') -> Optional[Path]:
+        if not path.exists(): return None
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.quarantine_dir / f'{path.name}.{int(time.time())}.{reason}.bad'
+        path.replace(dest); return dest
+    def promote(self, tmp: Path, final_name: str, qa: Callable[[Path], QAResult]) -> tuple[Path, str, QAResult]:
+        q = qa(tmp)
+        if not q.ok:
+            self.quarantine(tmp, 'qa_failed')
+            raise RuntimeError(f'artifact QA failed: {q.reason}')
+        final = self.final_path(final_name)
+        digest = atomic_promote(tmp, final)
+        return final, digest, q
+
+
+def ffprobe_json(path: Path, timeout: int=30) -> Dict[str, Any]:
+    result = ProcessRunner().run(['ffprobe','-v','error','-print_format','json','-show_streams','-show_format',str(path)], timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or 'ffprobe failed')
+    return json.loads(result.stdout or '{}')
+
+
+def audio_qa(path: Path, narration_expected: bool=True, min_duration: float=0.05) -> QAResult:
+    if not path.exists() or path.stat().st_size == 0:
+        return QAResult(False, 'missing_or_empty_audio')
+    try:
+        meta = ffprobe_json(path)
+        dur = float(meta.get('format', {}).get('duration') or 0)
+        if dur < min_duration: return QAResult(False, f'audio_duration_too_short:{dur}', dur, meta)
+        if not any(s.get('codec_type') == 'audio' for s in meta.get('streams', [])):
+            return QAResult(False, 'no_audio_stream', dur, meta)
+        if narration_expected:
+            vol = ProcessRunner().run(['ffmpeg','-hide_banner','-i',str(path),'-af','volumedetect','-f','null','-'], timeout=30)
+            stderr = (vol.stderr or '') + (vol.stdout or '')
+            if vol.returncode != 0: return QAResult(False, 'audio_energy_probe_failed', dur, meta)
+            if 'mean_volume: -inf' in stderr: return QAResult(False, 'silent_audio', dur, meta)
+        return QAResult(True, duration=dur, metadata=meta)
+    except Exception as exc:
+        return QAResult(False, f'ffprobe_audio_failed:{exc}')
+
+
+def video_qa(path: Path, audio_expected: bool=True, expected_duration: Optional[float]=None, tolerance: float=1.0) -> QAResult:
+    if not path.exists() or path.stat().st_size == 0:
+        return QAResult(False, 'missing_or_empty_video')
+    try:
+        meta = ffprobe_json(path)
+        dur = float(meta.get('format', {}).get('duration') or 0)
+        streams = meta.get('streams', [])
+        if not any(s.get('codec_type') == 'video' for s in streams): return QAResult(False, 'no_video_stream', dur, meta)
+        if audio_expected and not any(s.get('codec_type') == 'audio' for s in streams): return QAResult(False, 'no_audio_stream', dur, meta)
+        if expected_duration is not None and abs(dur - expected_duration) > tolerance:
+            return QAResult(False, f'duration_out_of_tolerance:{dur}', dur, meta)
+        return QAResult(True, duration=dur, metadata=meta)
+    except Exception as exc:
+        return QAResult(False, f'ffprobe_video_failed:{exc}')
+
+
+def ocr_text_for_narration(result: OCRResult) -> str:
+    return result.text.strip() if result.status == State.COMPLETE or str(result.status) == 'SUCCESS' else ''

@@ -20,32 +20,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---- Bun (JavaScript runtime) ----------------------------------------------
 RUN curl -fsSL https://bun.sh/install | bash
 ENV BUN_INSTALL="/root/.bun"
-ENV PATH="${BUN_INSTALL}/bin}:${PATH}"
+ENV PATH="${BUN_INSTALL}/bin:${PATH}"
 
 # ---- Python dependencies (Python 3.10.4 target; local-first production TTS) ------
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r pipeline/requirements.txt && \
-    pip install --no-cache-dir -r mini-services/paddleocr-service/requirements.txt
-
-# Pre-download the YOLO model so the first job doesn't stall on a download
-RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" || true
-
-# Pre-download PaddleOCR PP-OCRv5 English model so the first job doesn't stall
-RUN python3 -c "from paddleocr import PaddleOCR; PaddleOCR(ocr_version='PP-OCRv5', lang='en', show_log=False)" || true
-
-# ---- App setup --------------------------------------------------------------
 WORKDIR /app
 
 # Copy package files first (better Docker layer caching)
 COPY package.json bun.lock ./
 COPY mini-services/pipeline-service/package.json mini-services/pipeline-service/bun.lock ./mini-services/pipeline-service/
 COPY mini-services/paddleocr-service/requirements.txt ./mini-services/paddleocr-service/
+COPY pipeline/requirements.txt ./pipeline/requirements.txt
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r pipeline/requirements.txt && \
+    pip install --no-cache-dir -r mini-services/paddleocr-service/requirements.txt
 
 RUN bun install
 RUN cd mini-services/pipeline-service && bun install
-RUN pip install -r mini-services/paddleocr-service/requirements.txt --no-cache-dir || true
 
 # Copy source code
 COPY . .
