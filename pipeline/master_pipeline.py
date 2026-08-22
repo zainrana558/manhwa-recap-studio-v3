@@ -66,6 +66,16 @@ except ImportError:  # pragma: no cover
     cv2 = None  # type: ignore
     np = None  # type: ignore
 
+# production.py lives alongside this script (pipeline/production.py) and has
+# zero external dependencies, so this import is safe to do eagerly. It wires
+# the real pipeline into the QA-gated atomic-artifact primitives that were
+# previously only exercised by tests/production_canary.py — chapter and
+# final-video output were being written directly to their "done" path with
+# no validation, so a crash mid-ffmpeg-write (or a corrupt/truncated
+# encode) could leave a broken file that a resumed run would treat as
+# already-complete and silently ship. See render_chapter/finalize_output.
+from production import video_qa, atomic_promote  # noqa: E402
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
 OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
@@ -2079,6 +2089,15 @@ def render_chapter(
         log.warning("[%s] no frames to render — skipping chapter", chapter.tag)
         return None
 
+    # Render to a temp path, never the resume-checked `out_path` directly.
+    # If this process gets killed mid-ffmpeg-write (OOM, crash, manual
+    # interrupt — all realistic on an unattended multi-day Oracle run),
+    # `out_path` must NOT exist as a partial/corrupt file, or the next
+    # resumed run's `out_path.exists()` check above would treat a broken
+    # chapter as done and silently ship it in the final merge.
+    tmp_path = cfg.temp_chapters_dir / f"{chapter.tag}.mp4.tmp"
+    tmp_path.unlink(missing_ok=True)
+
     # Write a concat demuxer input file with per-image durations.
     # This lets a SINGLE ffmpeg call produce the whole slideshow video.
     concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
@@ -2098,7 +2117,8 @@ def render_chapter(
     # Frames are already 1920x1080 from _compose_canvas, but ensure exact size.
     video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2"
 
-    if audio_path and audio_path.exists():
+    has_audio = bool(audio_path and audio_path.exists())
+    if has_audio:
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
@@ -2110,7 +2130,7 @@ def render_chapter(
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-r", str(FPS),
             "-shortest",
-            str(out_path),
+            str(tmp_path),
         ]
     else:
         cmd = [
@@ -2120,18 +2140,41 @@ def render_chapter(
             "-vf", video_filters,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-r", str(FPS),
-            str(out_path),
+            str(tmp_path),
         ]
 
     try:
         run_ffmpeg(cmd)
     except RuntimeError as e:
         log.error("[%s] concat render failed: %s", chapter.tag, e)
+        tmp_path.unlink(missing_ok=True)
         return None
 
     concat_list.unlink(missing_ok=True)
 
-    log.info("[%s] chapter video rendered -> %s", chapter.tag, out_path.name)
+    # Never mark a chapter complete before validation (loudnorm drift,
+    # a killed ffmpeg process, or disk pressure can all leave a file that
+    # opens but is truncated, has no audio stream, or is far shorter than
+    # expected — ffmpeg exiting 0 is not sufficient proof of a good file).
+    expected_duration = sum(frame_durations)
+    qa = video_qa(tmp_path, audio_expected=has_audio, expected_duration=expected_duration, tolerance=2.0)
+    if not qa.ok:
+        quarantine_dir = cfg.temp_chapters_dir / "quarantine"
+        quarantine_dir.mkdir(exist_ok=True)
+        bad_path = quarantine_dir / f"{chapter.tag}.{int(time.time())}.{qa.reason}.bad"
+        try:
+            tmp_path.rename(bad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+        log.error(
+            "[%s] rendered video FAILED QA (%s) — quarantined, chapter will be "
+            "re-rendered on the next resume instead of being shipped broken",
+            chapter.tag, qa.reason,
+        )
+        return None
+
+    atomic_promote(tmp_path, out_path)
+    log.info("[%s] chapter video rendered + QA-validated -> %s", chapter.tag, out_path.name)
     return out_path
 
 
@@ -2187,16 +2230,37 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
         log.info("Merged master file already exists — skipping merge step (resume)")
         return merged_path
 
+    # Individual chapters are already QA-validated on their own, but the
+    # concat step itself (stream copy across N files) can still fail
+    # partway through or get killed mid-write — write to a tmp path and
+    # only promote to `merged_path` (the resume-checked path above) after
+    # the merged file passes QA, for the same reason as render_chapter.
+    tmp_path = cfg.work_dir / "master_merged.mp4.tmp"
+    tmp_path.unlink(missing_ok=True)
+
     log.info("Merging %d chapter videos via ffmpeg stream copy...", len(chapter_videos))
     run_ffmpeg(
         [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
-            str(merged_path),
+            str(tmp_path),
         ]
     )
-    log.info("Merge complete -> %s", merged_path.name)
+
+    qa = video_qa(tmp_path, audio_expected=True)
+    if not qa.ok:
+        quarantine_dir = cfg.work_dir / "quarantine"
+        quarantine_dir.mkdir(exist_ok=True)
+        bad_path = quarantine_dir / f"master_merged.{int(time.time())}.{qa.reason}.bad"
+        try:
+            tmp_path.rename(bad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"merged master video failed QA ({qa.reason}) — see {bad_path}")
+
+    atomic_promote(tmp_path, merged_path)
+    log.info("Merge complete + QA-validated -> %s", merged_path.name)
     return merged_path
 
 
@@ -2209,8 +2273,26 @@ def finalize_output(cfg: PipelineConfig, merged_path: Path) -> Path:
     """
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Copying merged video to final output (no BGM overlay)...")
-    shutil.copy2(merged_path, cfg.output_path)
-    log.info("Final master video written -> %s", cfg.output_path)
+
+    # `merged_path` was already QA-validated by merge_chapters, but copy
+    # through a tmp path and re-check before the atomic rename anyway: a
+    # crash or a full disk mid-copy can leave a truncated file sitting at
+    # cfg.output_path — the one path anything downstream (upload, YouTube
+    # metadata step, the person opening the file) actually trusts as "the
+    # finished video." That path must never be observably partial.
+    tmp_path = cfg.output_path.with_suffix(cfg.output_path.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+    shutil.copy2(merged_path, tmp_path)
+
+    qa = video_qa(tmp_path, audio_expected=True)
+    if not qa.ok:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"final output failed QA ({qa.reason}) — refusing to mark the job complete"
+        )
+
+    atomic_promote(tmp_path, cfg.output_path)
+    log.info("Final master video written + QA-validated -> %s", cfg.output_path)
     return cfg.output_path
 
 
@@ -2258,204 +2340,221 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 prev_tail = last_sentences(script_cache.read_text(encoding="utf-8"))
             continue
 
-        # Slice returns [(frame_path, source_panel_index), ...] so we can map
-        # each frame to its source image's narration for perfect sync.
-        # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
-        # horizontal AND vertical panel boundaries, so each manga panel
-        # gets its own individual 1920x1080 frame.
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: slicing panels...")
-        frame_data = slice_chapter_panels(cfg, chapter)
-        frame_paths = [fp for fp, _ in frame_data]
-        frame_sources = [si for _, si in frame_data]
+        try:
+            # Slice returns [(frame_path, source_panel_index), ...] so we can map
+            # each frame to its source image's narration for perfect sync.
+            # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
+            # horizontal AND vertical panel boundaries, so each manga panel
+            # gets its own individual 1920x1080 frame.
+            cfg.write_progress("slice", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: slicing panels...")
+            frame_data = slice_chapter_panels(cfg, chapter)
+            frame_paths = [fp for fp, _ in frame_data]
+            frame_sources = [si for _, si in frame_data]
 
-        log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
+            log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+            cfg.write_progress("slice", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
-        # Build an ordered list of (tag, text, frame_positions) "segments" —
-        # each one gets exactly ONE continuous edge-tts synthesis call, then
-        # real word timestamps from that single clip drive per-frame timing.
-        # This is what eliminates the audible stop-after-every-word chop:
-        # previously every one of these frame positions triggered its own
-        # separate edge-tts call.
-        segments: List[tuple] = []  # (tag, text, positions)
+            # Build an ordered list of (tag, text, frame_positions) "segments" —
+            # each one gets exactly ONE continuous edge-tts synthesis call, then
+            # real word timestamps from that single clip drive per-frame timing.
+            # This is what eliminates the audible stop-after-every-word chop:
+            # previously every one of these frame positions triggered its own
+            # separate edge-tts call.
+            segments: List[tuple] = []  # (tag, text, positions)
 
-        if chapter.image_narrations:
-            # PER-PANEL NARRATION MODE (preferred).
-            #
-            # Two narration.json key formats are supported:
-            #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
-            #      filenames like "frame_00000.jpg". Each frame already shows
-            #      ONE individual panel, so the VLM transcription is precise.
-            #      We build one TTS segment per frame.
-            #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
-            #      filenames like "001.jpg". The VLM read the whole page, so
-            #      all sliced frames from the same source page share one
-            #      narration. We group frame positions by source panel index.
-            frame_keyed = any(
-                k.startswith("frame_") for k in chapter.image_narrations.keys()
-            )
-
-            if frame_keyed:
-                log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
-                         chapter.tag, len(frame_paths))
-                # One segment per frame — narration perfectly synced to each panel.
-                for pos, fp in enumerate(frame_paths):
-                    raw_text = chapter.image_narrations.get(fp.name, "")
-                    img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
-                    translated = translate_text(cfg, raw_text, img_tag)
-                    rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                    if rephrased:
-                        prev_tail = last_sentences(rephrased)
-                    segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
-            else:
-                log.info("[%s] per-image narration mode: %d source images, %d frames",
-                         chapter.tag, len(chapter.panel_paths), len(frame_paths))
-                # Legacy: translate + rephrase each source image's narration.
-                panel_narrations: dict = {}  # panel_index -> narration text
-                for idx, panel_path in enumerate(chapter.panel_paths):
-                    raw_text = chapter.image_narrations.get(panel_path.name, "")
-                    img_tag = f"{chapter.tag}_img{idx + 1:03d}"
-                    translated = translate_text(cfg, raw_text, img_tag)
-                    rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                    panel_narrations[idx] = rephrased
-                    if rephrased:
-                        prev_tail = last_sentences(rephrased)
-
-                # Group frame positions by source panel (preserving timeline order).
-                from collections import defaultdict as _dd
-                panel_frame_positions = _dd(list)  # panel_index -> [frame_positions]
-                for pos, si in enumerate(frame_sources):
-                    panel_frame_positions[si].append(pos)
-
-                for si, positions in panel_frame_positions.items():
-                    narr = panel_narrations.get(si, "")
-                    segments.append((f"img{si + 1:03d}", narr, positions))
-        else:
-            # No narration.json — all frames are silent (no text to narrate).
-            log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
-            for pos in range(len(frame_paths)):
-                segments.append((f"frm{pos + 1:04d}", "", [pos]))
-
-        # Synthesize one continuous clip per segment and derive per-frame timing.
-        # No whisper transcription — timing is derived purely from proportional
-        # word-count splits, with a MIN_FRAME_DURATION floor so panels don't flash by.
-        frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
-        segment_audio_paths: List[Path] = []
-        chapter_offset = 0.0
-        tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
-        tts_failed = 0      # of those, how many fell back to silence due to a real failure
-
-        for seg_idx, (tag, text, positions) in enumerate(segments):
-            cfg.write_progress("render", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
-            if text.strip():
-                tts_attempted += 1
-            audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
-            if seg_tts_failed:
-                tts_failed += 1
-            duration = get_audio_duration(audio_path_seg)
-
-            # Ensure the segment audio is at least long enough for all its
-            # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
-            min_total = len(positions) * MIN_FRAME_DURATION
-            if duration < min_total:
-                audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
-                duration = min_total
-
-            timings = split_frame_timings(text, positions, duration)
-            for pos in positions:
-                frame_timing[pos] = timings[pos]
-            # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
-            # so the total visual duration is longer than the raw audio. Pad the
-            # audio with trailing silence so the audio track matches the video.
-            last_end = max((timings[p][1] for p in positions), default=duration)
-            if last_end > duration:
-                audio_path_seg = pad_audio_with_silence(audio_path_seg, last_end)
-                duration = last_end
-            segment_audio_paths.append(audio_path_seg)
-            chapter_offset += duration
-
-        # If most/all segments that HAD real dialogue to speak ended up
-        # falling back to silence, this isn't "a quiet chapter" — it's a
-        # broken TTS pipeline (most commonly: edge-tts's endpoint,
-        # speech.platform.bing.com, is unreachable from this network —
-        # firewall/security-list egress rules on cloud hosts are a common
-        # cause). Every prior signal along the way (translation, rephrase,
-        # loudnorm, mux) looks completely normal even when this has happened,
-        # because each stage just sees "silence" as valid audio input and
-        # passes it through without error. Surface it loudly here instead of
-        # letting the job report success with a genuinely silent video.
-        if tts_attempted > 0:
-            tts_fail_ratio = tts_failed / tts_attempted
-            if tts_fail_ratio >= 0.9:
-                log.error(
-                    "[%s] TTS FAILED for %d/%d narrated segments (%.0f%%) — "
-                    "edge-tts is not producing audio. Check network access to "
-                    "speech.platform.bing.com from this host (firewall/security-"
-                    "list egress rules are a common cause on cloud VMs). The "
-                    "output video for this chapter will be SILENT.",
-                    chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
-                )
-            elif tts_fail_ratio > 0.2:
-                log.warning(
-                    "[%s] TTS failed for %d/%d narrated segments (%.0f%%) — "
-                    "partial audio dropout, check edge-tts connectivity",
-                    chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+            if chapter.image_narrations:
+                # PER-PANEL NARRATION MODE (preferred).
+                #
+                # Two narration.json key formats are supported:
+                #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
+                #      filenames like "frame_00000.jpg". Each frame already shows
+                #      ONE individual panel, so the VLM transcription is precise.
+                #      We build one TTS segment per frame.
+                #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
+                #      filenames like "001.jpg". The VLM read the whole page, so
+                #      all sliced frames from the same source page share one
+                #      narration. We group frame positions by source panel index.
+                frame_keyed = any(
+                    k.startswith("frame_") for k in chapter.image_narrations.keys()
                 )
 
-        # Build final per-frame durations from the timings.
-        # Guard against None entries (can happen if a segment had no positions
-        # or an error left a frame_timing slot unpopulated). Default to
-        # MIN_FRAME_DURATION so the video never has a zero-duration frame.
-        frame_durations = []
-        for t in frame_timing:
-            if t is not None:
-                frame_durations.append(t[1] - t[0])
+                if frame_keyed:
+                    log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
+                             chapter.tag, len(frame_paths))
+                    # One segment per frame — narration perfectly synced to each panel.
+                    for pos, fp in enumerate(frame_paths):
+                        raw_text = chapter.image_narrations.get(fp.name, "")
+                        img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
+                        translated = translate_text(cfg, raw_text, img_tag)
+                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                        if rephrased:
+                            prev_tail = last_sentences(rephrased)
+                        segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
+                else:
+                    log.info("[%s] per-image narration mode: %d source images, %d frames",
+                             chapter.tag, len(chapter.panel_paths), len(frame_paths))
+                    # Legacy: translate + rephrase each source image's narration.
+                    panel_narrations: dict = {}  # panel_index -> narration text
+                    for idx, panel_path in enumerate(chapter.panel_paths):
+                        raw_text = chapter.image_narrations.get(panel_path.name, "")
+                        img_tag = f"{chapter.tag}_img{idx + 1:03d}"
+                        translated = translate_text(cfg, raw_text, img_tag)
+                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                        panel_narrations[idx] = rephrased
+                        if rephrased:
+                            prev_tail = last_sentences(rephrased)
+
+                    # Group frame positions by source panel (preserving timeline order).
+                    from collections import defaultdict as _dd
+                    panel_frame_positions = _dd(list)  # panel_index -> [frame_positions]
+                    for pos, si in enumerate(frame_sources):
+                        panel_frame_positions[si].append(pos)
+
+                    for si, positions in panel_frame_positions.items():
+                        narr = panel_narrations.get(si, "")
+                        segments.append((f"img{si + 1:03d}", narr, positions))
             else:
-                frame_durations.append(MIN_FRAME_DURATION)
-                log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
+                # No narration.json — all frames are silent (no text to narrate).
+                log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
+                for pos in range(len(frame_paths)):
+                    segments.append((f"frm{pos + 1:04d}", "", [pos]))
 
-        cfg.write_progress("render", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: building audio track")
-        audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
+            # Synthesize one continuous clip per segment and derive per-frame timing.
+            # No whisper transcription — timing is derived purely from proportional
+            # word-count splits, with a MIN_FRAME_DURATION floor so panels don't flash by.
+            frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
+            segment_audio_paths: List[Path] = []
+            chapter_offset = 0.0
+            tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
+            tts_failed = 0      # of those, how many fell back to silence due to a real failure
 
-        # The video timeline (frame_durations) was built to match the RAW,
-        # pre-loudnorm segment audio exactly. But build_chapter_audio_track's
-        # loudnorm pass (a single-pass/dynamic normalization, not two-pass
-        # "measured" mode) can shift the final audio's duration by a small
-        # but real amount due to its internal lookahead/limiter buffering.
-        # render_chapter muxes with `-shortest`, so if the post-loudnorm
-        # audio ends up LONGER than the video timeline, the tail of the
-        # narration gets silently cut off mid-sentence. Re-probe the actual
-        # final audio duration here and extend the last frame's hold time
-        # to cover it, so narration is never truncated.
-        if audio_path and audio_path.exists():
-            try:
-                final_audio_duration = get_audio_duration(audio_path)
-                video_duration = sum(frame_durations)
-                if final_audio_duration > video_duration + 0.05 and frame_durations:
-                    shortfall = final_audio_duration - video_duration
-                    frame_durations[-1] += shortfall
-                    log.info(
-                        "[%s] extended last frame by %.3fs to cover loudnorm "
-                        "duration drift (audio %.3fs vs video %.3fs) — "
-                        "prevents narration from being cut off",
-                        chapter.tag, shortfall, final_audio_duration, video_duration,
+            for seg_idx, (tag, text, positions) in enumerate(segments):
+                cfg.write_progress("render", chapter.index - 1, total,
+                                   f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
+                if text.strip():
+                    tts_attempted += 1
+                audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+                if seg_tts_failed:
+                    tts_failed += 1
+                duration = get_audio_duration(audio_path_seg)
+
+                # Ensure the segment audio is at least long enough for all its
+                # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
+                min_total = len(positions) * MIN_FRAME_DURATION
+                if duration < min_total:
+                    audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
+                    duration = min_total
+
+                timings = split_frame_timings(text, positions, duration)
+                for pos in positions:
+                    frame_timing[pos] = timings[pos]
+                # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
+                # so the total visual duration is longer than the raw audio. Pad the
+                # audio with trailing silence so the audio track matches the video.
+                last_end = max((timings[p][1] for p in positions), default=duration)
+                if last_end > duration:
+                    audio_path_seg = pad_audio_with_silence(audio_path_seg, last_end)
+                    duration = last_end
+                segment_audio_paths.append(audio_path_seg)
+                chapter_offset += duration
+
+            # If most/all segments that HAD real dialogue to speak ended up
+            # falling back to silence, this isn't "a quiet chapter" — it's a
+            # broken TTS pipeline (most commonly: edge-tts's endpoint,
+            # speech.platform.bing.com, is unreachable from this network —
+            # firewall/security-list egress rules on cloud hosts are a common
+            # cause). Every prior signal along the way (translation, rephrase,
+            # loudnorm, mux) looks completely normal even when this has happened,
+            # because each stage just sees "silence" as valid audio input and
+            # passes it through without error. Surface it loudly here instead of
+            # letting the job report success with a genuinely silent video.
+            if tts_attempted > 0:
+                tts_fail_ratio = tts_failed / tts_attempted
+                if tts_fail_ratio >= 0.9:
+                    log.error(
+                        "[%s] TTS FAILED for %d/%d narrated segments (%.0f%%) — "
+                        "edge-tts is not producing audio. Check network access to "
+                        "speech.platform.bing.com from this host (firewall/security-"
+                        "list egress rules are a common cause on cloud VMs). The "
+                        "output video for this chapter will be SILENT.",
+                        chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
                     )
-            except RuntimeError as e:
-                log.warning("[%s] could not verify final audio duration: %s", chapter.tag, e)
+                elif tts_fail_ratio > 0.2:
+                    log.warning(
+                        "[%s] TTS failed for %d/%d narrated segments (%.0f%%) — "
+                        "partial audio dropout, check edge-tts connectivity",
+                        chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+                    )
 
-        cfg.write_progress("render", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
-        video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
+            # Build final per-frame durations from the timings.
+            # Guard against None entries (can happen if a segment had no positions
+            # or an error left a frame_timing slot unpopulated). Default to
+            # MIN_FRAME_DURATION so the video never has a zero-duration frame.
+            frame_durations = []
+            for t in frame_timing:
+                if t is not None:
+                    frame_durations.append(t[1] - t[0])
+                else:
+                    frame_durations.append(MIN_FRAME_DURATION)
+                    log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
 
-        if video_path:
-            chapter_videos.append(video_path)
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: building audio track")
+            audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
 
-        log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
-        cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
+            # The video timeline (frame_durations) was built to match the RAW,
+            # pre-loudnorm segment audio exactly. But build_chapter_audio_track's
+            # loudnorm pass (a single-pass/dynamic normalization, not two-pass
+            # "measured" mode) can shift the final audio's duration by a small
+            # but real amount due to its internal lookahead/limiter buffering.
+            # render_chapter muxes with `-shortest`, so if the post-loudnorm
+            # audio ends up LONGER than the video timeline, the tail of the
+            # narration gets silently cut off mid-sentence. Re-probe the actual
+            # final audio duration here and extend the last frame's hold time
+            # to cover it, so narration is never truncated.
+            if audio_path and audio_path.exists():
+                try:
+                    final_audio_duration = get_audio_duration(audio_path)
+                    video_duration = sum(frame_durations)
+                    if final_audio_duration > video_duration + 0.05 and frame_durations:
+                        shortfall = final_audio_duration - video_duration
+                        frame_durations[-1] += shortfall
+                        log.info(
+                            "[%s] extended last frame by %.3fs to cover loudnorm "
+                            "duration drift (audio %.3fs vs video %.3fs) — "
+                            "prevents narration from being cut off",
+                            chapter.tag, shortfall, final_audio_duration, video_duration,
+                        )
+                except RuntimeError as e:
+                    log.warning("[%s] could not verify final audio duration: %s", chapter.tag, e)
+
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
+            video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
+
+            if video_path:
+                chapter_videos.append(video_path)
+
+            log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
+            cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
+        except Exception as e:
+            # One chapter failing (TTS totally unavailable, a corrupt
+            # source image, an OCR/ffmpeg crash, etc.) must not take
+            # down the rest of a multi-day batch. Log it loudly, skip
+            # this chapter (it's naturally retried on the next resumed
+            # run since it never wrote a completed chapter video), and
+            # keep processing the remaining chapters.
+            log.error(
+                "[%s] chapter FAILED and will be skipped this run: %s",
+                chapter.tag, e, exc_info=True,
+            )
+            cfg.write_progress(
+                "render", chapter.index, total,
+                f"Chapter {chapter.index}/{total} FAILED: {e}", status="warning",
+            )
+            continue
 
     if not chapter_videos:
         cfg.write_progress("render", total, total, "No chapter videos produced", status="error")

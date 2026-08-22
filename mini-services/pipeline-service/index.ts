@@ -1040,8 +1040,20 @@ async function processJob(jobId: string): Promise<void> {
           // failure: manhwa/manhua chapters are often mostly action,
           // establishing, or transition panels with no bubbles at all, so
           // 80%+ silent panels is frequently correct output, not broken OCR.
-          const { totalRegionsDetected, batchCallFailures, freshlyProcessed } = ocrOutcome.stats
+          const { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } = ocrOutcome.stats
           const detectorNeverFired = freshlyProcessed > 3 && totalRegionsDetected === 0
+          // Distinct from detectorNeverFired: text regions WERE found, but
+          // the recognizer couldn't read most of them confidently (status
+          // UNCERTAIN/FAILED), so that dialogue got silently discarded as
+          // if the panel were quiet. Left unchecked this fails exactly the
+          // way the OCR plan calls out: "OCR returns empty text while a
+          // large speech bubble is visually present" being accepted as a
+          // legitimate empty panel instead of triggering the fallback
+          // cascade. Only trip this once there's a reasonable sample size
+          // and it's clearly systemic, not a couple of genuinely hard crops.
+          const regionsWithText = Math.max(totalRegionsDetected, uncertainWithRegions)
+          const uncertainRatio = regionsWithText > 0 ? uncertainWithRegions / regionsWithText : 0
+          const recognizerStruggling = uncertainWithRegions >= 4 && uncertainRatio > 0.5
 
           if (batchCallFailures > 0) {
             await emitLog(jobId, 'warn', 'transcribe',
@@ -1054,6 +1066,12 @@ async function processJob(jobId: string): Promise<void> {
               `Chapter ${ch.index}: PaddleOCR detected zero text regions across ${freshlyProcessed} panels — likely a broken OCR pipeline, not just silent panels. Falling back to VLM.`,
             )
             throw new Error(`OCR detector never fired across ${freshlyProcessed} panels`)
+          }
+          if (recognizerStruggling) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: PaddleOCR detected text in ${uncertainWithRegions} panels but couldn't read it confidently (${Math.round(uncertainRatio * 100)}% uncertain/failed) — dialogue would be silently dropped. Falling back to VLM.`,
+            )
+            throw new Error(`OCR recognizer low-confidence on ${uncertainWithRegions} panels with detected text`)
           }
           if (emptyRatio > 0.8 && rawNarrations.length > 3) {
             // Informational only — do NOT throw / fall back to VLM. The

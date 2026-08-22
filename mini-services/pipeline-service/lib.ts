@@ -1083,9 +1083,9 @@ export async function generateImageNarrationsOCR(
   onProgress?: (done: number, total: number) => void,
 ): Promise<{
   results: Array<{ image: string; text: string }>
-  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number }
+  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number; uncertainWithRegions: number }
 }> {
-  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0 } }
+  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0 } }
 
   const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
   const OCR_BATCH_SIZE = 20 // PaddleOCR is fast on CPU; larger batches reduce HTTP overhead
@@ -1101,6 +1101,15 @@ export async function generateImageNarrationsOCR(
   let totalRegionsDetected = 0
   let batchCallFailures = 0
   let freshlyProcessed = 0
+  // Distinct failure signal from both of the above: the DETECTOR found real
+  // text regions (regions > 0) but the RECOGNIZER couldn't read them
+  // confidently enough to be trusted (status UNCERTAIN/FAILED). That text
+  // gets discarded below (text = '') exactly like a legitimately silent
+  // panel — indistinguishable from "no dialogue" by emptyRatio alone. A
+  // chapter where this happens a lot means real dialogue is being silently
+  // thrown away because the recognizer is struggling with this chapter's
+  // font/art style, not that the panels are quiet.
+  let uncertainWithRegions = 0
 
   // Process in batches
   for (let i = 0; i < imagePaths.length; i += OCR_BATCH_SIZE) {
@@ -1174,8 +1183,11 @@ export async function generateImageNarrationsOCR(
       const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
       totalRegionsDetected += batchRegions
       freshlyProcessed += data.results.length
+      uncertainWithRegions += data.results.filter(
+        (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
+      ).length
       console.log(
-        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected`,
+        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
       )
 
       // Map results back to the correct positions in the results array
@@ -1221,7 +1233,7 @@ export async function generateImageNarrationsOCR(
     onProgress?.(completedCount, imagePaths.length)
   }
 
-  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed } }
+  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } }
 }
 
 // ---------------------------------------------------------------------------
