@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover
 # no validation, so a crash mid-ffmpeg-write (or a corrupt/truncated
 # encode) could leave a broken file that a resumed run would treat as
 # already-complete and silently ship. See render_chapter/finalize_output.
-from production import video_qa, atomic_promote  # noqa: E402
+from production import video_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
@@ -132,6 +132,8 @@ class PipelineConfig:
     slice_only: bool = False  # if True, only run panel slicing then exit (used by the Node orchestrator so VLM can read individual sliced panels)
     production_mode: bool = False
     job_id: str = "local"
+    min_free_disk_gb: float = 2.0  # ResourceGuard threshold — see run_pipeline()
+    min_available_ram_mb: float = 300.0
 
     @property
     def temp_audio_dir(self) -> Path:
@@ -2318,6 +2320,36 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     # Ensure the output directory exists.
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Fail fast rather than start a doomed multi-day batch: on an Oracle
+    # free-tier instance, running out of disk mid-encode is a much worse
+    # failure mode than never starting (a partially-full disk from an
+    # earlier crashed run, temp files from a different job, etc. are all
+    # realistic on a small always-on box). This is a pre-flight check
+    # only — the per-chapter check inside the loop below is what catches
+    # resource pressure that builds up DURING a long run.
+    # SQLiteStateStore gives every chapter's stage/state/error/retry history
+    # a queryable, durable record (survives process restarts, unlike the
+    # JSON progress file which the Node service just polls for the current
+    # snapshot) — this is what turns "filesystem existence checks" into the
+    # kind of real state tracking a multi-day unattended batch needs to be
+    # debuggable after the fact.
+    state_store = SQLiteStateStore(cfg.work_dir / "pipeline_state.sqlite3")
+    state_store.record(cfg.job_id, Stage.JOB, State.RUNNING)
+
+    resource_guard = ResourceGuard(
+        min_free_disk_bytes=int(cfg.min_free_disk_gb * 1_000_000_000),
+        min_available_ram_bytes=int(cfg.min_available_ram_mb * 1_000_000),
+        state=state_store,
+    )
+    preflight = resource_guard.check(cfg.work_dir)
+    if not preflight.ok:
+        raise RuntimeError(
+            f"Refusing to start: {preflight.reason} (free disk: "
+            f"{preflight.free_disk_bytes / 1e9:.2f}GB, available RAM: "
+            f"{preflight.available_ram_bytes / 1e6:.0f}MB). Free up "
+            f"resources or lower --min-free-disk-gb/--min-available-ram-mb."
+        )
+
     chapters = discover_chapters(cfg)
     total = len(chapters)
     chapter_videos: List[Path] = []
@@ -2330,16 +2362,37 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         log.info("=== Chapter %d/%d (%s) ===", chapter.index, total, chapter.name)
         cfg.write_progress("render", chapter.index - 1, total, f"Chapter {chapter.index}/{total}: {chapter.name}")
 
+        # Resource pressure on a long batch typically builds up over time
+        # (temp files accumulating, other processes on the same small
+        # instance) rather than being present at startup — re-check before
+        # each chapter's ffmpeg/TTS/OCR work rather than only once here.
+        resource_status = resource_guard.check(cfg.work_dir, job_id=cfg.job_id)
+        if not resource_status.ok:
+            log.error(
+                "[%s] pausing before this chapter: %s (free disk: %.2fGB, "
+                "available RAM: %.0fMB) — chapter will be retried on the "
+                "next resumed run once resources recover",
+                chapter.tag, resource_status.reason,
+                resource_status.free_disk_bytes / 1e9, resource_status.available_ram_bytes / 1e6,
+            )
+            cfg.write_progress(
+                "render", chapter.index - 1, total,
+                f"Paused: {resource_status.reason}", status="warning",
+            )
+            break
+
         existing_video = cfg.temp_chapters_dir / f"{chapter.tag}.mp4"
         if existing_video.exists():
             log.info("[%s] fully rendered already — resuming past this chapter", chapter.tag)
             chapter_videos.append(existing_video)
+            state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag, artifact_path=existing_video)
             # Keep narrative continuity even when resuming: pull tail from cached script.
             script_cache = cfg.temp_scripts_dir / f"{chapter.tag}.txt"
             if script_cache.exists():
                 prev_tail = last_sentences(script_cache.read_text(encoding="utf-8"))
             continue
 
+        state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
         try:
             # Slice returns [(frame_path, source_panel_index), ...] so we can map
             # each frame to its source image's narration for perfect sync.
@@ -2536,6 +2589,15 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
             if video_path:
                 chapter_videos.append(video_path)
+                state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag,
+                                    artifact_path=video_path, duration=time.time() - t0)
+            else:
+                # render_chapter already logged the specific reason (QA
+                # failure, ffmpeg error, no frames) — record it as
+                # RETRYABLE here rather than COMPLETE/FAILED since a
+                # resumed run will simply attempt this chapter again.
+                state_store.record(cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
+                                    error_code="RENDER_FAILED", retry_category=classify_retry("render failed"))
 
             log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
             cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
@@ -2550,6 +2612,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 "[%s] chapter FAILED and will be skipped this run: %s",
                 chapter.tag, e, exc_info=True,
             )
+            state_store.record(cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
+                                error_message=str(e)[:500], retry_category=classify_retry(e))
             cfg.write_progress(
                 "render", chapter.index, total,
                 f"Chapter {chapter.index}/{total} FAILED: {e}", status="warning",
@@ -2557,18 +2621,56 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             continue
 
     if not chapter_videos:
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="NO_CHAPTERS")
         cfg.write_progress("render", total, total, "No chapter videos produced", status="error")
         raise RuntimeError("No chapter videos were produced — nothing to merge.")
 
+    dropped_chapters = total - len(chapter_videos)
+    if dropped_chapters > 0:
+        log.warning(
+            "%d/%d chapters were skipped this run due to failures — job will "
+            "complete with a video MISSING that content. Check pipeline_state.sqlite3 "
+            "for RETRYABLE chapters and rerun the same --work-dir to fill them in.",
+            dropped_chapters, total,
+        )
+
     cfg.write_progress("merge", total, total, "Merging chapter videos")
-    merged = merge_chapters(cfg, chapter_videos)
+    state_store.record(cfg.job_id, Stage.MERGE, State.RUNNING)
+    try:
+        merged = merge_chapters(cfg, chapter_videos)
+        state_store.record(cfg.job_id, Stage.MERGE, State.COMPLETE, artifact_path=merged)
+    except Exception as e:
+        state_store.record(cfg.job_id, Stage.MERGE, State.FAILED, error_message=str(e)[:500],
+                            retry_category=classify_retry(e))
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="MERGE_FAILED")
+        raise
+
     cfg.write_progress("bgm", total, total, "Finalizing output")
-    finalize_output(cfg, merged)
+    state_store.record(cfg.job_id, Stage.FINAL_QA, State.RUNNING)
+    try:
+        finalize_output(cfg, merged)
+        state_store.record(cfg.job_id, Stage.FINAL_QA, State.COMPLETE, artifact_path=cfg.output_path)
+    except Exception as e:
+        state_store.record(cfg.job_id, Stage.FINAL_QA, State.FAILED, error_message=str(e)[:500],
+                            retry_category=classify_retry(e))
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="FINAL_QA_FAILED")
+        raise
+
     cleanup_temp(cfg)
 
     elapsed = time.time() - start
+    final_state = State.UNCERTAIN if dropped_chapters > 0 else State.COMPLETE
+    state_store.record(cfg.job_id, Stage.JOB, final_state,
+                        duration=elapsed, artifact_path=cfg.output_path,
+                        metadata={"chapters_total": total, "chapters_dropped": dropped_chapters})
     cfg.write_progress("done", total, total, f"Pipeline complete in {elapsed/60:.1f} min", status="done")
     log.info("PIPELINE COMPLETE in %.1f minutes. Output: %s", elapsed / 60, cfg.output_path)
+    if dropped_chapters > 0:
+        log.warning(
+            "Job marked UNCERTAIN (not COMPLETE): %d/%d chapters are missing "
+            "from this output. This is not a silent success.",
+            dropped_chapters, total,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2648,6 +2750,21 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
     parser.add_argument("--production-mode", action="store_true", help="Use local-only production mode: no edge-tts/OpenAI dependency checks or runtime installs.")
     parser.add_argument("--job-id", default="local", help="Stable job id for production state/recovery records.")
     parser.add_argument(
+        "--min-free-disk-gb", type=float, default=2.0,
+        help="Abort (or pause between chapters) if free disk on the work-dir's "
+             "filesystem drops below this many GB (default: 2.0). A multi-day "
+             "unattended batch on a small free-tier disk is exactly the "
+             "scenario this guards against — better to fail loudly here than "
+             "have ffmpeg or Piper fail unpredictably mid-write from a full disk.",
+    )
+    parser.add_argument(
+        "--min-available-ram-mb", type=float, default=300.0,
+        help="Pause between chapters if available RAM drops below this many MB "
+             "(default: 300). Checked before each chapter, not just at startup, "
+             "since memory pressure on a small instance tends to build up over "
+             "a long batch rather than being present on day one.",
+    )
+    parser.add_argument(
         "--slice-only", action="store_true",
         help="Only run the panel-slicing stage for all chapters, then exit. "
              "Writes frame_NNNNN.jpg files + manifest.json under work/temp_slices/chapter_XXX/. "
@@ -2681,6 +2798,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         slice_only=args.slice_only,
         production_mode=args.production_mode,
         job_id=args.job_id,
+        min_free_disk_gb=args.min_free_disk_gb,
+        min_available_ram_mb=args.min_available_ram_mb,
     )
 
 

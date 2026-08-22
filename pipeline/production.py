@@ -91,10 +91,15 @@ class ResourceGuard:
 def classify_retry(exc: Exception|str) -> RetryCategory:
     s=str(exc).lower()
     if 'timeout' in s or 'timed out' in s: return RetryCategory.TIMEOUT
+    # Check corrupt-artifact patterns BEFORE the generic provider-unavailable
+    # "not found" check: ffprobe's own error text for a broken/truncated
+    # media file is often literally "... not found" (e.g. "moov atom not
+    # found"), which would otherwise false-match the missing-binary check
+    # below and misclassify a corrupt video as a missing provider.
+    if 'corrupt' in s or 'ffprobe' in s or 'moov atom' in s: return RetryCategory.CORRUPT_ARTIFACT
     if 'no such file' in s or 'not found' in s or 'missing binary' in s: return RetryCategory.PROVIDER_UNAVAILABLE
     if 'disk' in s or 'memory' in s or 'resource' in s or 'oom' in s: return RetryCategory.RESOURCE
-    if 'quality' in s or 'silence' in s or 'uncertain' in s: return RetryCategory.QUALITY
-    if 'corrupt' in s or 'ffprobe' in s: return RetryCategory.CORRUPT_ARTIFACT
+    if 'quality' in s or 'silence' in s or 'silent' in s or 'uncertain' in s: return RetryCategory.QUALITY
     if 'invalid' in s or 'empty input' in s: return RetryCategory.INVALID_INPUT
     return RetryCategory.TRANSIENT
 

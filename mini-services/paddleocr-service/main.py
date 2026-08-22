@@ -12,6 +12,9 @@ import base64
 import io
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -599,6 +602,155 @@ def _decode_base64_image(b64_string):
         return None
 
 
+def _tesseract_available() -> bool:
+    # type: () -> bool
+    """Cached check for whether the `tesseract` CLI binary exists.
+
+    Tesseract is the plan's independent last-resort OCR candidate — it
+    should never be a hard dependency (Oracle free-tier images may not
+    have it installed), so every call site must be able to skip it
+    cleanly rather than crash. Cached because shutil.which() does a PATH
+    scan and this gets checked per-panel.
+    """
+    if not hasattr(_tesseract_available, "_cached"):
+        _tesseract_available._cached = shutil.which("tesseract") is not None  # type: ignore
+        if not _tesseract_available._cached:  # type: ignore
+            logger.info("tesseract binary not found on PATH — Tesseract fallback tier disabled")
+    return _tesseract_available._cached  # type: ignore
+
+
+def _run_tesseract_ocr(img):
+    # type: (np.ndarray) -> Tuple[str, float]
+    """Run the Tesseract CLI as an independent OCR candidate.
+
+    Returns (text, confidence) where confidence is the mean per-word
+    confidence (0-1) reported by Tesseract's TSV output, and text is the
+    words joined in Tesseract's own reading order (its layout analysis
+    already groups by block/paragraph/line, so no extra clustering is
+    needed here the way the Paddle region-merge required).
+
+    Never raises — a Tesseract failure (bad install, unreadable image,
+    timeout) degrades to an empty/zero-confidence result so callers can
+    treat it as "this candidate didn't pan out" rather than an error that
+    needs handling, matching "Model unavailable -> skip provider and use
+    fallback" from the OCR taxonomy.
+    """
+    if not _tesseract_available():
+        return "", 0.0
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        Image.fromarray(img).save(tmp_path)
+        result = subprocess.run(
+            ["tesseract", tmp_path, "stdout", "--psm", "6", "tsv"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+        )
+        if result.returncode != 0:
+            logger.warning("tesseract exited %d: %s", result.returncode, (result.stderr or "")[:200])
+            return "", 0.0
+
+        words = []  # type: List[str]
+        confs = []  # type: List[float]
+        lines = result.stdout.splitlines()
+        if len(lines) < 2:
+            return "", 0.0
+        header = lines[0].split("\t")
+        try:
+            text_idx = header.index("text")
+            conf_idx = header.index("conf")
+        except ValueError:
+            return "", 0.0
+        for line in lines[1:]:
+            cols = line.split("\t")
+            if len(cols) <= max(text_idx, conf_idx):
+                continue
+            word = cols[text_idx].strip()
+            try:
+                conf = float(cols[conf_idx])
+            except ValueError:
+                continue
+            # Tesseract uses conf == -1 for non-text layout rows (blocks/
+            # paragraphs/lines themselves, not actual words).
+            if not word or conf < 0:
+                continue
+            words.append(word)
+            confs.append(conf)
+
+        if not words:
+            return "", 0.0
+        text = " ".join(words)
+        avg_conf = (sum(confs) / len(confs)) / 100.0  # Tesseract reports 0-100
+        return text, max(0.0, min(1.0, avg_conf))
+    except subprocess.TimeoutExpired:
+        logger.warning("tesseract timed out after 20s")
+        return "", 0.0
+    except Exception as exc:
+        logger.warning("tesseract OCR failed: %s", exc)
+        return "", 0.0
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _ocr_with_cascade(img, options=None):
+    # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
+    """Run the primary PaddleOCR pass and, only when it comes back
+    UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
+
+    This is intentionally lazy (matches "the cascade is intentionally
+    lazy: easy panels consume one OCR pass; only difficult panels reach
+    later models") — Tesseract only runs for panels PaddleOCR couldn't
+    confidently read, not for every panel, to conserve CPU on the Oracle
+    free-tier instance.
+
+    Returns (text, confidence, region_count, status, quality_score,
+    candidates, selection_reason) — the same tuple shape every endpoint
+    below builds its OCRResult from.
+    """
+    regions = _run_ocr_on_image(img, options)
+    merged_text, avg_conf, region_count = _merge_regions(regions)
+    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
+
+    candidates = [{
+        "text": merged_text, "confidence": avg_conf, "regions": region_count,
+        "provider": "paddleocr", "model": MODEL_NAME,
+    }]
+
+    if status == "SUCCESS":
+        return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+
+    tess_text, tess_conf = _run_tesseract_ocr(img)
+    if not tess_text:
+        # Tesseract found nothing either (or isn't installed) — keep the
+        # Paddle UNCERTAIN/FAILED result as-is; don't fabricate anything.
+        return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+
+    tess_regions = len(tess_text.split())
+    candidates.append({
+        "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
+        "provider": "tesseract", "model": "tesseract",
+    })
+
+    # Never blindly majority-vote or prefer the newer candidate — score
+    # both and only switch if Tesseract is a genuinely better, trustworthy
+    # candidate. Do NOT hallucinate a merge between two disagreeing
+    # transcriptions; take one whole candidate or the other.
+    tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
+    if tess_status == "SUCCESS" and tess_quality > quality_score:
+        return (
+            tess_text, tess_conf, tess_regions, tess_status, tess_quality,
+            candidates, f"tesseract_fallback_beat_paddleocr:{tess_reason}",
+        )
+
+    # Neither candidate was confidently trustworthy — stay UNCERTAIN
+    # rather than accept a low-confidence guess from either provider.
+    return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+
+
 def _quality_status(text, confidence, regions):
     # Empty/no-region output is explicitly UNCERTAIN, not successful text.
     quality = round(max(0.0, min(1.0, (confidence or 0.0))) * (1.0 if regions > 0 else 0.0), 4)
@@ -654,22 +806,20 @@ async def ocr_batch(request: BatchOCRRequest):
             results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image"))
             continue
 
-        regions = _run_ocr_on_image(img_array, request.options)
-        merged_text, avg_conf, region_count = _merge_regions(regions)
+        text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
 
         if region_count == 0:
             logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
 
-        status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
         results.append(
             OCRResult(
                 index=idx,
-                text=merged_text,
+                text=text,
                 confidence=avg_conf,
                 regions=region_count,
                 status=status,
                 quality_score=quality_score,
-                candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+                candidates=candidates,
                 selection_reason=reason,
             )
         )
@@ -703,8 +853,7 @@ async def ocr_base64(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array, request.options)
-    merged_text, avg_conf, region_count = _merge_regions(regions)
+    text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
@@ -714,14 +863,13 @@ async def ocr_base64(request: Base64OCRRequest):
         MODEL_NAME,
     )
 
-    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
     return Base64OCRResponse(
-        text=merged_text,
+        text=text,
         confidence=avg_conf,
         regions=region_count,
         status=status,
         quality_score=quality_score,
-        candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+        candidates=candidates,
         selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,
@@ -742,8 +890,7 @@ async def ocr_single(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    regions = _run_ocr_on_image(img_array, request.options)
-    merged_text, avg_conf, region_count = _merge_regions(regions)
+    text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
@@ -753,14 +900,13 @@ async def ocr_single(request: Base64OCRRequest):
         MODEL_NAME,
     )
 
-    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
     return SingleOCRResponse(
-        text=merged_text,
+        text=text,
         confidence=avg_conf,
         regions=region_count,
         status=status,
         quality_score=quality_score,
-        candidates=[{"text": merged_text, "confidence": avg_conf, "regions": region_count}],
+        candidates=candidates,
         selection_reason=reason,
         model=MODEL_NAME,
         processing_time_ms=elapsed_ms,

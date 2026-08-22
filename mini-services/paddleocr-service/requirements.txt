@@ -10,3 +10,11 @@ python-multipart==0.0.18
 Pillow>=10.4.0,<12.0.0
 numpy>=1.24.4,<2.0.0
 opencv-python-headless>=4.10.0,<4.11.0
+
+# Optional last-resort OCR fallback tier: this service shells out to the
+# `tesseract` CLI binary directly (no pytesseract wrapper needed), only for
+# panels where PaddleOCR comes back UNCERTAIN/FAILED. Not a pip package —
+# install the system binary if you want this tier active:
+#   sudo apt-get install -y tesseract-ocr
+# If it's not installed, the service detects that at runtime and simply
+# skips this fallback tier (logged once at startup) rather than failing.
