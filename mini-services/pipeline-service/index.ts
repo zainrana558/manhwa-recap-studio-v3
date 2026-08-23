@@ -46,12 +46,16 @@ import {
   downloadImageForSource,
   extFromFilename,
   generateImageNarrations,
+  generateImageNarrationsOCR,
+  isPaddleOCRAvailable,
+  getOCRModelName,
   filterCreditPanels,
+  filterJunkTextPanels,
   sleep,
   fileExists,
 } from './lib'
 import { isR2Configured, uploadFileToR2 } from './r2'
-import * as mega from 'megajs'
+import { Storage as MegaStorage } from 'megajs'
 import { createReadStream } from 'fs'
 
 // ---------------------------------------------------------------------------
@@ -273,6 +277,45 @@ function extractJobId(payload: unknown): string | null {
     if (typeof p.jobId === 'string') return p.jobId
   }
   return null
+}
+
+
+type VideoQaResult = { ok: true; sizeBytes: number; durationSec: number } | { ok: false; error: string }
+
+async function validateFinalVideoArtifact(filePath: string): Promise<VideoQaResult> {
+  let st
+  try {
+    st = await fs.stat(filePath)
+  } catch (err) {
+    return { ok: false, error: `output file is missing or unreadable: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (!st.isFile() || st.size < 1024) {
+    return { ok: false, error: `output file is too small or not a regular file (${st.size} bytes)` }
+  }
+
+  const probe = spawnSync('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration:stream=codec_type',
+    '-of', 'json',
+    filePath,
+  ], { encoding: 'utf8', timeout: 30000, shell: false })
+
+  if (probe.error) return { ok: false, error: `ffprobe unavailable or failed to start: ${probe.error.message}` }
+  if (probe.status !== 0) return { ok: false, error: `ffprobe failed: ${(probe.stderr || probe.stdout || '').slice(0, 500)}` }
+
+  try {
+    const parsed: unknown = JSON.parse(probe.stdout || '{}')
+    if (typeof parsed !== 'object' || parsed === null) return { ok: false, error: 'ffprobe returned malformed JSON' }
+    const rec = parsed as { format?: { duration?: unknown }; streams?: Array<{ codec_type?: unknown }> }
+    const duration = Number(rec.format?.duration)
+    const streams = Array.isArray(rec.streams) ? rec.streams : []
+    if (!Number.isFinite(duration) || duration <= 0) return { ok: false, error: 'video has no positive duration' }
+    if (!streams.some((stream) => stream.codec_type === 'video')) return { ok: false, error: 'video stream missing' }
+    if (!streams.some((stream) => stream.codec_type === 'audio')) return { ok: false, error: 'audio stream missing' }
+    return { ok: true, sizeBytes: st.size, durationSec: duration }
+  } catch (err) {
+    return { ok: false, error: `could not parse ffprobe output: ${err instanceof Error ? err.message : String(err)}` }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +611,8 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     '--work-dir', workDir(jobId),
     '--voice', 'en-US-AndrewNeural', // unused by slice-only, but required by argparse
     '--narration-provider', 'none',
+    '--job-id', jobId,
+    ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--slice-only',
     '--keep-temp',
   ]
@@ -837,13 +882,32 @@ async function processJob(jobId: string): Promise<void> {
   }
 
   // -----------------------------
-  // Phase 2: TRANSCRIBE (VLM) — read bubble/caption text from each panel
+  // Phase 2: TRANSCRIBE — read bubble/caption text from each panel.
+  // Strategy: PaddleOCR PP-OCRv5 (PRIMARY, local, no API keys needed) →
+  //           VLM providers (FALLBACK, requires API keys, slower)
   // -----------------------------
   await db.job.update({
     where: { id: jobId },
-    data: { status: 'transcribing', stage: 'transcribe', message: 'Reading panel text with VLM' },
+    data: { status: 'transcribing', stage: 'transcribe', message: 'Transcribing panel text' },
   })
   await emitStatus(jobId)
+
+  // Check PaddleOCR availability ONCE at the start of transcription phase.
+  // If the service is up, we use it for ALL chapters. If not, we fall back
+  // to VLM for ALL chapters (no per-chapter switching — that would waste
+  // time re-initializing providers).
+  const ocrAvailable = await isPaddleOCRAvailable()
+  let ocrModelName = 'unknown'
+  if (ocrAvailable) {
+    ocrModelName = await getOCRModelName()
+    await emitLog(jobId, 'success', 'transcribe',
+      `PaddleOCR ${ocrModelName} detected — using as PRIMARY transcriptor (fast, local, no API keys needed)`,
+    )
+  } else {
+    await emitLog(jobId, 'info', 'transcribe',
+      'PaddleOCR service not available — falling back to VLM providers (requires API keys)',
+    )
+  }
   await emitLog(jobId, 'info', 'transcribe', 'Transcribing speech bubbles and captions from each panel image')
 
   // Set VLM API keys from the per-job record (user-entered in the UI).
@@ -950,19 +1014,111 @@ async function processJob(jobId: string): Promise<void> {
 
     try {
       const modeLabel = frameKeyed ? 'sliced panels' : 'full-page images'
-      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel}...`)
-      const rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
-        // Per-image progress within this chapter.
-        void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
-      })
+      let rawNarrations: Array<{ image: string; text: string }>
+      let usedMethod = 'unknown'
+
+      if (ocrAvailable) {
+        // ── PRIMARY: PaddleOCR PP-OCRv5 (fast, local, no API keys) ──
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with PaddleOCR ${ocrModelName}...`)
+        try {
+          const ocrOutcome = await generateImageNarrationsOCR(imageFiles, (done, total) => {
+            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} OCR'd`)
+          })
+          rawNarrations = ocrOutcome.results
+          usedMethod = `PaddleOCR ${ocrModelName}`
+
+          const emptyCount = rawNarrations.filter((n) => !n.text.trim()).length
+          const emptyRatio = emptyCount / rawNarrations.length
+
+          // Genuine OCR failure signals — worth falling back to VLM for:
+          //  1. The service call itself errored (network/service down).
+          //  2. The text DETECTOR never fired once across the whole chapter
+          //     (totalRegionsDetected === 0) despite processing panels.
+          //     This is what a broken model/init/preprocessing bug looks
+          //     like — not just "few panels have dialogue".
+          // A high empty-text ratio ALONE is explicitly NOT treated as
+          // failure: manhwa/manhua chapters are often mostly action,
+          // establishing, or transition panels with no bubbles at all, so
+          // 80%+ silent panels is frequently correct output, not broken OCR.
+          const { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } = ocrOutcome.stats
+          const detectorNeverFired = freshlyProcessed > 3 && totalRegionsDetected === 0
+          // Distinct from detectorNeverFired: text regions WERE found, but
+          // the recognizer couldn't read most of them confidently (status
+          // UNCERTAIN/FAILED), so that dialogue got silently discarded as
+          // if the panel were quiet. Left unchecked this fails exactly the
+          // way the OCR plan calls out: "OCR returns empty text while a
+          // large speech bubble is visually present" being accepted as a
+          // legitimate empty panel instead of triggering the fallback
+          // cascade. Only trip this once there's a reasonable sample size
+          // and it's clearly systemic, not a couple of genuinely hard crops.
+          const regionsWithText = Math.max(totalRegionsDetected, uncertainWithRegions)
+          const uncertainRatio = regionsWithText > 0 ? uncertainWithRegions / regionsWithText : 0
+          const recognizerStruggling = uncertainWithRegions >= 4 && uncertainRatio > 0.5
+
+          if (batchCallFailures > 0) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: PaddleOCR service call failed ${batchCallFailures}x — falling back to VLM for this chapter`,
+            )
+            throw new Error(`OCR service unreachable/erroring (${batchCallFailures} batch failures)`)
+          }
+          if (detectorNeverFired) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: PaddleOCR detected zero text regions across ${freshlyProcessed} panels — likely a broken OCR pipeline, not just silent panels. Falling back to VLM.`,
+            )
+            throw new Error(`OCR detector never fired across ${freshlyProcessed} panels`)
+          }
+          if (recognizerStruggling) {
+            await emitLog(jobId, 'warn', 'transcribe',
+              `Chapter ${ch.index}: PaddleOCR detected text in ${uncertainWithRegions} panels but couldn't read it confidently (${Math.round(uncertainRatio * 100)}% uncertain/failed) — dialogue would be silently dropped. Falling back to VLM.`,
+            )
+            throw new Error(`OCR recognizer low-confidence on ${uncertainWithRegions} panels with detected text`)
+          }
+          if (emptyRatio > 0.8 && rawNarrations.length > 3) {
+            // Informational only — do NOT throw / fall back to VLM. The
+            // detector did fire (totalRegionsDetected > 0), so this is most
+            // likely a genuinely quiet chapter, not a broken pipeline.
+            await emitLog(jobId, 'info', 'transcribe',
+              `Chapter ${ch.index}: ${emptyCount}/${rawNarrations.length} panels (${Math.round(emptyRatio * 100)}%) have no dialogue — this is normal for action-heavy chapters. OCR detector is active (${totalRegionsDetected} regions found), keeping PaddleOCR results.`,
+            )
+          }
+        } catch (ocrErr) {
+          // OCR failed or returned poor results — fall back to VLM for this chapter.
+          const ocrMsg = ocrErr instanceof Error ? ocrErr.message : String(ocrErr)
+          await emitLog(jobId, 'warn', 'transcribe',
+            `Chapter ${ch.index}: PaddleOCR failed or low quality (${ocrMsg.slice(0, 100)}) — falling back to VLM`,
+          )
+          rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed via VLM`)
+          })
+          usedMethod = 'VLM (fallback)'
+        }
+      } else {
+        // ── FALLBACK: VLM providers (requires API keys) ──
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with VLM...`)
+        rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+          void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
+        })
+        usedMethod = 'VLM'
+      }
 
       // FILTER CREDIT/AUTHOR/WEBSITE PANELS — these are non-story panels
       // (scanlation credits, Discord links, Patreon, "next chapter" teasers,
       // etc.) that shouldn't be narrated. Their text is set to empty so the
       // Python render step treats them as silent/skipped frames.
-      const { filtered: narrations, creditsRemoved } = filterCreditPanels(rawNarrations)
+      const { filtered: creditFiltered, creditsRemoved } = filterCreditPanels(rawNarrations)
       if (creditsRemoved > 0) {
         await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: filtered out ${creditsRemoved} credit/author panel(s)`)
+      }
+
+      // FILTER PUNCTUATION-ONLY PANELS — bubbles that are only "......",
+      // "?!!", "!!" etc. (real stylistic "silence beat" bubbles, common in
+      // manhwa). OCR reads these correctly, but feeding literal punctuation
+      // to edge-tts produces garbage narration, not silence. Silence these
+      // instead of narrating them — same shape as the credit filter above,
+      // applied after it so it only sees panels the credit filter left alone.
+      const { filtered: narrations, junkRemoved } = filterJunkTextPanels(creditFiltered)
+      if (junkRemoved > 0) {
+        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: silenced ${junkRemoved} punctuation-only panel(s) (e.g. "...", "?!!") instead of narrating them literally`)
       }
 
       // Save narrations as narration.json. When frameKeyed, keys are sliced
@@ -981,15 +1137,21 @@ async function processJob(jobId: string): Promise<void> {
         jobId,
         'success',
         'transcribe',
-        `Chapter ${ch.index} transcribed: ${narrations.length} ${frameKeyed ? 'panels' : 'images'}${creditsRemoved > 0 ? ` (${creditsRemoved} credits filtered)` : ''}`
+        `Chapter ${ch.index} transcribed (${usedMethod}): ${narrations.length} ${frameKeyed ? 'panels' : 'images'}${creditsRemoved > 0 ? ` (${creditsRemoved} credits filtered)` : ''}`
       )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await emitLog(jobId, 'error', 'transcribe', `Chapter ${ch.index} transcription failed: ${msg}`)
-      // narration.json absence signals failure to Python pipeline.
+      // Total failure (both PaddleOCR and VLM threw) — previously this still
+      // marked the chapter `transcribed: true` / status 'transcribed', which
+      // is misleading: the chapter has no narration.json at all, and the
+      // Python render step will silently produce a fully-silent chapter for
+      // it. Record it as a genuine error instead so the UI and job status
+      // reflect what actually happened, using the `status`/`error` fields
+      // that already exist in the schema for exactly this.
       const updated = await db.chapter.update({
         where: { id: ch.id },
-        data: { status: 'transcribed', transcribed: true },
+        data: { status: 'error', error: msg.slice(0, 1000), transcribed: false },
       })
       await emitChapter(jobId, updated)
     }
@@ -1044,6 +1206,8 @@ async function processJob(jobId: string): Promise<void> {
     '--work-dir', workDir(jobId),
     '--voice', job.voice,
     '--narration-provider', 'none',
+    '--job-id', jobId,
+    ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--progress-file', progressFile,
     '--keep-temp',
   ]
@@ -1185,6 +1349,20 @@ async function processJob(jobId: string): Promise<void> {
       io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
       return
     }
+    const qa = await validateFinalVideoArtifact(outFile)
+    if (!qa.ok) {
+      const msg = `Rendered artifact failed video QA: ${qa.error}`
+      await emitLog(jobId, 'error', 'render', msg)
+      await db.job.update({
+        where: { id: jobId },
+        data: { status: 'error', error: msg, stage: 'render' },
+      })
+      await emitStatus(jobId)
+      io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
+      return
+    }
+    await emitLog(jobId, 'success', 'render', `Video QA passed (${Math.round(qa.sizeBytes / 1024 / 1024)}MB, ${Math.round(qa.durationSec)}s, audio+video streams present)`)
+
     const outName = path.basename(outFile)
 
     // -----------------------------
@@ -1254,7 +1432,7 @@ async function processJob(jobId: string): Promise<void> {
           const archiveName = `${safeTitle}_recap.mp4`
 
           await new Promise<void>((resolve, reject) => {
-            const s = mega.Storage({
+            const s = new MegaStorage({
               email: megaEmail,
               password: megaPassword,
               autoload: true,
@@ -1262,22 +1440,27 @@ async function processJob(jobId: string): Promise<void> {
             s.on('ready', () => {
               try {
                 const uploadStream = s.upload(archiveName)
-                createReadStream(outFile).pipe(uploadStream)
-                uploadStream.on('complete', () => {
-                  try {
+                const source = createReadStream(outFile)
+                source.on('error', (err) => reject(err))
+
+                // megajs ships Deno-oriented stream declarations, while at
+                // runtime this is a Node writable stream. Keep that mismatch
+                // isolated at the library boundary instead of weakening the
+                // rest of the upload path.
+                source.pipe(uploadStream as unknown as NodeJS.WritableStream)
+
+                uploadStream.complete
+                  .then(async (file) => {
                     archiveProvider = 'mega'
-                    archiveFileId = (uploadStream as any).link()
+                    archiveFileId = await file.link(false)
                     resolve()
-                  } catch (err) {
-                    reject(err)
-                  }
-                })
-                uploadStream.on('error', (err: Error) => reject(err))
+                  })
+                  .catch((err: unknown) => reject(err))
               } catch (err) {
                 reject(err)
               }
             })
-            s.on('error', (err: Error) => reject(err))
+            ;(s as unknown as { on(event: 'error', listener: (err: Error) => void): void }).on('error', (err) => reject(err))
           })
 
           // Delete local file after successful upload.
@@ -1405,17 +1588,22 @@ function sendJson(res: ServerResponse, code: number, body: unknown) {
 httpServer.listen(PORT, async () => {
   console.log(`[pipeline-service] listening on port ${PORT} (socket.io path "/")`)
 
-  // PYTHON DEPENDENCY CHECK: verify that edge-tts, openai, PIL, cv2, numpy are
-  // installed in the Python environment. If any are missing, auto-install them
-  // via pip. This prevents the "edge-tts not installed" render failure that
-  // happens when the venv gets reset.
+  // PYTHON DEPENDENCY CHECK: production mode is local-first and must not require
+  // edge-tts/openai or install packages at runtime. Legacy/dev mode can still
+  // use pipeline/requirements.txt if explicitly selected with PRODUCTION_PIPELINE=0.
   try {
-    const checkResult = spawnSync(PYTHON_BIN, ['-c', 'import edge_tts, openai, PIL, cv2, numpy'], {
+    const productionPipeline = process.env.PRODUCTION_PIPELINE !== '0'
+    const depSnippet = productionPipeline ? 'import PIL, cv2, numpy' : 'import edge_tts, openai, PIL, cv2, numpy'
+    const checkResult = spawnSync(PYTHON_BIN, ['-c', depSnippet], {
       encoding: 'utf8',
       timeout: 10000,
     })
     if (checkResult.status !== 0) {
-      console.log('[pipeline-service] Python deps missing — auto-installing from pipeline/requirements.txt')
+      if (productionPipeline) {
+        console.error('[pipeline-service] Production Python deps missing; not auto-installing at runtime')
+        return
+      }
+      console.log('[pipeline-service] Legacy Python deps missing — auto-installing from pipeline/requirements.txt')
       const installResult = spawnSync(PYTHON_BIN, ['-m', 'pip', 'install', '-r', path.join(PROJECT_ROOT, 'pipeline', 'requirements.txt')], {
         encoding: 'utf8',
         timeout: 120000,
@@ -1427,7 +1615,7 @@ httpServer.listen(PORT, async () => {
         console.error('[pipeline-service] Failed to install Python deps:', installResult.stderr?.slice(-300))
       }
     } else {
-      console.log('[pipeline-service] Python deps OK (edge-tts, openai, PIL, cv2, numpy)')
+      console.log(`[pipeline-service] Python deps OK (${depSnippet})`)
     }
   } catch (err) {
     console.error('[pipeline-service] Python dep check failed:', err)
@@ -1520,7 +1708,8 @@ process.on('unhandledRejection', (err) => {
   console.error('[pipeline-service] unhandledRejection:', err)
 })
 process.on('exit', (code, signal) => {
-  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(process.memoryUsage.rss / 1024 / 1024)}MB`)
+  const m = process.memoryUsage()
+  console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(m.rss / 1024 / 1024)}MB`)
 })
 // Log memory usage every 30s to detect leaks.
 setInterval(() => {

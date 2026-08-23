@@ -4,7 +4,7 @@ import { useSectionObserver } from "@/hooks/use-section-observer";
 import {
   Search,
   ScanLine,
-  Eye,
+  FileText,
   Scissors,
   Clapperboard,
   Globe,
@@ -41,10 +41,10 @@ const FEATURES: Feature[] = [
     glowColor: "shadow-emerald-500/10",
   },
   {
-    icon: Eye,
-    title: "VLM Transcription",
-    desc: "Vision AI reads speech bubbles and captions from each panel with 3 provider fallback.",
-    stat: "3 VLM Providers",
+    icon: FileText,
+    title: "PaddleOCR Transcription",
+    desc: "PP-OCRv5 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
+    stat: "PP-OCRv5",
     gradient: "from-sky-500/20 to-blue-500/10",
     glowColor: "shadow-sky-500/10",
   },
@@ -75,7 +75,7 @@ const FEATURES: Feature[] = [
   {
     icon: Zap,
     title: "Groq Accelerated",
-    desc: "Optional Groq LPU hardware delivers 3-5x faster VLM transcription and narration rewriting.",
+    desc: "Optional Groq LPU hardware delivers 3-5x faster VLM fallback transcription and narration rewriting.",
     stat: "3-5x Faster",
     gradient: "from-yellow-500/20 to-amber-500/10",
     glowColor: "shadow-yellow-500/10",

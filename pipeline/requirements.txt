@@ -1,14 +1,12 @@
-edge-tts>=7.2.8
-openai>=2.49.0
-Pillow>=11.3.0
-opencv-python>=4.13.0
-numpy>=2.1.0
-# NOTE: torch/torchvision are installed SEPARATELY by setup.sh via
-# --index-url https://download.pytorch.org/whl/cpu (CPU-only build).
-# The versions below just record the minimum — pip will skip them
-# if the CPU build already satisfies the constraint.
-# Do NOT add --extra-index-url here or pip may pull a GPU build.
-torch>=2.0.0
-torchvision>=0.15.0
-ultralytics>=8.0.0
-huggingface-hub>=0.20.0
+# Production target: Oracle Cloud Free Tier CPU-only with Python 3.10.4.
+# Production TTS is local-first (Piper -> retry -> eSpeak NG) and does not
+# require edge-tts/openai/API keys. Install edge-tts/openai separately only for
+# explicit legacy/development mode (PRODUCTION_PIPELINE=0).
+Pillow>=10.4.0,<12.0.0
+opencv-python-headless>=4.10.0,<4.11.0
+numpy>=1.24.4,<2.0.0
+# NOTE: torch/torchvision are installed SEPARATELY by setup.sh via CPU wheels.
+torch>=2.0.0,<3.0.0
+torchvision>=0.15.0,<1.0.0
+ultralytics~=8.0
+huggingface-hub~=0.20

@@ -63,6 +63,8 @@ server.log
 /mini-services-dist/
 upload/
 pipeline/models/
+pipeline/piper/
+pipeline/voices/
 data/cache/
 
 # Runtime artifacts
@@ -74,3 +76,5 @@ pipeline/__pycache__/
 
 # Log directory (created by setup.sh tmux fallback)
 logs/
+*.pyc
+yolov8n.pt

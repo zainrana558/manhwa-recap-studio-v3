@@ -1,0 +1,6 @@
+interface:
+  display_name: "Manhwa Recap Studio V3"
+  short_description: "Repo-specific patterns and workflows for manhwa-recap-studio-v3"
+  default_prompt: "Use the manhwa-recap-studio-v3 repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true

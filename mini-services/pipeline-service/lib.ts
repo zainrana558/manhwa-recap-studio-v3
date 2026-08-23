@@ -121,8 +121,31 @@ import crypto from 'crypto'
 const VLM_CACHE_DIR = path.join(DATA_DIR, 'cache', 'vlm')
 const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent)
 
+// Bump this whenever OCR tuning parameters (det_db_unclip_ratio, model
+// version, etc.) change in a way that could produce different text for the
+// same image. The 1-year TTL above means a stale cached EMPTY result from
+// before a detector fix would otherwise never get re-checked — confirmed
+// as a real cause of permanently-silent panels: an early run cached "no
+// text detected" for a panel, and no later code fix (including this one)
+// would ever re-process that panel without a version bump here, since the
+// cache key was previously derived from the image path alone.
+// v2: raised det_db_unclip_ratio from PaddleOCR's document-tuned default
+// (1.8) to 2.4 for manhwa/manhua's bolder, hand-lettered speech-bubble text.
+const OCR_TUNING_VERSION = 'v3-status-aware'
+
 function vlmCacheKey(imagePath: string): string {
   return crypto.createHash('sha256').update(imagePath).digest('hex').slice(0, 16)
+}
+
+// Separate key function for OCR specifically (VLM has its own prompt/model
+// versioning concerns and isn't affected by det_db_unclip_ratio, so it keeps
+// the plain path-only key via vlmCacheKey above).
+function ocrCacheKey(imagePath: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${OCR_TUNING_VERSION}:${imagePath}`)
+    .digest('hex')
+    .slice(0, 16)
 }
 
 async function getVlmCached(key: string): Promise<string | null> {
@@ -174,7 +197,11 @@ const CREDIT_PATTERNS: RegExp[] = [
   /donate/i,
   /support\s+(?:us|the\s+(?:team|scanlat))/i,
   /join\s+(?:our\s+)?(?:discord|server)/i,
-  /follow\s+(?:us|on)/i,
+  /follow\s+(?:us|me)\s+(?:on|at)\b/i,   // "follow us on [platform]" — narrowed
+                                          // from a bare "follow (us|on)" match,
+                                          // which could false-positive on real
+                                          // story dialogue like "follow us!"
+                                          // or "I'll follow on your orders"
   /@[\w-]+\s*(?:on\s+)?(?:twitter|insta|tiktok|youtube)/i,  // social handles
   /website\s*:/i,
   /visit\s+(?:our\s+)?(?:site|website)/i,
@@ -232,6 +259,46 @@ export function filterCreditPanels(
     return n
   })
   return { filtered, creditsRemoved }
+}
+
+// A panel whose OCR'd text is nothing but punctuation/ellipsis/exclamation
+// marks — e.g. "......", "?!!", "!!" — with zero actual letters or digits.
+// These are real, common manhwa bubbles used as a stylistic "silence" beat
+// (a character trailing off, a wordless shock reaction). OCR reads them
+// correctly — that IS all the ink in the bubble — but feeding literal
+// punctuation into edge-tts produces garbage narration ("dot dot dot dot"
+// or nothing intelligible at all), not silence and not real dialogue.
+// Confirmed on real output: a "?!!"-only bubble at ~3:40 in a test video
+// produced exactly this failure mode.
+//
+// Deliberately narrow: requires ZERO letters/digits anywhere in the text.
+// A bubble like "Wait...!" has a real word in it and must NOT be caught
+// here — only pure symbol/punctuation bubbles qualify.
+const PUNCTUATION_ONLY_RE = /^[\s.,!?…\-–—~*'"()\[\]]+$/u
+
+export function isJunkOnlyText(text: string): boolean {
+  if (!text || !text.trim()) return false
+  return PUNCTUATION_ONLY_RE.test(text.trim())
+}
+
+/**
+ * Filter an array of {image, text} narrations, silencing panels whose text
+ * is nothing but punctuation (no letters/digits at all). Same shape as
+ * filterCreditPanels — text is set to empty (not the entry removed) so
+ * frame indices stay aligned with the Python render step's frame list.
+ */
+export function filterJunkTextPanels(
+  narrations: Array<{ image: string; text: string }>,
+): { filtered: Array<{ image: string; text: string }>; junkRemoved: number } {
+  let junkRemoved = 0
+  const filtered = narrations.map((n) => {
+    if (isJunkOnlyText(n.text)) {
+      junkRemoved++
+      return { ...n, text: '' }
+    }
+    return n
+  })
+  return { filtered, junkRemoved }
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +756,65 @@ interface AsuraChapterPage {
   url: string
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function safeString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function normalizeAsuraChapters(body: unknown, mangaSlug: string): AsuraChapter[] {
+  if (!isRecord(body) || !Array.isArray(body.data)) {
+    console.warn(`[AsuraScans] malformed chapters response for ${mangaSlug}: missing data array`)
+    return []
+  }
+  const chapters: AsuraChapter[] = []
+  for (const item of body.data) {
+    if (!isRecord(item)) continue
+    const slug = safeString(item.slug)
+    const rawNumber = item.number
+    const number = typeof rawNumber === 'number' ? rawNumber : Number(rawNumber)
+    if (!slug || !Number.isFinite(number)) {
+      console.warn(`[AsuraScans] skipped malformed chapter record for ${mangaSlug}`)
+      continue
+    }
+    chapters.push({
+      id: typeof item.id === 'number' ? item.id : Number(item.id) || 0,
+      number,
+      title: typeof item.title === 'string' ? item.title : '',
+      slug,
+    })
+  }
+  return chapters
+}
+
+function normalizeAsuraChapterPages(body: unknown, mangaSlug: string, chapterSlug: string): AsuraChapterPage[] {
+  const data = isRecord(body) ? body.data : null
+  const chapter = isRecord(data) ? data.chapter : null
+  const rawPages = isRecord(chapter) ? chapter.pages : null
+  if (!Array.isArray(rawPages)) {
+    console.warn(`[AsuraScans] malformed pages response for ${mangaSlug}/${chapterSlug}: missing pages array`)
+    return []
+  }
+  const pages: AsuraChapterPage[] = []
+  for (const page of rawPages) {
+    const url = isRecord(page) ? safeString(page.url) : null
+    if (!url) {
+      console.warn(`[AsuraScans] skipped malformed page for ${mangaSlug}/${chapterSlug}`)
+      continue
+    }
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsupported protocol')
+      pages.push({ url })
+    } catch {
+      console.warn(`[AsuraScans] skipped invalid page URL for ${mangaSlug}/${chapterSlug}`)
+    }
+  }
+  return pages
+}
+
 /**
  * Fetch the chapter list for a manga from AsuraScans.
  * mangaId is the as-{slug} form; slug is the AsuraScans series slug.
@@ -720,8 +846,12 @@ export async function fetchAsuraScansChapters(
   if (!res.ok) {
     throw new Error(`AsuraScans chapters ${res.status} for ${mangaSlug}`)
   }
-  const body = await res.json()
-  const chapters: AsuraChapter[] = body?.data ?? []
+  const body: unknown = await res.json().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[AsuraScans] malformed chapters JSON for ${mangaSlug}: ${msg}`)
+    return null
+  })
+  const chapters = normalizeAsuraChapters(body, mangaSlug)
 
   // API returns newest-first; reverse to oldest-first.
   const oldest = [...chapters].reverse()
@@ -757,9 +887,13 @@ export async function fetchAsuraScansChapterImages(
   if (!res.ok) {
     throw new Error(`AsuraScans chapter ${res.status} for ${mangaSlug}/${chapterSlug}`)
   }
-  const body = await res.json()
-  const pages: AsuraChapterPage[] = body?.data?.chapter?.pages ?? []
-  return pages.map((p) => p.url).filter((u): u is string => Boolean(u))
+  const body: unknown = await res.json().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[AsuraScans] malformed pages JSON for ${mangaSlug}/${chapterSlug}: ${msg}`)
+    return null
+  })
+  const pages = normalizeAsuraChapterPages(body, mangaSlug, chapterSlug)
+  return pages.map((p) => p.url)
 }
 
 /** Download an AsuraScans image from cdn.asurascans.com. */
@@ -856,6 +990,256 @@ async function getZai() {
   return await zaiPromise
 }
 
+// ---------------------------------------------------------------------------
+// PaddleOCR PP-OCRv5 — Primary local OCR transcription.
+//
+// Sends image file paths to the PaddleOCR Python service (port 3002) for
+// fast, CPU-efficient text extraction. This is the PRIMARY transcription
+// method — VLM is used only as a fallback when OCR is unavailable or
+// returns low-confidence results.
+//
+// PP-OCRv5 gives +13% accuracy over v4, handles multilingual text, and
+// is specifically optimized for manga/manhwa panels (speech bubbles,
+// rotated text, mixed scripts).
+// ---------------------------------------------------------------------------
+
+const OCR_CACHE_DIR = path.join(DATA_DIR, 'cache', 'ocr')
+
+/** Check if the PaddleOCR service is reachable and ready. */
+export async function isPaddleOCRAvailable(): Promise<boolean> {
+  try {
+    const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
+    const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5000) })
+    if (!res.ok) return false
+    const data = (await res.json()) as { ready?: boolean }
+    return data.ready === true
+  } catch {
+    return false
+  }
+}
+
+/** Get OCR model name from the PaddleOCR service. */
+export async function getOCRModelName(): Promise<string> {
+  try {
+    const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
+    const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(3000) })
+    if (!res.ok) return 'unknown'
+    const data = (await res.json()) as { model?: string }
+    return data.model || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+/** Get cached OCR result for an image, or null if not cached. */
+async function getOcrCached(key: string): Promise<{ text: string; status: string } | null> {
+  try {
+    const cacheFile = path.join(OCR_CACHE_DIR, `${key}.json`)
+    const stat = await fs.stat(cacheFile)
+    if (Date.now() - stat.mtimeMs > VLM_CACHE_TTL_MS) return null
+    const data = JSON.parse(await fs.readFile(cacheFile, 'utf8'))
+    const status = String(data.status || 'SUCCESS').toUpperCase()
+    if (status !== 'SUCCESS') return null
+    return { text: data.text ?? '', status }
+  } catch {
+    return null
+  }
+}
+
+/** Save OCR result to cache. */
+async function setOcrCached(key: string, text: string, status = 'SUCCESS'): Promise<void> {
+  try {
+    await fs.mkdir(OCR_CACHE_DIR, { recursive: true })
+    await fs.writeFile(
+      path.join(OCR_CACHE_DIR, `${key}.json`),
+      JSON.stringify({ text, status, ts: Date.now() }),
+      'utf8',
+    )
+  } catch {
+    // non-fatal
+  }
+}
+
+/**
+ * Generate per-image transcriptions using PaddleOCR PP-OCRv5.
+ *
+ * Sends image file paths to the local PaddleOCR service for fast, CPU-efficient
+ * text extraction. Unlike VLM, OCR runs entirely on-device with no API keys
+ * or network latency.
+ *
+ * The function sends images in batches of 20 to the PaddleOCR service's
+ * `/ocr/batch` endpoint. Results are cached per-image (same cache key as VLM)
+ * so re-runs are instant.
+ *
+ * @param imagePaths - Absolute paths to panel/page images
+ * @param onProgress - Optional callback (done, total) for progress tracking
+ * @returns { results, stats } — results in the same order as imagePaths;
+ *   stats reports whether the detector ever actually fired, distinct from
+ *   how many panels simply have no dialogue.
+ * @throws Error if the PaddleOCR service is unreachable or returns an error
+ */
+export async function generateImageNarrationsOCR(
+  imagePaths: string[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<{
+  results: Array<{ image: string; text: string }>
+  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number; uncertainWithRegions: number }
+}> {
+  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0 } }
+
+  const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
+  const OCR_BATCH_SIZE = 20 // PaddleOCR is fast on CPU; larger batches reduce HTTP overhead
+  const results: Array<{ image: string; text: string }> = new Array(imagePaths.length)
+  let completedCount = 0
+  // Tracked separately from "empty text ratio" — manhwa/manhua panels are
+  // frequently text-free by design (action beats, establishing shots,
+  // transitions), so a high empty-text ratio is often CORRECT output, not
+  // a failure. What actually indicates a broken OCR pipeline (bad model
+  // init, doc-preprocessing distortion, wrong image format, etc.) is the
+  // TEXT DETECTOR never firing at all across an entire chapter — i.e.
+  // totalRegionsDetected stays at 0 even though panels were processed.
+  let totalRegionsDetected = 0
+  let batchCallFailures = 0
+  let freshlyProcessed = 0
+  // Distinct failure signal from both of the above: the DETECTOR found real
+  // text regions (regions > 0) but the RECOGNIZER couldn't read them
+  // confidently enough to be trusted (status UNCERTAIN/FAILED). That text
+  // gets discarded below (text = '') exactly like a legitimately silent
+  // panel — indistinguishable from "no dialogue" by emptyRatio alone. A
+  // chapter where this happens a lot means real dialogue is being silently
+  // thrown away because the recognizer is struggling with this chapter's
+  // font/art style, not that the panels are quiet.
+  let uncertainWithRegions = 0
+
+  // Process in batches
+  for (let i = 0; i < imagePaths.length; i += OCR_BATCH_SIZE) {
+    const batchPaths = imagePaths.slice(i, i + OCR_BATCH_SIZE)
+    const startIdx = i
+
+    // Check cache for each image in this batch
+    const uncachedIndices: number[] = []
+    const uncachedPaths: string[] = []
+
+    for (let j = 0; j < batchPaths.length; j++) {
+      // ocrCacheKey (not vlmCacheKey) — versioned so a change to OCR tuning
+      // (det_db_unclip_ratio etc., see OCR_TUNING_VERSION above) invalidates
+      // stale cached results instead of a permanently-empty result from an
+      // old detector setting being reused forever under the 1-year TTL.
+      const cacheKey = ocrCacheKey(batchPaths[j])
+      const cached = await getOcrCached(cacheKey)
+      if (cached !== null) {
+        results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached.text }
+        // Cached non-empty text is itself evidence the detector fired at
+        // some point in the past — count it toward the "detector works" signal.
+        if (cached.text.trim()) totalRegionsDetected += 1
+        completedCount++
+      } else {
+        uncachedIndices.push(j)
+        uncachedPaths.push(batchPaths[j])
+      }
+    }
+
+    // If all cached, skip the API call
+    if (uncachedPaths.length === 0) {
+      onProgress?.(completedCount, imagePaths.length)
+      continue
+    }
+
+    // Call PaddleOCR batch endpoint
+    try {
+      const t0 = Date.now()
+      const res = await fetch(`${baseUrl}/ocr/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          images: uncachedPaths,
+          // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
+          // text — thicker strokes, looser character spacing, bolder fonts
+          // — not dense printed-document text. PaddleOCR's stock default
+          // (1.8) is tuned for the latter. Without this override, the
+          // request body previously had NO options field at all, so every
+          // panel silently used the document-tuned default on every run.
+          // 2.4 is a looser unclip that merges nearby strokes into one region
+          // more readily, trading a little precision for fewer missed bubbles.
+          options: { det_db_unclip_ratio: 2.4 },
+        }),
+        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000), // CPU OCR ~13s/image observed; generous margin per image
+      })
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '')
+        throw new Error(`PaddleOCR service returned HTTP ${res.status}: ${errBody.slice(0, 200)}`)
+      }
+
+      const data = (await res.json()) as {
+        results: Array<{ index: number; text: string; confidence: number; regions: number; status?: string; quality_score?: number; candidates?: unknown[]; selection_reason?: string }>
+        model: string
+        processing_time_ms: number
+      }
+
+      const elapsed = Date.now() - t0
+      const uncertainCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'UNCERTAIN').length
+      const failedCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'FAILED').length
+      const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
+      totalRegionsDetected += batchRegions
+      freshlyProcessed += data.results.length
+      uncertainWithRegions += data.results.filter(
+        (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
+      ).length
+      console.log(
+        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
+      )
+
+      // Map results back to the correct positions in the results array
+      for (const ocrResult of data.results) {
+        const localIdx = uncachedIndices[ocrResult.index]
+        if (localIdx === undefined) continue
+
+        const globalIdx = startIdx + localIdx
+        const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
+        const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
+
+        // Cache the result. setOcrCached uses the versioned OCR key (so a
+        // future OCR_TUNING_VERSION bump invalidates it correctly);
+        // setVlmCached uses the plain path key since VLM has no tuning
+        // parameters to version and this is purely a cross-method reuse
+        // optimization (if VLM fallback runs later, it can reuse this text
+        // instead of re-calling an LLM for a panel we already transcribed).
+        const imgPath = uncachedPaths[ocrResult.index]
+        if (text && status === 'SUCCESS') {
+          void setOcrCached(ocrCacheKey(imgPath), text, status)
+          void setVlmCached(vlmCacheKey(imgPath), text)
+        }
+
+        results[globalIdx] = { image: path.basename(uncachedPaths[ocrResult.index]), text }
+        completedCount++
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[OCR] Batch failed: ${msg.slice(0, 200)}`)
+      batchCallFailures++
+      // Fill remaining uncached results with empty text
+      for (let j = 0; j < uncachedIndices.length; j++) {
+        const globalIdx = startIdx + uncachedIndices[j]
+        if (!results[globalIdx]) {
+          results[globalIdx] = { image: path.basename(uncachedPaths[j]), text: '' }
+          completedCount++
+        }
+      }
+      // Don't throw — let the pipeline continue with empty text for this batch.
+      // The caller can decide to retry with VLM.
+    }
+
+    onProgress?.(completedCount, imagePaths.length)
+  }
+
+  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } }
+}
+
+// ---------------------------------------------------------------------------
+// VLM-based transcription (fallback when PaddleOCR is unavailable).
+// ---------------------------------------------------------------------------
+
 /**
  * Generate per-image narrations: send each image to the VLM individually and
  * get 2-4 sentences of narration describing exactly what's in that image.
@@ -887,13 +1271,13 @@ export async function generateImageNarrations(
   // transcription time ~4-5x. Configurable via VLM_CONCURRENCY env var
   // (default 4). Each batch writes to disjoint indices in the results array
   // so there are no race conditions. If a batch call fails or returns
-  // BATCH_SIZE: number of panel images sent per VLM API call.
-  // 6 is the sweet spot — large enough to reduce API calls, small enough to
-  // avoid token-limit truncation and keep response times reasonable.
-  // In low-mem mode (VLM_CONCURRENCY=1), reduced to 3 since each child
-  // process loads all images into memory.
   const LOW_MEM = process.env.VLM_LOW_MEM === '1' || process.env.VLM_CONCURRENCY === '1'
-  const BATCH_SIZE = LOW_MEM ? 3 : 6
+  // BATCH_SIZE: number of panel images sent per VLM API call.
+  // 3 is the safe default — smaller batches mean less chance of a
+  // skipped-panel shift, and cheaper to detect if it still happens.
+  // Previously 6 (3 in LOW_MEM) — too large, a single mis-ordered index
+  // silently displaced the rest of the batch.
+  const BATCH_SIZE = 3
   // Concurrency: batches at a time. In low-mem mode, force 1.
   const CONCURRENCY = Math.max(
     1,
@@ -928,7 +1312,7 @@ export async function generateImageNarrations(
     try {
       if (provider === 'ollama') {
         const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-        const model = process.env.OLLAMA_VISION_MODEL || 'qwen2.5-vl:7b'
+        const model = process.env.OLLAMA_VISION_MODEL || 'llava:7b'
         const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(8000) })
         if (!res.ok) {
           console.warn(`[VLM] ✗ Ollama not reachable at ${baseUrl} (HTTP ${res.status})`)
@@ -1104,7 +1488,7 @@ export async function generateImageNarrations(
     const providerLabel = pickProvider()
     console.log(`[VLM] batch ${num}/${totalBatches} → ${providerLabel} (${images.length} panels)`)
 
-    let batchTexts: string[]
+    let batchTexts: string[] | null = null
     let succeeded = false
     let countedPerImage = false  // set true if single-image fallback counted panels
     try {
@@ -1207,17 +1591,15 @@ export async function generateImageNarrations(
         }
 
         if (!succeeded) {
-          // Final fallback: empty text (silence). This is the correct behavior
-          // for panels with genuinely no readable text. For panels that DO have
-          // text but all VLM providers failed, the silence is the lesser evil —
-          // the alternative was the annoying "scene continues to unfold" loop.
-          console.warn(
-            `[VLM] batch ${num}/${totalBatches} exhausted all retries — leaving ${images.length} panels silent`,
+          throw new Error(
+            `[VLM] batch ${num}/${totalBatches} exhausted all retries; refusing to convert provider failure into successful silence`,
           )
-          batchTexts = images.map(() => '')
-          succeeded = true
         }
       }
+    }
+
+    if (!batchTexts) {
+      throw new Error(`[VLM] batch ${num}/${totalBatches} produced no narration result`)
     }
 
     // Write results for this batch.
@@ -1488,8 +1870,22 @@ async function narrateImageBatchGemini(imgPaths: string[], batchStart: number): 
     } catch (err) {
       lastErr = err
       const msg = err instanceof Error ? err.message : String(err)
-      // 429 = rate limited — retry with longer backoff (free tier friendly).
+      // 429 = rate limited. Two distinct cases that need different handling:
+      //  - RESOURCE_EXHAUSTED / "quota" = daily quota is gone (free tier is
+      //    now ~15-20 req/day). No amount of backoff fixes this today —
+      //    retrying just burns 15s+30s+60s+120s (~225s) per batch for
+      //    nothing, and the outer orchestrator's own retry loop in lib.ts
+      //    can call back into this function again, multiplying the hang.
+      //    Fail immediately so the circuit breaker can disable this
+      //    provider and move on.
+      //  - plain RPM rate limit (no quota keyword) = transient, worth a
+      //    short backoff.
       if (msg.includes('429')) {
+        const isQuotaExhausted = /RESOURCE_EXHAUSTED|quota/i.test(msg)
+        if (isQuotaExhausted) {
+          console.warn(`[VLM:gemini] daily quota exhausted — failing fast (no retry) so the circuit breaker can switch providers`)
+          throw err
+        }
         if (attempt === MAX_RETRIES) throw err
         const delayMs = 15000 * Math.pow(2, attempt) // 15s, 30s, 60s
         console.warn(`[VLM:gemini] rate limited — retrying in ${delayMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES + 1})`)
@@ -1543,9 +1939,12 @@ async function narrateImageBatchGroq(imgPaths: string[], batchStart: number): Pr
   }
 
   const apiKey = process.env.GROQ_API_KEY!
-  // Llama 4 Scout — Groq's vision model (check console.groq.com for current ID).
+  // Groq's vision model. meta-llama/llama-4-scout was deprecated by Groq on
+  // 2026-06-17; qwen/qwen3.6-27b is Groq's own recommended migration target
+  // for vision workloads (check console.groq.com/docs/deprecations if this
+  // ever breaks again — Groq's free-tier model lineup changes frequently).
   // Override via GROQ_VLM_MODEL env var if needed.
-  const model = process.env.GROQ_VLM_MODEL || 'meta-llama/llama-4-scout'
+  const model = process.env.GROQ_VLM_MODEL || 'qwen/qwen3.6-27b'
   const url = 'https://api.groq.com/openai/v1/chat/completions'
 
   // Read + base64-encode each image.
@@ -1692,7 +2091,7 @@ export function isOllamaConfigured(): boolean {
 }
 
 // OLLAMA VLM — local inference via Ollama's OpenAI-compatible API.
-// Uses a vision-language model (e.g. qwen2.5-vl:7b) to transcribe panel text.
+// Uses a vision-language model (e.g. llava:7b) to transcribe panel text.
 // Completely free, no API key needed, runs on your own hardware.
 // Ollama exposes /v1/chat/completions with the same format as OpenAI.
 
@@ -1708,7 +2107,7 @@ async function narrateImageBatchOllama(imgPaths: string[], batchStart: number): 
   }
 
   const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-  const model = process.env.OLLAMA_VISION_MODEL || 'qwen2.5-vl:7b'
+  const model = process.env.OLLAMA_VISION_MODEL || 'llava:7b'
 
   // Build multi-image content (same prompt as other providers for consistency).
   const content: Array<
@@ -2222,16 +2621,34 @@ function parseBatchResponse(raw: string, expectedCount: number): string[] {
     throw new Error('VLM batch response is not a JSON array')
   }
 
+  // ── Sanity check: length mismatch ──
+  // This alone catches the skipped-panel shift bug immediately.
+  // If the VLM drops or duplicates an item, we log it rather than
+  // silently filling gaps with empty text.
+  if (parsed.length !== expectedCount) {
+    console.warn(
+      `[VLM] parseBatchResponse WARNING: parsed ${parsed.length} items but expected ${expectedCount}. ` +
+      `Possible skipped/duplicate panel — ${expectedCount - parsed.length > 0 ? `${expectedCount - parsed.length} panel(s) will be silent` : 'extra items will be dropped'}.`,
+    )
+  }
+
   const texts: string[] = new Array(expectedCount).fill('')
   for (let i = 0; i < parsed.length && i < expectedCount; i++) {
     const item = parsed[i]
     if (typeof item === 'object' && item !== null) {
       const obj = item as { index?: number; text?: string }
       const text = typeof obj.text === 'string' ? obj.text : ''
-      const idx = typeof obj.index === 'number' ? obj.index - 1 : i
+      // VLM returns 1-based index per the prompt ("Panel 1 through Panel N")
+      // Clamp 0-based: if index is already 0-based, keep it; if 1-based, subtract 1.
+      const idx = typeof obj.index === 'number'
+        ? (obj.index >= 1 ? obj.index - 1 : obj.index)
+        : i
       if (idx >= 0 && idx < expectedCount) {
         texts[idx] = text
       } else {
+        console.warn(
+          `[VLM] parseBatchResponse: out-of-range index ${obj.index} (valid 0-${expectedCount - 1}), placing at position ${i}`,
+        )
         texts[i] = text
       }
     } else if (typeof item === 'string') {

@@ -31,7 +31,10 @@ export type MangaSource =
   | "webtoons"
   | "mal"
   | "anilist"
-  | "asurascans";
+  | "asurascans"
+  | "mangadex"
+  | "mangapill"
+  | "toonily";
 
 export interface MangadexManga {
   id: string;

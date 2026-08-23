@@ -23,6 +23,9 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   asurascans: "AsuraScans",
   mal: "MAL",
   anilist: "AniList",
+  mangadex: "MangaDex",
+  mangapill: "MangaPill",
+  toonily: "Toonily",
 };
 
 const STATUS_CLASSES: Record<string, string> = {

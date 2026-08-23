@@ -61,6 +61,9 @@ const SOURCE_BADGE_CLASSES: Record<MangaSource, string> = {
   asurascans: "bg-rose-500/15 text-rose-300 border-rose-500/30",
   mal: "bg-sky-500/15 text-sky-300 border-sky-500/30",
   anilist: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30",
+  mangadex: "bg-orange-500/15 text-orange-300 border-orange-500/30",
+  mangapill: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
+  toonily: "bg-pink-500/15 text-pink-300 border-pink-500/30",
 };
 
 const SOURCE_LABEL: Record<MangaSource, string> = {
@@ -70,6 +73,9 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   asurascans: "Asura",
   mal: "MAL",
   anilist: "AniList",
+  mangadex: "MangaDex",
+  mangapill: "MangaPill",
+  toonily: "Toonily",
 };
 
 const CONTENT_RATING_CLASSES: Record<string, string> = {
@@ -305,7 +311,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
           sorted.sort((a, b) => (a.year ?? 9999) - (b.year ?? 9999));
           break;
         case "chapters-desc":
-          sorted.sort((a, b) => (b.lastChapter ?? 0) - (a.lastChapter ?? 0));
+          sorted.sort((a, b) => (parseFloat(b.lastChapter ?? "0") || 0) - (parseFloat(a.lastChapter ?? "0") || 0));
           break;
         case "updated":
           sorted.sort((a, b) => {

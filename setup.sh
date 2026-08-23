@@ -161,7 +161,8 @@ if $is_deb; then
     pkg_install curl wget git unzip zstd build-essential \
         ffmpeg python3 python3-pip python3-venv python3-dev \
         libgl1 libglib2.0-0 libcap2-bin \
-        ca-certificates gnupg lsb-release jq sqlite3 tmux htop
+        ca-certificates gnupg lsb-release jq sqlite3 tmux htop \
+        espeak-ng tesseract-ocr
 else
     # ── RHEL/Oracle Linux/Amazon Linux packages ──
     # FIX #10: Oracle Linux uses oracle-epel-release, not epel-release
@@ -178,7 +179,8 @@ else
     pkg_install curl wget git unzip zstd gcc gcc-c++ make \
         ffmpeg python3 python3-pip python3-devel \
         mesa-libGL glib2 libcap \
-        ca-certificates gnupg2 redhat-lsb-core jq sqlite tmux htop
+        ca-certificates gnupg2 redhat-lsb-core jq sqlite tmux htop \
+        espeak-ng tesseract
 
     # FIX #12: Ensure python3 venv module is available on RHEL/Oracle
     if ! python3 -m venv --help &>/dev/null; then
@@ -308,7 +310,7 @@ fi
 PY_MAJOR=$($_py_bin -c 'import sys; print(sys.version_info.major)')
 PY_MINOR=$($_py_bin -c 'import sys; print(sys.version_info.minor)')
 if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; then
-    log_error "Python $($_py_bin --version 2>&1 | awk '{print $2}') is too old — Python 3.10+ required (openai>=2.49 needs it)"
+    log_error "Python $($_py_bin --version 2>&1 | awk '{print $2}') is too old — production requires Python 3.10.x (target 3.10.4)"
     log_error ""
     log_error "QUICKEST FIX — install Miniconda (works on any Ubuntu version, ARM or x86):"
     log_error "  wget -qO- https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh | bash"
@@ -370,8 +372,6 @@ pip install -r pipeline/requirements.txt 2>&1 | tail -5
 # FIX #14: Verify critical imports
 log_info "Verifying Python environment..."
 if python3 -c "
-import edge_tts; print(f'  edge-tts: {edge_tts.__version__}')
-import openai; print(f'  openai: {openai.__version__}')
 import PIL; print(f'  Pillow: {PIL.__version__}')
 import cv2; print(f'  opencv: {cv2.__version__}')
 import numpy; print(f'  numpy: {numpy.__version__}')
@@ -387,6 +387,65 @@ else
 fi
 
 log_info "Python venv: $PYTHON_BIN"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4b: Piper TTS (primary production TTS engine)
+#
+# Uses Piper's prebuilt standalone binary release, NOT `pip install
+# piper-tts`. piper-tts's native dependency (piper-phonemize) only ships
+# wheels for Python 3.9+ — there is no cp38 wheel at all — so on a box
+# whose Python venv is older (e.g. Ubuntu 20.04's stock Python 3.8), pip's
+# resolver falls back to ancient piper-tts 1.1.0/1.2.0 releases and then
+# fails with a version conflict between them rather than a solvable
+# dependency issue. The prebuilt binary bundles its own espeak-ng,
+# libpiper_phonemize, and libonnxruntime, so it works regardless of which
+# Python the box has.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "4b" "Installing Piper TTS + voice model..."
+
+PIPER_DIR="$PROJECT_DIR/pipeline/piper"
+PIPER_BIN="$PIPER_DIR/piper/piper"
+PIPER_VOICE_DIR="$PROJECT_DIR/pipeline/voices"
+PIPER_VOICE_NAME="en_US-lessac-medium"
+PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
+
+PIPER_ARCH="$(uname -m)"
+case "$PIPER_ARCH" in
+    x86_64)  PIPER_ASSET="piper_linux_x86_64.tar.gz" ;;
+    aarch64) PIPER_ASSET="piper_linux_aarch64.tar.gz" ;;
+    armv7l)  PIPER_ASSET="piper_linux_armv7l.tar.gz" ;;
+    *)       PIPER_ASSET="" ;;
+esac
+
+if [[ -x "$PIPER_BIN" ]]; then
+    log_info "piper binary already installed at $PIPER_BIN"
+elif [[ -z "$PIPER_ASSET" ]]; then
+    log_warn "No prebuilt Piper release for architecture '$PIPER_ARCH' — production TTS will fall back to eSpeak-NG"
+else
+    mkdir -p "$PIPER_DIR"
+    PIPER_URL="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/${PIPER_ASSET}"
+    if curl -fsSL -o "$PIPER_DIR/piper.tar.gz" "$PIPER_URL" \
+        && tar -xzf "$PIPER_DIR/piper.tar.gz" -C "$PIPER_DIR" \
+        && rm -f "$PIPER_DIR/piper.tar.gz"; then
+        log_info "Piper binary installed"
+    else
+        log_warn "Piper binary download/extract failed — production TTS will fall back to eSpeak-NG"
+    fi
+fi
+
+if [[ -f "$PIPER_VOICE_MODEL_PATH" ]]; then
+    log_info "Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
+else
+    mkdir -p "$PIPER_VOICE_DIR"
+    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    if curl -fsSL -o "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx" \
+        && curl -fsSL -o "$PIPER_VOICE_MODEL_PATH.json" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx.json"; then
+        log_info "Piper voice model downloaded"
+    else
+        log_warn "Piper voice model download failed — production TTS will fall back to eSpeak-NG"
+        rm -f "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_MODEL_PATH.json"
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: Node.js / Bun Dependencies
@@ -464,7 +523,7 @@ else
 fi
 
 # Ensure critical paths are in .env (even if user already had a .env)
-for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT; do
+for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT PIPER_VOICE_MODEL PATH; do
     if ! grep -q "^${VAR_NAME}=" .env 2>/dev/null; then
         case $VAR_NAME in
             PYTHON_BIN)         VAL="$PYTHON_BIN" ;;
@@ -474,6 +533,16 @@ for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_M
             OLLAMA_VISION_MODEL) VAL="$OLLAMA_VISION_MODEL" ;;
             OLLAMA_TEXT_MODEL)   VAL="$OLLAMA_TEXT_MODEL" ;;
             PORT)               VAL="$PORT_PIPELINE" ;;
+            PIPER_VOICE_MODEL)   VAL="$PIPER_VOICE_MODEL_PATH" ;;
+            # Prepend piper's directory so shutil.which("piper") finds it
+            # when master_pipeline.py is spawned from the systemd service.
+            # systemd's EnvironmentFile does NOT shell-expand $PATH — a
+            # value like "/piper/dir:$PATH" would be taken completely
+            # literally (including the two characters "$P..."), silently
+            # breaking PATH resolution for python3/bun/ffmpeg/everything
+            # else system-wide. Use systemd's actual default PATH as the
+            # base instead of trying to reference "the current PATH".
+            PATH)               VAL="$(dirname "$PIPER_BIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ;;
         esac
         echo "${VAR_NAME}=${VAL}" >> .env
         log_info "Added ${VAR_NAME} to .env"

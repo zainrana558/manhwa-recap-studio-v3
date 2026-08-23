@@ -66,6 +66,16 @@ except ImportError:  # pragma: no cover
     cv2 = None  # type: ignore
     np = None  # type: ignore
 
+# production.py lives alongside this script (pipeline/production.py) and has
+# zero external dependencies, so this import is safe to do eagerly. It wires
+# the real pipeline into the QA-gated atomic-artifact primitives that were
+# previously only exercised by tests/production_canary.py — chapter and
+# final-video output were being written directly to their "done" path with
+# no validation, so a crash mid-ffmpeg-write (or a corrupt/truncated
+# encode) could leave a broken file that a resumed run would treat as
+# already-complete and silently ship. See render_chapter/finalize_output.
+from production import video_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
 OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
@@ -120,6 +130,10 @@ class PipelineConfig:
     narration_model: Optional[str] = None  # override model for narration
     progress_file: Optional[Path] = None  # JSON file the Node service polls
     slice_only: bool = False  # if True, only run panel slicing then exit (used by the Node orchestrator so VLM can read individual sliced panels)
+    production_mode: bool = False
+    job_id: str = "local"
+    min_free_disk_gb: float = 2.0  # ResourceGuard threshold — see run_pipeline()
+    min_available_ram_mb: float = 300.0
 
     @property
     def temp_audio_dir(self) -> Path:
@@ -336,6 +350,190 @@ def _compose_canvas_from_source(panel_path: Path):
 INPAINT_BUBBLES = False
 INPAINT_MIN_BUBBLE_AREA = 800   # px² — ignore tiny text fragments
 INPAINT_MAX_BUBBLE_AREA = 150000  # px² — ignore huge regions (whole panels)
+
+
+# ---------------------------------------------------------------------------
+# 2a. BUBBLE-SAFE GUTTER DETECTION
+#
+# Guarantee: a horizontal cut is only ever placed on a row that is 100%
+# free of "content" (art, line-work, text glyphs, bubble borders) across
+# the ENTIRE width of the page, measured on a lightly-dilated content mask.
+# Dilation bridges anti-aliasing gaps in bubble outlines and the small gaps
+# between individual glyphs/letters so a bubble or text line is always seen
+# as one solid blob — it is structurally impossible for a cut chosen this
+# way to slice through the middle of a bubble, a line of text, or artwork,
+# because any row that touches such a blob anywhere along its width is
+# disqualified as a cut candidate.
+# ---------------------------------------------------------------------------
+
+def _build_dilated_content_mask(img_gray, dark_thresh: int = 200) -> "np.ndarray":
+    """Binary mask (255 = content) of everything that isn't near-white
+    background, lightly dilated/closed so speech-bubble outlines, thin text
+    strokes, and screentone dots merge into solid blobs instead of leaving
+    tiny gaps that a naive row-scan could mistake for a safe gutter."""
+    _, mask = cv2.threshold(img_gray, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+    # Bridge small horizontal gaps (letter spacing, bubble outline breaks)
+    # without merging across a real gutter — kernel stays modest vertically.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    return mask
+
+
+def _label_content_components(mask) -> List[tuple]:
+    """Connected components of a content mask → list of (y1, y2, x1, x2, area)
+    bounding boxes, used to sanity-check that no cut straddles a real blob
+    (bubble, text line, character, etc.)."""
+    n, _labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    comps = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < 6:
+            continue
+        comps.append((int(y), int(y + h), int(x), int(x + w), int(area)))
+    return comps
+
+
+def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
+    """Bubble-safe panel detector for webtoon-style tall strips.
+
+    Unlike percentage/variance-based gutter heuristics, a row is only ever
+    classified as a valid cut if it is checked across N independent
+    width-slices of the DILATED content mask and is completely empty in
+    every one of them. This is a strictly stronger guarantee than "mostly
+    white" — a bubble tail, a caption box, or a stray character sitting in
+    an otherwise-white gap will keep that row (and the whole band around it,
+    once merged with neighbours) out of consideration.
+
+    Returns list of (x1, y1, x2, y2) tuples, full page width, sorted by y.
+    """
+    h, w = img_gray.shape
+    if h < 10 or w < 10:
+        return [(0, 0, w, h)]
+
+    mask = _build_dilated_content_mask(img_gray)
+    components = _label_content_components(mask)
+
+    n_slices = 8
+    slice_w = max(1, w // n_slices)
+    row_has_any_content = np.any(mask > 0, axis=1)
+    is_gutter_row = np.zeros(h, dtype=bool)
+    for y in range(h):
+        if not row_has_any_content[y]:
+            is_gutter_row[y] = True
+            continue
+        clear = True
+        for s in range(n_slices):
+            x0 = s * slice_w
+            x1 = w if s == n_slices - 1 else (s + 1) * slice_w
+            if np.any(mask[y, x0:x1] > 0):
+                clear = False
+                break
+        is_gutter_row[y] = clear
+
+    # Smooth to reject single-row noise (e.g. one stray dead pixel briefly
+    # flipping a row to "gutter" inside dense artwork), but never smooth
+    # enough to let a real gutter get swallowed.
+    is_gutter_row = cv2.blur(
+        is_gutter_row.astype(np.float32).reshape(-1, 1), (5, 1)
+    ).flatten() > 0.6
+
+    min_band_h = max(12, h // 350)
+    bands: List[tuple] = []
+    run_start = None
+    for i, g in enumerate(is_gutter_row):
+        if g and run_start is None:
+            run_start = i
+        elif not g and run_start is not None:
+            if i - run_start >= min_band_h:
+                bands.append((run_start, i))
+            run_start = None
+    if run_start is not None and h - run_start >= min_band_h:
+        bands.append((run_start, h))
+
+    if not bands:
+        return [(0, 0, w, h)]
+
+    # Cut at the safest row within each band — the row farthest from any
+    # component that comes close to (but, by construction, never crosses)
+    # the band's edges — then double-checked against every component so a
+    # cut can never land inside a bbox that happens to graze the band.
+    cut_points: List[int] = []
+    for (s, e) in bands:
+        cut = (s + e) // 2
+        for (cy1, cy2, _cx1, _cx2, area) in components:
+            if area < 40 or cy2 <= s or cy1 >= e:
+                continue
+            top_gap, bot_gap = cy1 - s, e - cy2
+            if top_gap > bot_gap and top_gap > 4:
+                cut = min(cut, s + max(2, top_gap // 2))
+            elif bot_gap > 4:
+                cut = max(cut, e - max(2, bot_gap // 2))
+        cut_points.append(cut)
+
+    boundaries = [0] + cut_points + [h]
+    min_panel_h = max(30, h // 100)
+    raw_panels = []
+    for i in range(len(boundaries) - 1):
+        top, bot = boundaries[i], boundaries[i + 1]
+        if bot - top >= min_panel_h:
+            raw_panels.append((0, top, w, bot))
+
+    content_panels = [p for p in raw_panels if np.any(mask[p[1]:p[3], :] > 0)]
+    if not content_panels:
+        return [(0, 0, w, h)]
+
+    # Merge runs of small adjacent fragments (e.g. a caption strip that got
+    # isolated by a thin gutter) so they read as one coherent frame.
+    merged = [list(content_panels[0])]
+    for (x1, y1, x2, y2) in content_panels[1:]:
+        prev = merged[-1]
+        if (y2 - y1) < 150 and (prev[3] - prev[1]) < 200:
+            prev[2], prev[3] = x2, y2
+        else:
+            merged.append([x1, y1, x2, y2])
+
+    return [(p[0], p[1], p[2], p[3]) for p in merged if (p[3] - p[1]) >= min_panel_h]
+
+
+def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
+    """Nudge a candidate horizontal edge to the nearest row that is
+    completely clear of content across the full width, within +/- window
+    px. Applied as a final safety net to panel boxes from ANY detector
+    (YOLO, contour, gutter-aware) so an edge can never clip a bubble tail
+    or a line of text even if the upstream detector placed it a few pixels
+    off. Returns the original y if no safe row is found nearby (better to
+    keep the original box than snap arbitrarily far away)."""
+    h = mask.shape[0]
+    y = max(0, min(h - 1, y))
+    if not np.any(mask[y, :] > 0):
+        return y
+    for d in range(1, window + 1):
+        for cand in (y - d, y + d):
+            if 0 <= cand < h and not np.any(mask[cand, :] > 0):
+                return cand
+    return y
+
+
+def _detect_panels_for_page(img_gray) -> List[tuple]:
+    """Top-level panel detector for one source page/strip image.
+
+    Webtoon/manhwa raws are dominated by tall, single-column strips — for
+    those, the bubble-safe gutter-aware detector gives the strongest
+    guarantee (cuts can never cross a content pixel). For roughly
+    page-shaped images (traditional multi-panel grid layouts), fall back to
+    the existing YOLO/contour auto-detector, which understands multi-column
+    layouts that a pure horizontal-gutter scan can't.
+
+    Returns list of (x, y, w, h) tuples, matching _detect_panels_auto's
+    contract.
+    """
+    h, w = img_gray.shape
+    if h / max(w, 1) > 1.3:
+        strip_panels = _detect_panels_gutter_aware(img_gray)
+        if strip_panels:
+            return [(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in strip_panels]
+    return _detect_panels_auto(img_gray)
 
 
 def _detect_panel_gutters(img_gray, y_offset: int = 0) -> List[int]:
@@ -987,11 +1185,53 @@ def _detect_panels_yolo(img_gray) -> List[tuple]:
 
         # NMS to remove near-duplicates (keep insets)
         panels = _suppress_nested(panels, iou_thresh=0.65)
-        panels.sort(key=lambda p: (p[1], p[0]))
+        panels = _order_panels_reading_order(panels)
         return panels
     except Exception as e:
         log.warning("YOLO panel detection failed: %s", e)
         return []
+
+
+def _order_panels_reading_order(panels: List[tuple]) -> List[tuple]:
+    """Order panel boxes (x, y, w, h) into natural top-to-bottom,
+    left-to-right reading order for LTR-read manhwa/comic grid pages.
+
+    A naive sort purely by top-y coordinate (p[1], p[0]) breaks whenever
+    panels in the same visual row are staggered or have different heights
+    — extremely common in dynamic comic layouts with diagonal panel cuts
+    or a tall splash panel next to two stacked smaller ones. That naive
+    sort can place a panel from the NEXT row before the second panel of
+    the CURRENT row, silently narrating story events out of order. This
+    clusters panels into rows by vertical overlap first, then sorts each
+    row left-to-right, before ordering rows top-to-bottom.
+    """
+    if not panels:
+        return panels
+
+    remaining = sorted(panels, key=lambda p: p[1])
+    rows: List[List[tuple]] = []
+    for p in remaining:
+        x, y, w, h = p
+        y2 = y + h
+        placed = False
+        for row in rows:
+            ry1 = min(rp[1] for rp in row)
+            ry2 = max(rp[1] + rp[3] for rp in row)
+            overlap = min(y2, ry2) - max(y, ry1)
+            min_h = min(h, ry2 - ry1)
+            if min_h > 0 and overlap / min_h > 0.4:
+                row.append(p)
+                placed = True
+                break
+        if not placed:
+            rows.append([p])
+
+    rows.sort(key=lambda row: min(rp[1] for rp in row))
+    ordered: List[tuple] = []
+    for row in rows:
+        row.sort(key=lambda rp: rp[0])
+        ordered.extend(row)
+    return ordered
 
 
 def _detect_panels_auto(img_gray) -> List[tuple]:
@@ -1138,8 +1378,9 @@ def _detect_panels_contour(img_gray) -> List[tuple]:
     if len(panels) == 1 and panels[0][2] * panels[0][3] >= 0.70 * page_area:
         return [(0, 0, w, h)]
 
-    # Sort by y position (top to bottom), then x (left to right)
-    panels.sort(key=lambda p: (p[1], p[0]))
+    # Sort into natural reading order: rows by vertical overlap (handles
+    # staggered/diagonal layouts), then left-to-right within each row.
+    panels = _order_panels_reading_order(panels)
     return panels
 
 
@@ -1187,13 +1428,24 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
             w, h = img.size
             gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-            # Auto-mode panel detection: YOLO first, CV fallback if weak
-            panels = _detect_panels_auto(gray)
+            # Bubble-safe detection: gutter-aware scan for tall webtoon
+            # strips, YOLO/contour auto-detect for grid-style pages.
+            panels = _detect_panels_for_page(gray)
             log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
+
+            # Safety net: snap every panel's top/bottom edge to the nearest
+            # fully-clear row within a small window, so a box from ANY
+            # detector can never clip a bubble tail or a text line.
+            content_mask = _build_dilated_content_mask(gray)
 
             for (px, py, pw, ph) in panels:
                 if ph < 50 or pw < 50:
                     continue
+
+                safe_top = _snap_cut_to_safe_row(content_mask, py)
+                safe_bot = _snap_cut_to_safe_row(content_mask, py + ph)
+                if safe_bot - safe_top >= 50:
+                    py, ph = safe_top, safe_bot - safe_top
 
                 # Each detected panel = ONE frame. No sub-splitting.
                 # Tall panels are shown complete using cover-fit (fill the
@@ -1396,7 +1648,14 @@ def _strip_forbidden(text: str) -> str:
     cleaned = text
     for pat in FORBIDDEN_PATTERNS:
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
+    # \s+ (not \s{2,}) — a LONE embedded newline/tab from OCR's per-line
+    # region joining must also collapse to a single space. This matters for
+    # --narration-provider none (verbatim mode): edge-tts's internal
+    # sanitizer explicitly preserves \n/\t/\r (they're outside the control-
+    # character ranges it strips), so a raw newline between OCR'd speech
+    # bubbles previously survived all the way into the spoken narration,
+    # producing an unnatural pause/break mid-panel instead of a clean space.
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str) -> str:
@@ -1535,7 +1794,7 @@ def split_into_segments(text: str, n: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. CONTINUOUS NEURAL TEXT-TO-SPEECH (edge-tts)
+# 4. LOCAL-FIRST PRODUCTION TEXT-TO-SPEECH (Piper -> Piper retry -> eSpeak NG)
 # ---------------------------------------------------------------------------
 # NOTE: narration used to be synthesized one tiny word-chunk at a time (one
 # edge-tts call per sliced frame) and then concatenated. edge-tts inserts a
@@ -1574,78 +1833,106 @@ def _generate_silence(path: Path, duration: float) -> None:
     )
 
 
-def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> Path:
-    """Generate ONE continuous narration clip (or silence) for a whole segment
-    (a single source panel, or the whole chapter in legacy mode). Resumable
-    per segment. This is the only place edge-tts is invoked per chapter run,
-    so the resulting speech has none of the artificial start/end pauses that
-    per-word synthesis introduced."""
+def _audio_qa(path: Path, allow_silence: bool = False) -> bool:
+    if not path.exists() or path.stat().st_size < 44:
+        return False
+    try:
+        duration = get_audio_duration(path)
+        if duration <= 0.05:
+            return False
+        if allow_silence:
+            return True
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        probe = result.stderr + result.stdout
+        m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", probe)
+        return bool(m and float(m.group(1)) > -50.0)
+    except Exception:
+        return False
+
+
+def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not espeak:
+        raise RuntimeError("espeak-ng binary unavailable")
+    result = subprocess.run([espeak, "-w", str(out_wav), text], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed: {result.stderr[-200:]}")
+
+
+def _synthesize_with_piper(text: str, out_wav: Path) -> None:
+    piper = shutil.which("piper")
+    model = os.environ.get("PIPER_VOICE_MODEL")
+    if not piper or not model:
+        raise RuntimeError("piper binary/model unavailable")
+    with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        _out, err = proc.communicate(text, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError(f"piper failed: {err[-200:]}")
+
+
+def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
+    """Generate atomic segment audio. Production never uses edge-tts or network TTS."""
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
-    # Output WAV (not MP3) — WAV has no encoder delay/padding, so concatenation
-    # is sample-accurate. This eliminates the audio/video sync drift that
-    # accumulated in the second half of videos when using MP3 intermediates.
     final_path = seg_audio_dir / f"{tag}.wav"
-    if final_path.exists():
-        return final_path
-
     text = text.strip()
+    if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
+        return final_path, False
+    final_path.unlink(missing_ok=True)
+    tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
+    tmp_path.unlink(missing_ok=True)
     if not text:
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        return final_path
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        if not _audio_qa(tmp_path, allow_silence=True):
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"silent audio QA failed for {tag}")
+        os.replace(tmp_path, final_path)
+        return final_path, False
+    failures = []
+    if getattr(cfg, "production_mode", False):
+        for provider in ("piper", "piper", "espeak"):
+            tmp_path.unlink(missing_ok=True)
+            try:
+                if provider == "piper":
+                    _synthesize_with_piper(text, tmp_path)
+                else:
+                    _synthesize_with_espeak(text, tmp_path)
+                if not _audio_qa(tmp_path, allow_silence=False):
+                    raise RuntimeError(f"{provider} output failed audio QA")
+                os.replace(tmp_path, final_path)
+                return final_path, False
+            except Exception as e:
+                failures.append(f"{provider}: {e}")
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Production TTS failed; no silent substitution: " + " | ".join(failures))
 
     import asyncio
     import edge_tts
-
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
-
     async def _run():
         communicate = edge_tts.Communicate(text, cfg.voice)
         await communicate.save(str(raw_path))
-
     try:
         asyncio.run(_run())
-        # Verify the raw audio file is non-empty (edge-tts can produce a
-        # 0-byte file for text it can't synthesize, e.g. single characters
-        # or pure punctuation).
         if not raw_path.exists() or raw_path.stat().st_size < 100:
             raise RuntimeError("edge-tts produced an empty audio file")
-    except Exception as e:
-        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-        raw_path.unlink(missing_ok=True)
-        return final_path
-
-    # Re-encode at the pipeline's standard sample rate + bitrate, AND apply
-    # a short fade-in/fade-out. The fades eliminate the zero-crossing
-    # discontinuity at the start/end of each TTS clip, which is the #1 cause
-    # of audible "clicks" and "pops" when clips are concatenated back-to-back.
-    # 25ms in / 40ms out is imperceptible to human hearing but removes the
-    # transient completely. (edge-tts output often starts/ends mid-waveform.)
-    try:
         raw_dur = get_audio_duration(raw_path)
         fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
-        seg_af = (
-            f"afade=t=in:st=0:d={SEGMENT_FADE_IN},"
-            f"afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
-        )
-        # Convert edge-tts MP3 → WAV with fades. WAV output = no encoder
-        # delay/padding = sample-accurate concatenation later.
-        run_ffmpeg(
-            [
-                "ffmpeg", "-y", "-i", str(raw_path),
-                "-af", seg_af,
-                "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
-                str(final_path),
-            ]
-        )
+        seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-af", seg_af, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+        if not _audio_qa(tmp_path, allow_silence=False):
+            raise RuntimeError("edge-tts output failed audio QA")
+        os.replace(tmp_path, final_path)
+        return final_path, False
     except Exception as e:
-        log.warning("[%s] ffmpeg audio conversion failed for segment %s (%s) — using silence", chapter.tag, tag, e)
-        _generate_silence(final_path, SILENT_FRAME_DURATION)
-
-    raw_path.unlink(missing_ok=True)
-    return final_path
-
+        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence in legacy mode", chapter.tag, tag, e)
+        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+        os.replace(tmp_path, final_path)
+        return final_path, True
+    finally:
+        raw_path.unlink(missing_ok=True)
 
 def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path]) -> Path:
     """Concatenate per-segment (per-panel) audio clips into one continuous
@@ -1804,6 +2091,15 @@ def render_chapter(
         log.warning("[%s] no frames to render — skipping chapter", chapter.tag)
         return None
 
+    # Render to a temp path, never the resume-checked `out_path` directly.
+    # If this process gets killed mid-ffmpeg-write (OOM, crash, manual
+    # interrupt — all realistic on an unattended multi-day Oracle run),
+    # `out_path` must NOT exist as a partial/corrupt file, or the next
+    # resumed run's `out_path.exists()` check above would treat a broken
+    # chapter as done and silently ship it in the final merge.
+    tmp_path = cfg.temp_chapters_dir / f"{chapter.tag}.mp4.tmp"
+    tmp_path.unlink(missing_ok=True)
+
     # Write a concat demuxer input file with per-image durations.
     # This lets a SINGLE ffmpeg call produce the whole slideshow video.
     concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
@@ -1823,7 +2119,8 @@ def render_chapter(
     # Frames are already 1920x1080 from _compose_canvas, but ensure exact size.
     video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2"
 
-    if audio_path and audio_path.exists():
+    has_audio = bool(audio_path and audio_path.exists())
+    if has_audio:
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
@@ -1835,7 +2132,7 @@ def render_chapter(
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-r", str(FPS),
             "-shortest",
-            str(out_path),
+            str(tmp_path),
         ]
     else:
         cmd = [
@@ -1845,18 +2142,41 @@ def render_chapter(
             "-vf", video_filters,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-r", str(FPS),
-            str(out_path),
+            str(tmp_path),
         ]
 
     try:
         run_ffmpeg(cmd)
     except RuntimeError as e:
         log.error("[%s] concat render failed: %s", chapter.tag, e)
+        tmp_path.unlink(missing_ok=True)
         return None
 
     concat_list.unlink(missing_ok=True)
 
-    log.info("[%s] chapter video rendered -> %s", chapter.tag, out_path.name)
+    # Never mark a chapter complete before validation (loudnorm drift,
+    # a killed ffmpeg process, or disk pressure can all leave a file that
+    # opens but is truncated, has no audio stream, or is far shorter than
+    # expected — ffmpeg exiting 0 is not sufficient proof of a good file).
+    expected_duration = sum(frame_durations)
+    qa = video_qa(tmp_path, audio_expected=has_audio, expected_duration=expected_duration, tolerance=2.0)
+    if not qa.ok:
+        quarantine_dir = cfg.temp_chapters_dir / "quarantine"
+        quarantine_dir.mkdir(exist_ok=True)
+        bad_path = quarantine_dir / f"{chapter.tag}.{int(time.time())}.{qa.reason}.bad"
+        try:
+            tmp_path.rename(bad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+        log.error(
+            "[%s] rendered video FAILED QA (%s) — quarantined, chapter will be "
+            "re-rendered on the next resume instead of being shipped broken",
+            chapter.tag, qa.reason,
+        )
+        return None
+
+    atomic_promote(tmp_path, out_path)
+    log.info("[%s] chapter video rendered + QA-validated -> %s", chapter.tag, out_path.name)
     return out_path
 
 
@@ -1912,16 +2232,37 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
         log.info("Merged master file already exists — skipping merge step (resume)")
         return merged_path
 
+    # Individual chapters are already QA-validated on their own, but the
+    # concat step itself (stream copy across N files) can still fail
+    # partway through or get killed mid-write — write to a tmp path and
+    # only promote to `merged_path` (the resume-checked path above) after
+    # the merged file passes QA, for the same reason as render_chapter.
+    tmp_path = cfg.work_dir / "master_merged.mp4.tmp"
+    tmp_path.unlink(missing_ok=True)
+
     log.info("Merging %d chapter videos via ffmpeg stream copy...", len(chapter_videos))
     run_ffmpeg(
         [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
-            str(merged_path),
+            str(tmp_path),
         ]
     )
-    log.info("Merge complete -> %s", merged_path.name)
+
+    qa = video_qa(tmp_path, audio_expected=True)
+    if not qa.ok:
+        quarantine_dir = cfg.work_dir / "quarantine"
+        quarantine_dir.mkdir(exist_ok=True)
+        bad_path = quarantine_dir / f"master_merged.{int(time.time())}.{qa.reason}.bad"
+        try:
+            tmp_path.rename(bad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"merged master video failed QA ({qa.reason}) — see {bad_path}")
+
+    atomic_promote(tmp_path, merged_path)
+    log.info("Merge complete + QA-validated -> %s", merged_path.name)
     return merged_path
 
 
@@ -1934,8 +2275,26 @@ def finalize_output(cfg: PipelineConfig, merged_path: Path) -> Path:
     """
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Copying merged video to final output (no BGM overlay)...")
-    shutil.copy2(merged_path, cfg.output_path)
-    log.info("Final master video written -> %s", cfg.output_path)
+
+    # `merged_path` was already QA-validated by merge_chapters, but copy
+    # through a tmp path and re-check before the atomic rename anyway: a
+    # crash or a full disk mid-copy can leave a truncated file sitting at
+    # cfg.output_path — the one path anything downstream (upload, YouTube
+    # metadata step, the person opening the file) actually trusts as "the
+    # finished video." That path must never be observably partial.
+    tmp_path = cfg.output_path.with_suffix(cfg.output_path.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+    shutil.copy2(merged_path, tmp_path)
+
+    qa = video_qa(tmp_path, audio_expected=True)
+    if not qa.ok:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"final output failed QA ({qa.reason}) — refusing to mark the job complete"
+        )
+
+    atomic_promote(tmp_path, cfg.output_path)
+    log.info("Final master video written + QA-validated -> %s", cfg.output_path)
     return cfg.output_path
 
 
@@ -1961,6 +2320,36 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     # Ensure the output directory exists.
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Fail fast rather than start a doomed multi-day batch: on an Oracle
+    # free-tier instance, running out of disk mid-encode is a much worse
+    # failure mode than never starting (a partially-full disk from an
+    # earlier crashed run, temp files from a different job, etc. are all
+    # realistic on a small always-on box). This is a pre-flight check
+    # only — the per-chapter check inside the loop below is what catches
+    # resource pressure that builds up DURING a long run.
+    # SQLiteStateStore gives every chapter's stage/state/error/retry history
+    # a queryable, durable record (survives process restarts, unlike the
+    # JSON progress file which the Node service just polls for the current
+    # snapshot) — this is what turns "filesystem existence checks" into the
+    # kind of real state tracking a multi-day unattended batch needs to be
+    # debuggable after the fact.
+    state_store = SQLiteStateStore(cfg.work_dir / "pipeline_state.sqlite3")
+    state_store.record(cfg.job_id, Stage.JOB, State.RUNNING)
+
+    resource_guard = ResourceGuard(
+        min_free_disk_bytes=int(cfg.min_free_disk_gb * 1_000_000_000),
+        min_available_ram_bytes=int(cfg.min_available_ram_mb * 1_000_000),
+        state=state_store,
+    )
+    preflight = resource_guard.check(cfg.work_dir)
+    if not preflight.ok:
+        raise RuntimeError(
+            f"Refusing to start: {preflight.reason} (free disk: "
+            f"{preflight.free_disk_bytes / 1e9:.2f}GB, available RAM: "
+            f"{preflight.available_ram_bytes / 1e6:.0f}MB). Free up "
+            f"resources or lower --min-free-disk-gb/--min-available-ram-mb."
+        )
+
     chapters = discover_chapters(cfg)
     total = len(chapters)
     chapter_videos: List[Path] = []
@@ -1973,168 +2362,315 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         log.info("=== Chapter %d/%d (%s) ===", chapter.index, total, chapter.name)
         cfg.write_progress("render", chapter.index - 1, total, f"Chapter {chapter.index}/{total}: {chapter.name}")
 
+        # Resource pressure on a long batch typically builds up over time
+        # (temp files accumulating, other processes on the same small
+        # instance) rather than being present at startup — re-check before
+        # each chapter's ffmpeg/TTS/OCR work rather than only once here.
+        resource_status = resource_guard.check(cfg.work_dir, job_id=cfg.job_id)
+        if not resource_status.ok:
+            log.error(
+                "[%s] pausing before this chapter: %s (free disk: %.2fGB, "
+                "available RAM: %.0fMB) — chapter will be retried on the "
+                "next resumed run once resources recover",
+                chapter.tag, resource_status.reason,
+                resource_status.free_disk_bytes / 1e9, resource_status.available_ram_bytes / 1e6,
+            )
+            cfg.write_progress(
+                "render", chapter.index - 1, total,
+                f"Paused: {resource_status.reason}", status="warning",
+            )
+            break
+
         existing_video = cfg.temp_chapters_dir / f"{chapter.tag}.mp4"
         if existing_video.exists():
             log.info("[%s] fully rendered already — resuming past this chapter", chapter.tag)
             chapter_videos.append(existing_video)
+            state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag, artifact_path=existing_video)
             # Keep narrative continuity even when resuming: pull tail from cached script.
             script_cache = cfg.temp_scripts_dir / f"{chapter.tag}.txt"
             if script_cache.exists():
                 prev_tail = last_sentences(script_cache.read_text(encoding="utf-8"))
             continue
 
-        # Slice returns [(frame_path, source_panel_index), ...] so we can map
-        # each frame to its source image's narration for perfect sync.
-        # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
-        # horizontal AND vertical panel boundaries, so each manga panel
-        # gets its own individual 1920x1080 frame.
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: slicing panels...")
-        frame_data = slice_chapter_panels(cfg, chapter)
-        frame_paths = [fp for fp, _ in frame_data]
-        frame_sources = [si for _, si in frame_data]
+        state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
+        try:
+            # Slice returns [(frame_path, source_panel_index), ...] so we can map
+            # each frame to its source image's narration for perfect sync.
+            # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
+            # horizontal AND vertical panel boundaries, so each manga panel
+            # gets its own individual 1920x1080 frame.
+            cfg.write_progress("slice", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: slicing panels...")
+            frame_data = slice_chapter_panels(cfg, chapter)
+            frame_paths = [fp for fp, _ in frame_data]
+            frame_sources = [si for _, si in frame_data]
 
-        log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
+            log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+            cfg.write_progress("slice", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
-        # Build an ordered list of (tag, text, frame_positions) "segments" —
-        # each one gets exactly ONE continuous edge-tts synthesis call, then
-        # real word timestamps from that single clip drive per-frame timing.
-        # This is what eliminates the audible stop-after-every-word chop:
-        # previously every one of these frame positions triggered its own
-        # separate edge-tts call.
-        segments: List[tuple] = []  # (tag, text, positions)
+            # Build an ordered list of (tag, text, frame_positions) "segments" —
+            # each one gets exactly ONE continuous edge-tts synthesis call, then
+            # real word timestamps from that single clip drive per-frame timing.
+            # This is what eliminates the audible stop-after-every-word chop:
+            # previously every one of these frame positions triggered its own
+            # separate edge-tts call.
+            segments: List[tuple] = []  # (tag, text, positions)
 
-        if chapter.image_narrations:
-            # PER-PANEL NARRATION MODE (preferred).
-            #
-            # Two narration.json key formats are supported:
-            #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
-            #      filenames like "frame_00000.jpg". Each frame already shows
-            #      ONE individual panel, so the VLM transcription is precise.
-            #      We build one TTS segment per frame.
-            #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
-            #      filenames like "001.jpg". The VLM read the whole page, so
-            #      all sliced frames from the same source page share one
-            #      narration. We group frame positions by source panel index.
-            frame_keyed = any(
-                k.startswith("frame_") for k in chapter.image_narrations.keys()
-            )
+            if chapter.image_narrations:
+                # PER-PANEL NARRATION MODE (preferred).
+                #
+                # Two narration.json key formats are supported:
+                #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
+                #      filenames like "frame_00000.jpg". Each frame already shows
+                #      ONE individual panel, so the VLM transcription is precise.
+                #      We build one TTS segment per frame.
+                #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
+                #      filenames like "001.jpg". The VLM read the whole page, so
+                #      all sliced frames from the same source page share one
+                #      narration. We group frame positions by source panel index.
+                frame_keyed = any(
+                    k.startswith("frame_") for k in chapter.image_narrations.keys()
+                )
 
-            if frame_keyed:
-                log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
-                         chapter.tag, len(frame_paths))
-                # One segment per frame — narration perfectly synced to each panel.
-                for pos, fp in enumerate(frame_paths):
-                    raw_text = chapter.image_narrations.get(fp.name, "")
-                    img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
-                    translated = translate_text(cfg, raw_text, img_tag)
-                    rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                    if rephrased:
-                        prev_tail = last_sentences(rephrased)
-                    segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
+                if frame_keyed:
+                    log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
+                             chapter.tag, len(frame_paths))
+                    # One segment per frame — narration perfectly synced to each panel.
+                    for pos, fp in enumerate(frame_paths):
+                        raw_text = chapter.image_narrations.get(fp.name, "")
+                        img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
+                        translated = translate_text(cfg, raw_text, img_tag)
+                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                        if rephrased:
+                            prev_tail = last_sentences(rephrased)
+                        segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
+                else:
+                    log.info("[%s] per-image narration mode: %d source images, %d frames",
+                             chapter.tag, len(chapter.panel_paths), len(frame_paths))
+                    # Legacy: translate + rephrase each source image's narration.
+                    panel_narrations: dict = {}  # panel_index -> narration text
+                    for idx, panel_path in enumerate(chapter.panel_paths):
+                        raw_text = chapter.image_narrations.get(panel_path.name, "")
+                        img_tag = f"{chapter.tag}_img{idx + 1:03d}"
+                        translated = translate_text(cfg, raw_text, img_tag)
+                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                        panel_narrations[idx] = rephrased
+                        if rephrased:
+                            prev_tail = last_sentences(rephrased)
+
+                    # Group frame positions by source panel (preserving timeline order).
+                    from collections import defaultdict as _dd
+                    panel_frame_positions = _dd(list)  # panel_index -> [frame_positions]
+                    for pos, si in enumerate(frame_sources):
+                        panel_frame_positions[si].append(pos)
+
+                    for si, positions in panel_frame_positions.items():
+                        narr = panel_narrations.get(si, "")
+                        segments.append((f"img{si + 1:03d}", narr, positions))
             else:
-                log.info("[%s] per-image narration mode: %d source images, %d frames",
-                         chapter.tag, len(chapter.panel_paths), len(frame_paths))
-                # Legacy: translate + rephrase each source image's narration.
-                panel_narrations: dict = {}  # panel_index -> narration text
-                for idx, panel_path in enumerate(chapter.panel_paths):
-                    raw_text = chapter.image_narrations.get(panel_path.name, "")
-                    img_tag = f"{chapter.tag}_img{idx + 1:03d}"
-                    translated = translate_text(cfg, raw_text, img_tag)
-                    rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                    panel_narrations[idx] = rephrased
-                    if rephrased:
-                        prev_tail = last_sentences(rephrased)
+                # No narration.json — all frames are silent (no text to narrate).
+                log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
+                for pos in range(len(frame_paths)):
+                    segments.append((f"frm{pos + 1:04d}", "", [pos]))
 
-                # Group frame positions by source panel (preserving timeline order).
-                from collections import defaultdict as _dd
-                panel_frame_positions = _dd(list)  # panel_index -> [frame_positions]
-                for pos, si in enumerate(frame_sources):
-                    panel_frame_positions[si].append(pos)
+            # Synthesize one continuous clip per segment and derive per-frame timing.
+            # No whisper transcription — timing is derived purely from proportional
+            # word-count splits, with a MIN_FRAME_DURATION floor so panels don't flash by.
+            frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
+            segment_audio_paths: List[Path] = []
+            chapter_offset = 0.0
+            tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
+            tts_failed = 0      # of those, how many fell back to silence due to a real failure
 
-                for si, positions in panel_frame_positions.items():
-                    narr = panel_narrations.get(si, "")
-                    segments.append((f"img{si + 1:03d}", narr, positions))
-        else:
-            # No narration.json — all frames are silent (no text to narrate).
-            log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
-            for pos in range(len(frame_paths)):
-                segments.append((f"frm{pos + 1:04d}", "", [pos]))
+            for seg_idx, (tag, text, positions) in enumerate(segments):
+                cfg.write_progress("render", chapter.index - 1, total,
+                                   f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
+                if text.strip():
+                    tts_attempted += 1
+                audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+                if seg_tts_failed:
+                    tts_failed += 1
+                duration = get_audio_duration(audio_path_seg)
 
-        # Synthesize one continuous clip per segment and derive per-frame timing.
-        # No whisper transcription — timing is derived purely from proportional
-        # word-count splits, with a MIN_FRAME_DURATION floor so panels don't flash by.
-        frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
-        segment_audio_paths: List[Path] = []
-        chapter_offset = 0.0
+                # Ensure the segment audio is at least long enough for all its
+                # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
+                min_total = len(positions) * MIN_FRAME_DURATION
+                if duration < min_total:
+                    audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
+                    duration = min_total
 
-        for seg_idx, (tag, text, positions) in enumerate(segments):
+                timings = split_frame_timings(text, positions, duration)
+                for pos in positions:
+                    frame_timing[pos] = timings[pos]
+                # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
+                # so the total visual duration is longer than the raw audio. Pad the
+                # audio with trailing silence so the audio track matches the video.
+                last_end = max((timings[p][1] for p in positions), default=duration)
+                if last_end > duration:
+                    audio_path_seg = pad_audio_with_silence(audio_path_seg, last_end)
+                    duration = last_end
+                segment_audio_paths.append(audio_path_seg)
+                chapter_offset += duration
+
+            # If most/all segments that HAD real dialogue to speak ended up
+            # falling back to silence, this isn't "a quiet chapter" — it's a
+            # broken TTS pipeline (most commonly: edge-tts's endpoint,
+            # speech.platform.bing.com, is unreachable from this network —
+            # firewall/security-list egress rules on cloud hosts are a common
+            # cause). Every prior signal along the way (translation, rephrase,
+            # loudnorm, mux) looks completely normal even when this has happened,
+            # because each stage just sees "silence" as valid audio input and
+            # passes it through without error. Surface it loudly here instead of
+            # letting the job report success with a genuinely silent video.
+            if tts_attempted > 0:
+                tts_fail_ratio = tts_failed / tts_attempted
+                if tts_fail_ratio >= 0.9:
+                    log.error(
+                        "[%s] TTS FAILED for %d/%d narrated segments (%.0f%%) — "
+                        "edge-tts is not producing audio. Check network access to "
+                        "speech.platform.bing.com from this host (firewall/security-"
+                        "list egress rules are a common cause on cloud VMs). The "
+                        "output video for this chapter will be SILENT.",
+                        chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+                    )
+                elif tts_fail_ratio > 0.2:
+                    log.warning(
+                        "[%s] TTS failed for %d/%d narrated segments (%.0f%%) — "
+                        "partial audio dropout, check edge-tts connectivity",
+                        chapter.tag, tts_failed, tts_attempted, tts_fail_ratio * 100,
+                    )
+
+            # Build final per-frame durations from the timings.
+            # Guard against None entries (can happen if a segment had no positions
+            # or an error left a frame_timing slot unpopulated). Default to
+            # MIN_FRAME_DURATION so the video never has a zero-duration frame.
+            frame_durations = []
+            for t in frame_timing:
+                if t is not None:
+                    frame_durations.append(t[1] - t[0])
+                else:
+                    frame_durations.append(MIN_FRAME_DURATION)
+                    log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
+
             cfg.write_progress("render", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
-            audio_path_seg = synthesize_segment_audio(cfg, chapter, tag, text)
-            duration = get_audio_duration(audio_path_seg)
+                               f"Chapter {chapter.index}/{total}: building audio track")
+            audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
 
-            # Ensure the segment audio is at least long enough for all its
-            # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
-            min_total = len(positions) * MIN_FRAME_DURATION
-            if duration < min_total:
-                audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
-                duration = min_total
+            # The video timeline (frame_durations) was built to match the RAW,
+            # pre-loudnorm segment audio exactly. But build_chapter_audio_track's
+            # loudnorm pass (a single-pass/dynamic normalization, not two-pass
+            # "measured" mode) can shift the final audio's duration by a small
+            # but real amount due to its internal lookahead/limiter buffering.
+            # render_chapter muxes with `-shortest`, so if the post-loudnorm
+            # audio ends up LONGER than the video timeline, the tail of the
+            # narration gets silently cut off mid-sentence. Re-probe the actual
+            # final audio duration here and extend the last frame's hold time
+            # to cover it, so narration is never truncated.
+            if audio_path and audio_path.exists():
+                try:
+                    final_audio_duration = get_audio_duration(audio_path)
+                    video_duration = sum(frame_durations)
+                    if final_audio_duration > video_duration + 0.05 and frame_durations:
+                        shortfall = final_audio_duration - video_duration
+                        frame_durations[-1] += shortfall
+                        log.info(
+                            "[%s] extended last frame by %.3fs to cover loudnorm "
+                            "duration drift (audio %.3fs vs video %.3fs) — "
+                            "prevents narration from being cut off",
+                            chapter.tag, shortfall, final_audio_duration, video_duration,
+                        )
+                except RuntimeError as e:
+                    log.warning("[%s] could not verify final audio duration: %s", chapter.tag, e)
 
-            timings = split_frame_timings(text, positions, duration)
-            for pos in positions:
-                frame_timing[pos] = timings[pos]
-            # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
-            # so the total visual duration is longer than the raw audio. Pad the
-            # audio with trailing silence so the audio track matches the video.
-            last_end = max((timings[p][1] for p in positions), default=duration)
-            if last_end > duration:
-                audio_path_seg = pad_audio_with_silence(audio_path_seg, last_end)
-                duration = last_end
-            segment_audio_paths.append(audio_path_seg)
-            chapter_offset += duration
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
+            video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
 
-        # Build final per-frame durations from the timings.
-        # Guard against None entries (can happen if a segment had no positions
-        # or an error left a frame_timing slot unpopulated). Default to
-        # MIN_FRAME_DURATION so the video never has a zero-duration frame.
-        frame_durations = []
-        for t in frame_timing:
-            if t is not None:
-                frame_durations.append(t[1] - t[0])
+            if video_path:
+                chapter_videos.append(video_path)
+                state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag,
+                                    artifact_path=video_path, duration=time.time() - t0)
             else:
-                frame_durations.append(MIN_FRAME_DURATION)
-                log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
+                # render_chapter already logged the specific reason (QA
+                # failure, ffmpeg error, no frames) — record it as
+                # RETRYABLE here rather than COMPLETE/FAILED since a
+                # resumed run will simply attempt this chapter again.
+                state_store.record(cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
+                                    error_code="RENDER_FAILED", retry_category=classify_retry("render failed"))
 
-        cfg.write_progress("render", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: building audio track")
-        audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
-
-        cfg.write_progress("render", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
-        video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
-
-        if video_path:
-            chapter_videos.append(video_path)
-
-        log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
-        cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
+            log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
+            cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")
+        except Exception as e:
+            # One chapter failing (TTS totally unavailable, a corrupt
+            # source image, an OCR/ffmpeg crash, etc.) must not take
+            # down the rest of a multi-day batch. Log it loudly, skip
+            # this chapter (it's naturally retried on the next resumed
+            # run since it never wrote a completed chapter video), and
+            # keep processing the remaining chapters.
+            log.error(
+                "[%s] chapter FAILED and will be skipped this run: %s",
+                chapter.tag, e, exc_info=True,
+            )
+            state_store.record(cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
+                                error_message=str(e)[:500], retry_category=classify_retry(e))
+            cfg.write_progress(
+                "render", chapter.index, total,
+                f"Chapter {chapter.index}/{total} FAILED: {e}", status="warning",
+            )
+            continue
 
     if not chapter_videos:
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="NO_CHAPTERS")
         cfg.write_progress("render", total, total, "No chapter videos produced", status="error")
         raise RuntimeError("No chapter videos were produced — nothing to merge.")
 
+    dropped_chapters = total - len(chapter_videos)
+    if dropped_chapters > 0:
+        log.warning(
+            "%d/%d chapters were skipped this run due to failures — job will "
+            "complete with a video MISSING that content. Check pipeline_state.sqlite3 "
+            "for RETRYABLE chapters and rerun the same --work-dir to fill them in.",
+            dropped_chapters, total,
+        )
+
     cfg.write_progress("merge", total, total, "Merging chapter videos")
-    merged = merge_chapters(cfg, chapter_videos)
+    state_store.record(cfg.job_id, Stage.MERGE, State.RUNNING)
+    try:
+        merged = merge_chapters(cfg, chapter_videos)
+        state_store.record(cfg.job_id, Stage.MERGE, State.COMPLETE, artifact_path=merged)
+    except Exception as e:
+        state_store.record(cfg.job_id, Stage.MERGE, State.FAILED, error_message=str(e)[:500],
+                            retry_category=classify_retry(e))
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="MERGE_FAILED")
+        raise
+
     cfg.write_progress("bgm", total, total, "Finalizing output")
-    finalize_output(cfg, merged)
+    state_store.record(cfg.job_id, Stage.FINAL_QA, State.RUNNING)
+    try:
+        finalize_output(cfg, merged)
+        state_store.record(cfg.job_id, Stage.FINAL_QA, State.COMPLETE, artifact_path=cfg.output_path)
+    except Exception as e:
+        state_store.record(cfg.job_id, Stage.FINAL_QA, State.FAILED, error_message=str(e)[:500],
+                            retry_category=classify_retry(e))
+        state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="FINAL_QA_FAILED")
+        raise
+
     cleanup_temp(cfg)
 
     elapsed = time.time() - start
+    final_state = State.UNCERTAIN if dropped_chapters > 0 else State.COMPLETE
+    state_store.record(cfg.job_id, Stage.JOB, final_state,
+                        duration=elapsed, artifact_path=cfg.output_path,
+                        metadata={"chapters_total": total, "chapters_dropped": dropped_chapters})
     cfg.write_progress("done", total, total, f"Pipeline complete in {elapsed/60:.1f} min", status="done")
     log.info("PIPELINE COMPLETE in %.1f minutes. Output: %s", elapsed / 60, cfg.output_path)
+    if dropped_chapters > 0:
+        log.warning(
+            "Job marked UNCERTAIN (not COMPLETE): %d/%d chapters are missing "
+            "from this output. This is not a silent success.",
+            dropped_chapters, total,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2211,6 +2747,23 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging.",
     )
+    parser.add_argument("--production-mode", action="store_true", help="Use local-only production mode: no edge-tts/OpenAI dependency checks or runtime installs.")
+    parser.add_argument("--job-id", default="local", help="Stable job id for production state/recovery records.")
+    parser.add_argument(
+        "--min-free-disk-gb", type=float, default=2.0,
+        help="Abort (or pause between chapters) if free disk on the work-dir's "
+             "filesystem drops below this many GB (default: 2.0). A multi-day "
+             "unattended batch on a small free-tier disk is exactly the "
+             "scenario this guards against — better to fail loudly here than "
+             "have ffmpeg or Piper fail unpredictably mid-write from a full disk.",
+    )
+    parser.add_argument(
+        "--min-available-ram-mb", type=float, default=300.0,
+        help="Pause between chapters if available RAM drops below this many MB "
+             "(default: 300). Checked before each chapter, not just at startup, "
+             "since memory pressure on a small instance tends to build up over "
+             "a long batch rather than being present on day one.",
+    )
     parser.add_argument(
         "--slice-only", action="store_true",
         help="Only run the panel-slicing stage for all chapters, then exit. "
@@ -2243,6 +2796,10 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         narration_model=args.narration_model,
         progress_file=args.progress_file,
         slice_only=args.slice_only,
+        production_mode=args.production_mode,
+        job_id=args.job_id,
+        min_free_disk_gb=args.min_free_disk_gb,
+        min_available_ram_mb=args.min_available_ram_mb,
     )
 
 
@@ -2258,32 +2815,13 @@ def check_dependencies(cfg: Optional[PipelineConfig] = None) -> None:
     if shutil.which("ffmpeg") is None:
         log.error("ffmpeg not found on PATH. Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`).")
         sys.exit(1)
-    # edge-tts is only needed for the full render pipeline, not for --slice-only.
-    if cfg is not None and getattr(cfg, "slice_only", False):
+    if cfg is not None and (getattr(cfg, "slice_only", False) or getattr(cfg, "production_mode", False)):
         return
     try:
         import edge_tts  # noqa: F401
     except ImportError:
-        log.warning("edge-tts not installed — attempting auto-install via pip...")
-        import subprocess
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "edge-tts", "openai"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode == 0:
-                log.info("edge-tts + openai installed successfully")
-                # Verify it imports now
-                import importlib
-                importlib.invalidate_caches()
-                import edge_tts  # noqa: F401
-                log.info("edge-tts import verified")
-            else:
-                log.error("Failed to install edge-tts: %s", result.stderr[-300:])
-                sys.exit(1)
-        except Exception as e:
-            log.error("Failed to auto-install edge-tts: %s. Run: pip install edge-tts", e)
-            sys.exit(1)
+        log.error("edge-tts missing. Install pipeline dev dependencies or run --production-mode for local Piper/eSpeak TTS.")
+        sys.exit(1)
 
 
 def run_slice_only(cfg: PipelineConfig) -> None:
