@@ -1312,7 +1312,7 @@ export async function generateImageNarrations(
     try {
       if (provider === 'ollama') {
         const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-        const model = process.env.OLLAMA_VISION_MODEL || 'qwen2.5-vl:7b'
+        const model = process.env.OLLAMA_VISION_MODEL || 'llava:7b'
         const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(8000) })
         if (!res.ok) {
           console.warn(`[VLM] ✗ Ollama not reachable at ${baseUrl} (HTTP ${res.status})`)
@@ -1939,9 +1939,12 @@ async function narrateImageBatchGroq(imgPaths: string[], batchStart: number): Pr
   }
 
   const apiKey = process.env.GROQ_API_KEY!
-  // Llama 4 Scout — Groq's vision model (check console.groq.com for current ID).
+  // Groq's vision model. meta-llama/llama-4-scout was deprecated by Groq on
+  // 2026-06-17; qwen/qwen3.6-27b is Groq's own recommended migration target
+  // for vision workloads (check console.groq.com/docs/deprecations if this
+  // ever breaks again — Groq's free-tier model lineup changes frequently).
   // Override via GROQ_VLM_MODEL env var if needed.
-  const model = process.env.GROQ_VLM_MODEL || 'meta-llama/llama-4-scout'
+  const model = process.env.GROQ_VLM_MODEL || 'qwen/qwen3.6-27b'
   const url = 'https://api.groq.com/openai/v1/chat/completions'
 
   // Read + base64-encode each image.
@@ -2088,7 +2091,7 @@ export function isOllamaConfigured(): boolean {
 }
 
 // OLLAMA VLM — local inference via Ollama's OpenAI-compatible API.
-// Uses a vision-language model (e.g. qwen2.5-vl:7b) to transcribe panel text.
+// Uses a vision-language model (e.g. llava:7b) to transcribe panel text.
 // Completely free, no API key needed, runs on your own hardware.
 // Ollama exposes /v1/chat/completions with the same format as OpenAI.
 
@@ -2104,7 +2107,7 @@ async function narrateImageBatchOllama(imgPaths: string[], batchStart: number): 
   }
 
   const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-  const model = process.env.OLLAMA_VISION_MODEL || 'qwen2.5-vl:7b'
+  const model = process.env.OLLAMA_VISION_MODEL || 'llava:7b'
 
   // Build multi-image content (same prompt as other providers for consistency).
   const content: Array<

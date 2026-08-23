@@ -161,7 +161,8 @@ if $is_deb; then
     pkg_install curl wget git unzip zstd build-essential \
         ffmpeg python3 python3-pip python3-venv python3-dev \
         libgl1 libglib2.0-0 libcap2-bin \
-        ca-certificates gnupg lsb-release jq sqlite3 tmux htop
+        ca-certificates gnupg lsb-release jq sqlite3 tmux htop \
+        espeak-ng tesseract-ocr
 else
     # ── RHEL/Oracle Linux/Amazon Linux packages ──
     # FIX #10: Oracle Linux uses oracle-epel-release, not epel-release
@@ -178,7 +179,8 @@ else
     pkg_install curl wget git unzip zstd gcc gcc-c++ make \
         ffmpeg python3 python3-pip python3-devel \
         mesa-libGL glib2 libcap \
-        ca-certificates gnupg2 redhat-lsb-core jq sqlite tmux htop
+        ca-certificates gnupg2 redhat-lsb-core jq sqlite tmux htop \
+        espeak-ng tesseract
 
     # FIX #12: Ensure python3 venv module is available on RHEL/Oracle
     if ! python3 -m venv --help &>/dev/null; then
@@ -387,6 +389,33 @@ fi
 log_info "Python venv: $PYTHON_BIN"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4b: Piper TTS (primary production TTS engine)
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "4b" "Installing Piper TTS + voice model..."
+
+PIPER_VOICE_DIR="$PROJECT_DIR/pipeline/voices"
+PIPER_VOICE_NAME="en_US-lessac-medium"
+PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
+
+if [[ -x "$PYTHON_VENV/bin/piper" ]]; then
+    log_info "piper-tts already installed"
+else
+    pip install --quiet piper-tts \
+        && log_info "piper-tts installed" \
+        || log_warn "piper-tts install failed — production TTS will fall back to eSpeak-NG"
+fi
+
+if [[ -f "$PIPER_VOICE_MODEL_PATH" ]]; then
+    log_info "Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
+else
+    mkdir -p "$PIPER_VOICE_DIR"
+    "$PYTHON_VENV/bin/python3" -m piper.download_voices "$PIPER_VOICE_NAME" \
+        --download-dir "$PIPER_VOICE_DIR" \
+        && log_info "Piper voice model downloaded" \
+        || log_warn "Piper voice download failed — production TTS will fall back to eSpeak-NG"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: Node.js / Bun Dependencies
 # ═══════════════════════════════════════════════════════════════════════════════
 log_step 5 "Installing Node.js/Bun dependencies..."
@@ -462,7 +491,7 @@ else
 fi
 
 # Ensure critical paths are in .env (even if user already had a .env)
-for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT; do
+for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT PIPER_VOICE_MODEL; do
     if ! grep -q "^${VAR_NAME}=" .env 2>/dev/null; then
         case $VAR_NAME in
             PYTHON_BIN)         VAL="$PYTHON_BIN" ;;
@@ -472,6 +501,7 @@ for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_M
             OLLAMA_VISION_MODEL) VAL="$OLLAMA_VISION_MODEL" ;;
             OLLAMA_TEXT_MODEL)   VAL="$OLLAMA_TEXT_MODEL" ;;
             PORT)               VAL="$PORT_PIPELINE" ;;
+            PIPER_VOICE_MODEL)   VAL="$PIPER_VOICE_MODEL_PATH" ;;
         esac
         echo "${VAR_NAME}=${VAL}" >> .env
         log_info "Added ${VAR_NAME} to .env"
