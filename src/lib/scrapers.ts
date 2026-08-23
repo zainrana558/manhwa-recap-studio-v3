@@ -22,9 +22,13 @@ import type { MangadexManga } from "@/types/pipeline";
 
 const FETCH_TIMEOUT_MS = 5_000; // 5s timeout for all external fetches
 
-async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = FETCH_TIMEOUT_MS
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
@@ -40,11 +44,17 @@ export interface ScrapedChapter {
   id: string; // chapter slug/id used by the source
   chapterNum: string;
   title: string | null;
+  /** Translated language of this chapter, when known (e.g. "en"). Defaults to "en" if omitted. */
+  language?: string;
 }
 
 export interface ScrapedImage {
   url: string;
   referer: string; // required Referer header for this CDN
+  /** Suggested local filename (with extension) when saving this page to disk. */
+  filename?: string;
+  /** Extra request headers beyond Referer, if the CDN needs them (e.g. User-Agent). */
+  headers?: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +856,7 @@ export async function getMangaDexImages(
     const imgUrl = `${data.baseUrl}/data/${data.chapter.hash}/${file}`;
     images.push({
       url: imgUrl,
+      referer: "https://mangadex.org/",
       filename: file,
       // MangaDex CDN requires Referer header
       headers: { Referer: "https://mangadex.org/" },
@@ -920,6 +931,7 @@ export async function getMangaPillImages(
   while ((match = imgRegex.exec(html)) !== null) {
     images.push({
       url: match[1],
+      referer: "https://mangapill.com/",
       filename: `${String(page).padStart(3, "0")}.jpg`,
       headers: { Referer: "https://mangapill.com/" },
     });
@@ -1008,6 +1020,7 @@ export async function getToonilyImages(
     const ext = imgUrl.match(/\.(jpg|jpeg|png|webp)/i)?.[1] || "jpg";
     images.push({
       url: imgUrl,
+      referer: "https://toonily.com/",
       filename: `${String(page).padStart(3, "0")}.${ext}`,
       headers: { Referer: "https://toonily.com/" },
     });

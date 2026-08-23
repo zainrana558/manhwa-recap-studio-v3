@@ -756,6 +756,65 @@ interface AsuraChapterPage {
   url: string
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function safeString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function normalizeAsuraChapters(body: unknown, mangaSlug: string): AsuraChapter[] {
+  if (!isRecord(body) || !Array.isArray(body.data)) {
+    console.warn(`[AsuraScans] malformed chapters response for ${mangaSlug}: missing data array`)
+    return []
+  }
+  const chapters: AsuraChapter[] = []
+  for (const item of body.data) {
+    if (!isRecord(item)) continue
+    const slug = safeString(item.slug)
+    const rawNumber = item.number
+    const number = typeof rawNumber === 'number' ? rawNumber : Number(rawNumber)
+    if (!slug || !Number.isFinite(number)) {
+      console.warn(`[AsuraScans] skipped malformed chapter record for ${mangaSlug}`)
+      continue
+    }
+    chapters.push({
+      id: typeof item.id === 'number' ? item.id : Number(item.id) || 0,
+      number,
+      title: typeof item.title === 'string' ? item.title : '',
+      slug,
+    })
+  }
+  return chapters
+}
+
+function normalizeAsuraChapterPages(body: unknown, mangaSlug: string, chapterSlug: string): AsuraChapterPage[] {
+  const data = isRecord(body) ? body.data : null
+  const chapter = isRecord(data) ? data.chapter : null
+  const rawPages = isRecord(chapter) ? chapter.pages : null
+  if (!Array.isArray(rawPages)) {
+    console.warn(`[AsuraScans] malformed pages response for ${mangaSlug}/${chapterSlug}: missing pages array`)
+    return []
+  }
+  const pages: AsuraChapterPage[] = []
+  for (const page of rawPages) {
+    const url = isRecord(page) ? safeString(page.url) : null
+    if (!url) {
+      console.warn(`[AsuraScans] skipped malformed page for ${mangaSlug}/${chapterSlug}`)
+      continue
+    }
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsupported protocol')
+      pages.push({ url })
+    } catch {
+      console.warn(`[AsuraScans] skipped invalid page URL for ${mangaSlug}/${chapterSlug}`)
+    }
+  }
+  return pages
+}
+
 /**
  * Fetch the chapter list for a manga from AsuraScans.
  * mangaId is the as-{slug} form; slug is the AsuraScans series slug.
@@ -787,8 +846,12 @@ export async function fetchAsuraScansChapters(
   if (!res.ok) {
     throw new Error(`AsuraScans chapters ${res.status} for ${mangaSlug}`)
   }
-  const body = await res.json()
-  const chapters: AsuraChapter[] = body?.data ?? []
+  const body: unknown = await res.json().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[AsuraScans] malformed chapters JSON for ${mangaSlug}: ${msg}`)
+    return null
+  })
+  const chapters = normalizeAsuraChapters(body, mangaSlug)
 
   // API returns newest-first; reverse to oldest-first.
   const oldest = [...chapters].reverse()
@@ -824,9 +887,13 @@ export async function fetchAsuraScansChapterImages(
   if (!res.ok) {
     throw new Error(`AsuraScans chapter ${res.status} for ${mangaSlug}/${chapterSlug}`)
   }
-  const body = await res.json()
-  const pages: AsuraChapterPage[] = body?.data?.chapter?.pages ?? []
-  return pages.map((p) => p.url).filter((u): u is string => Boolean(u))
+  const body: unknown = await res.json().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[AsuraScans] malformed pages JSON for ${mangaSlug}/${chapterSlug}: ${msg}`)
+    return null
+  })
+  const pages = normalizeAsuraChapterPages(body, mangaSlug, chapterSlug)
+  return pages.map((p) => p.url)
 }
 
 /** Download an AsuraScans image from cdn.asurascans.com. */
@@ -1016,9 +1083,9 @@ export async function generateImageNarrationsOCR(
   onProgress?: (done: number, total: number) => void,
 ): Promise<{
   results: Array<{ image: string; text: string }>
-  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number }
+  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number; uncertainWithRegions: number }
 }> {
-  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0 } }
+  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0 } }
 
   const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
   const OCR_BATCH_SIZE = 20 // PaddleOCR is fast on CPU; larger batches reduce HTTP overhead
@@ -1034,6 +1101,15 @@ export async function generateImageNarrationsOCR(
   let totalRegionsDetected = 0
   let batchCallFailures = 0
   let freshlyProcessed = 0
+  // Distinct failure signal from both of the above: the DETECTOR found real
+  // text regions (regions > 0) but the RECOGNIZER couldn't read them
+  // confidently enough to be trusted (status UNCERTAIN/FAILED). That text
+  // gets discarded below (text = '') exactly like a legitimately silent
+  // panel — indistinguishable from "no dialogue" by emptyRatio alone. A
+  // chapter where this happens a lot means real dialogue is being silently
+  // thrown away because the recognizer is struggling with this chapter's
+  // font/art style, not that the panels are quiet.
+  let uncertainWithRegions = 0
 
   // Process in batches
   for (let i = 0; i < imagePaths.length; i += OCR_BATCH_SIZE) {
@@ -1078,12 +1154,16 @@ export async function generateImageNarrationsOCR(
         body: JSON.stringify({
           images: uncachedPaths,
           // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
-          // text — thicker strokes, looser character spacing, bolder fonts.
-          // A looser unclip ratio improves detection of these regions.
+          // text — thicker strokes, looser character spacing, bolder fonts
+          // — not dense printed-document text. PaddleOCR's stock default
+          // (1.8) is tuned for the latter. Without this override, the
+          // request body previously had NO options field at all, so every
+          // panel silently used the document-tuned default on every run.
+          // 2.4 is a looser unclip that merges nearby strokes into one region
+          // more readily, trading a little precision for fewer missed bubbles.
           options: { det_db_unclip_ratio: 2.4 },
         }),
-        // CPU OCR can take ~13s/image; allow a generous per-image margin.
-        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000),
+        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000), // CPU OCR ~13s/image observed; generous margin per image
       })
 
       if (!res.ok) {
@@ -1103,8 +1183,11 @@ export async function generateImageNarrationsOCR(
       const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
       totalRegionsDetected += batchRegions
       freshlyProcessed += data.results.length
+      uncertainWithRegions += data.results.filter(
+        (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
+      ).length
       console.log(
-        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected`,
+        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
       )
 
       // Map results back to the correct positions in the results array
@@ -1150,7 +1233,7 @@ export async function generateImageNarrationsOCR(
     onProgress?.(completedCount, imagePaths.length)
   }
 
-  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed } }
+  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } }
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,7 +1488,7 @@ export async function generateImageNarrations(
     const providerLabel = pickProvider()
     console.log(`[VLM] batch ${num}/${totalBatches} → ${providerLabel} (${images.length} panels)`)
 
-    let batchTexts: string[]
+    let batchTexts: string[] | null = null
     let succeeded = false
     let countedPerImage = false  // set true if single-image fallback counted panels
     try {
@@ -1508,17 +1591,15 @@ export async function generateImageNarrations(
         }
 
         if (!succeeded) {
-          // Final fallback: empty text (silence). This is the correct behavior
-          // for panels with genuinely no readable text. For panels that DO have
-          // text but all VLM providers failed, the silence is the lesser evil —
-          // the alternative was the annoying "scene continues to unfold" loop.
-          console.warn(
-            `[VLM] batch ${num}/${totalBatches} exhausted all retries — leaving ${images.length} panels silent`,
+          throw new Error(
+            `[VLM] batch ${num}/${totalBatches} exhausted all retries; refusing to convert provider failure into successful silence`,
           )
-          batchTexts = images.map(() => '')
-          succeeded = true
         }
       }
+    }
+
+    if (!batchTexts) {
+      throw new Error(`[VLM] batch ${num}/${totalBatches} produced no narration result`)
     }
 
     // Write results for this batch.

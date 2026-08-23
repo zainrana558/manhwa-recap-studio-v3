@@ -117,13 +117,6 @@ export function SettingsDialog() {
     }
   }, []);
 
-  useEffect(() => {
-    if (open) {
-      loadSettings();
-      checkOcrHealth();
-    }
-  }, [open, loadSettings]);
-
   const checkOcrHealth = useCallback(async () => {
     setOcrChecking(true);
     try {
@@ -140,6 +133,13 @@ export function SettingsDialog() {
       setOcrChecking(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (open) {
+      loadSettings();
+      checkOcrHealth();
+    }
+  }, [open, loadSettings, checkOcrHealth]);
 
   const handleSave = async () => {
     setSaving(true);
