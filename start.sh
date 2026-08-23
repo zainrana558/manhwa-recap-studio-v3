@@ -29,7 +29,6 @@ echo "🔧 Checking pipeline dependencies..."
 PIPER_VOICE_DIR="$(pwd)/pipeline/voices"
 PIPER_VOICE_NAME="en_US-lessac-medium"
 PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
-ROOT_VENV="$HOME/.venv"
 
 # --- System packages: eSpeak-NG (TTS fallback) + Tesseract (OCR fallback) ---
 _missing_pkgs=()
@@ -62,34 +61,70 @@ fi
 # THIS script's environment before pipeline-service is launched below,
 # since pipeline-service spawns master_pipeline.py with `env: {...process.env}`
 # (a straight passthrough of whatever it itself was started with).
-if [ -x "$ROOT_VENV/bin/python3" ]; then
-    if [ -x "$ROOT_VENV/bin/piper" ]; then
-        echo "  ✅ piper-tts already installed in $ROOT_VENV"
-    else
-        echo "  Installing piper-tts into $ROOT_VENV..."
-        "$ROOT_VENV/bin/pip" install --quiet piper-tts \
-            || echo "  ⚠️  piper-tts pip install failed — will fall back to eSpeak-NG at render time"
-    fi
+#
+# NOTE: this deliberately does NOT `pip install piper-tts`. piper-tts's
+# native dependency (piper-phonemize) only ships wheels for Python 3.9+ —
+# there is no cp38 wheel at all. On a box with an older root venv (e.g.
+# Ubuntu 20.04's stock Python 3.8, as opposed to a separately-built 3.11
+# venv some services here use), pip's resolver falls back to ancient
+# piper-tts 1.1.0/1.2.0 releases and then fails with a version conflict
+# between them, not a solvable dependency issue. Piper also publishes a
+# fully self-contained prebuilt binary (bundles its own espeak-ng,
+# libpiper_phonemize, and libonnxruntime — zero Python involved), which
+# sidesteps this entirely and works regardless of which Python the box
+# happens to have. That's what this installs instead.
+PIPER_DIR="$(pwd)/pipeline/piper"
+PIPER_BIN="$PIPER_DIR/piper/piper"
+PIPER_ARCH="$(uname -m)"
+case "$PIPER_ARCH" in
+    x86_64)  PIPER_ASSET="piper_linux_x86_64.tar.gz" ;;
+    aarch64) PIPER_ASSET="piper_linux_aarch64.tar.gz" ;;
+    armv7l)  PIPER_ASSET="piper_linux_armv7l.tar.gz" ;;
+    *)       PIPER_ASSET="" ;;
+esac
 
-    if [ ! -f "$PIPER_VOICE_MODEL_PATH" ]; then
-        echo "  Downloading Piper voice model ($PIPER_VOICE_NAME)..."
-        mkdir -p "$PIPER_VOICE_DIR"
-        "$ROOT_VENV/bin/python3" -m piper.download_voices "$PIPER_VOICE_NAME" \
-            --download-dir "$PIPER_VOICE_DIR" \
-            || echo "  ⚠️  Piper voice download failed — will fall back to eSpeak-NG at render time"
+if [ -x "$PIPER_BIN" ]; then
+    echo "  ✅ piper binary already installed at $PIPER_BIN"
+elif [ -z "$PIPER_ASSET" ]; then
+    echo "  ⚠️  No prebuilt Piper release for architecture '$PIPER_ARCH' — will fall back to eSpeak-NG at render time"
+else
+    echo "  Downloading Piper prebuilt binary ($PIPER_ASSET)..."
+    mkdir -p "$PIPER_DIR"
+    PIPER_URL="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/${PIPER_ASSET}"
+    if curl -fsSL -o "$PIPER_DIR/piper.tar.gz" "$PIPER_URL" \
+        && tar -xzf "$PIPER_DIR/piper.tar.gz" -C "$PIPER_DIR" \
+        && rm -f "$PIPER_DIR/piper.tar.gz"; then
+        echo "  ✅ Piper binary installed"
     else
-        echo "  ✅ Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
+        echo "  ⚠️  Piper binary download/extract failed — will fall back to eSpeak-NG at render time"
     fi
+fi
 
-    # Make piper's binary reachable and tell master_pipeline.py which model
-    # to use, for every process this script launches from here on.
-    export PATH="$ROOT_VENV/bin:$PATH"
-    if [ -f "$PIPER_VOICE_MODEL_PATH" ]; then
-        export PIPER_VOICE_MODEL="$PIPER_VOICE_MODEL_PATH"
+if [ ! -f "$PIPER_VOICE_MODEL_PATH" ]; then
+    echo "  Downloading Piper voice model ($PIPER_VOICE_NAME)..."
+    mkdir -p "$PIPER_VOICE_DIR"
+    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    if curl -fsSL -o "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx" \
+        && curl -fsSL -o "$PIPER_VOICE_MODEL_PATH.json" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx.json"; then
+        echo "  ✅ Piper voice model downloaded"
+    else
+        echo "  ⚠️  Piper voice model download failed — will fall back to eSpeak-NG at render time"
+        rm -f "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_MODEL_PATH.json"
     fi
 else
-    echo "  ⚠️  Root Python venv not found at $ROOT_VENV — skipping Piper setup."
-    echo "     Run setup.sh first, or TTS will fall back to eSpeak-NG only."
+    echo "  ✅ Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
+fi
+
+# Make piper's binary reachable and tell master_pipeline.py which model to
+# use, for every process this script launches from here on. piper's own
+# bundled shared libraries (libespeak-ng.so, libonnxruntime.so, etc.) live
+# alongside the binary in the same directory, so no LD_LIBRARY_PATH needed
+# — the binary was built with a relative rpath for exactly this layout.
+if [ -x "$PIPER_BIN" ]; then
+    export PATH="$(dirname "$PIPER_BIN"):$PATH"
+fi
+if [ -f "$PIPER_VOICE_MODEL_PATH" ]; then
+    export PIPER_VOICE_MODEL="$PIPER_VOICE_MODEL_PATH"
 fi
 
 echo ""

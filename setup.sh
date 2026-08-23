@@ -390,29 +390,61 @@ log_info "Python venv: $PYTHON_BIN"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 4b: Piper TTS (primary production TTS engine)
+#
+# Uses Piper's prebuilt standalone binary release, NOT `pip install
+# piper-tts`. piper-tts's native dependency (piper-phonemize) only ships
+# wheels for Python 3.9+ — there is no cp38 wheel at all — so on a box
+# whose Python venv is older (e.g. Ubuntu 20.04's stock Python 3.8), pip's
+# resolver falls back to ancient piper-tts 1.1.0/1.2.0 releases and then
+# fails with a version conflict between them rather than a solvable
+# dependency issue. The prebuilt binary bundles its own espeak-ng,
+# libpiper_phonemize, and libonnxruntime, so it works regardless of which
+# Python the box has.
 # ═══════════════════════════════════════════════════════════════════════════════
 log_step "4b" "Installing Piper TTS + voice model..."
 
+PIPER_DIR="$PROJECT_DIR/pipeline/piper"
+PIPER_BIN="$PIPER_DIR/piper/piper"
 PIPER_VOICE_DIR="$PROJECT_DIR/pipeline/voices"
 PIPER_VOICE_NAME="en_US-lessac-medium"
 PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
 
-if [[ -x "$PYTHON_VENV/bin/piper" ]]; then
-    log_info "piper-tts already installed"
+PIPER_ARCH="$(uname -m)"
+case "$PIPER_ARCH" in
+    x86_64)  PIPER_ASSET="piper_linux_x86_64.tar.gz" ;;
+    aarch64) PIPER_ASSET="piper_linux_aarch64.tar.gz" ;;
+    armv7l)  PIPER_ASSET="piper_linux_armv7l.tar.gz" ;;
+    *)       PIPER_ASSET="" ;;
+esac
+
+if [[ -x "$PIPER_BIN" ]]; then
+    log_info "piper binary already installed at $PIPER_BIN"
+elif [[ -z "$PIPER_ASSET" ]]; then
+    log_warn "No prebuilt Piper release for architecture '$PIPER_ARCH' — production TTS will fall back to eSpeak-NG"
 else
-    pip install --quiet piper-tts \
-        && log_info "piper-tts installed" \
-        || log_warn "piper-tts install failed — production TTS will fall back to eSpeak-NG"
+    mkdir -p "$PIPER_DIR"
+    PIPER_URL="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/${PIPER_ASSET}"
+    if curl -fsSL -o "$PIPER_DIR/piper.tar.gz" "$PIPER_URL" \
+        && tar -xzf "$PIPER_DIR/piper.tar.gz" -C "$PIPER_DIR" \
+        && rm -f "$PIPER_DIR/piper.tar.gz"; then
+        log_info "Piper binary installed"
+    else
+        log_warn "Piper binary download/extract failed — production TTS will fall back to eSpeak-NG"
+    fi
 fi
 
 if [[ -f "$PIPER_VOICE_MODEL_PATH" ]]; then
     log_info "Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
 else
     mkdir -p "$PIPER_VOICE_DIR"
-    "$PYTHON_VENV/bin/python3" -m piper.download_voices "$PIPER_VOICE_NAME" \
-        --download-dir "$PIPER_VOICE_DIR" \
-        && log_info "Piper voice model downloaded" \
-        || log_warn "Piper voice download failed — production TTS will fall back to eSpeak-NG"
+    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    if curl -fsSL -o "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx" \
+        && curl -fsSL -o "$PIPER_VOICE_MODEL_PATH.json" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx.json"; then
+        log_info "Piper voice model downloaded"
+    else
+        log_warn "Piper voice model download failed — production TTS will fall back to eSpeak-NG"
+        rm -f "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_MODEL_PATH.json"
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -491,7 +523,7 @@ else
 fi
 
 # Ensure critical paths are in .env (even if user already had a .env)
-for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT PIPER_VOICE_MODEL; do
+for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT PIPER_VOICE_MODEL PATH; do
     if ! grep -q "^${VAR_NAME}=" .env 2>/dev/null; then
         case $VAR_NAME in
             PYTHON_BIN)         VAL="$PYTHON_BIN" ;;
@@ -502,6 +534,15 @@ for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_M
             OLLAMA_TEXT_MODEL)   VAL="$OLLAMA_TEXT_MODEL" ;;
             PORT)               VAL="$PORT_PIPELINE" ;;
             PIPER_VOICE_MODEL)   VAL="$PIPER_VOICE_MODEL_PATH" ;;
+            # Prepend piper's directory so shutil.which("piper") finds it
+            # when master_pipeline.py is spawned from the systemd service.
+            # systemd's EnvironmentFile does NOT shell-expand $PATH — a
+            # value like "/piper/dir:$PATH" would be taken completely
+            # literally (including the two characters "$P..."), silently
+            # breaking PATH resolution for python3/bun/ffmpeg/everything
+            # else system-wide. Use systemd's actual default PATH as the
+            # base instead of trying to reference "the current PATH".
+            PATH)               VAL="$(dirname "$PIPER_BIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ;;
         esac
         echo "${VAR_NAME}=${VAL}" >> .env
         log_info "Added ${VAR_NAME} to .env"

@@ -63,6 +63,8 @@ server.log
 /mini-services-dist/
 upload/
 pipeline/models/
+pipeline/piper/
+pipeline/voices/
 data/cache/
 
 # Runtime artifacts
