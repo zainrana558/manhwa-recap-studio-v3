@@ -1075,30 +1075,15 @@ export async function generateImageNarrationsOCR(
       const res = await fetch(`${baseUrl}/ocr/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-<<<<<<< Updated upstream
         body: JSON.stringify({
           images: uncachedPaths,
           // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
-          // text — thicker strokes, looser character spacing, bolder fonts
-          // — not dense printed-document text. PaddleOCR's stock default
-          // (1.8) is tuned for the latter. Without this override, the
-          // request body previously had NO options field at all, so every
-          // panel silently used the document-tuned default on every run.
-          // Verified on real output: clean, high-contrast bubbles like
-          // "HOW DARE THEY DISHONOR MY MOTHER...?!" were detected as zero
-          // regions and produced a fully silent frame despite being
-          // trivially legible to a human. 2.4 is a looser unclip that
-          // merges nearby strokes into one region more readily, which
-          // trades a small amount of detection precision (very rare
-          // over-merging of two adjacent, unrelated bubbles) for
-          // substantially fewer missed bubbles overall.
+          // text — thicker strokes, looser character spacing, bolder fonts.
+          // A looser unclip ratio improves detection of these regions.
           options: { det_db_unclip_ratio: 2.4 },
         }),
-        signal: AbortSignal.timeout(120000), // 2 min timeout for large batches
-=======
-        body: JSON.stringify({ images: uncachedPaths }),
-        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000), // CPU OCR ~13s/image observed; generous margin per image
->>>>>>> Stashed changes
+        // CPU OCR can take ~13s/image; allow a generous per-image margin.
+        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000),
       })
 
       if (!res.ok) {
