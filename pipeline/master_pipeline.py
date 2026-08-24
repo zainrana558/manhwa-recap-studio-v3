@@ -2132,6 +2132,13 @@ def render_chapter(
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-r", str(FPS),
             "-shortest",
+            # Force the output muxer explicitly rather than letting ffmpeg
+            # guess it from the output filename's extension. tmp_path ends
+            # in ".mp4.tmp" (by design — see the atomic-write comment
+            # above), so extension-sniffing sees ".tmp" as the extension
+            # and fails with "Unable to find a suitable output format".
+            # This bit the very first real render on production hardware.
+            "-f", "mp4",
             str(tmp_path),
         ]
     else:
@@ -2142,6 +2149,7 @@ def render_chapter(
             "-vf", video_filters,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-r", str(FPS),
+            "-f", "mp4",
             str(tmp_path),
         ]
 
@@ -2246,6 +2254,11 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
+            # Same fix as render_chapter: force the output muxer instead of
+            # relying on tmp_path's extension (".mp4.tmp" -> ffmpeg would
+            # otherwise see ".tmp" and fail with "Unable to find a
+            # suitable output format").
+            "-f", "mp4",
             str(tmp_path),
         ]
     )
