@@ -6,7 +6,7 @@ FAILED/UNCERTAIN states over fabricated success.
 """
 from __future__ import annotations
 
-import hashlib, json, os, shutil, sqlite3, subprocess, time
+import hashlib, json, os, re, shutil, sqlite3, subprocess, time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -165,7 +165,19 @@ def audio_qa(path: Path, narration_expected: bool=True, min_duration: float=0.05
             vol = ProcessRunner().run(['ffmpeg','-hide_banner','-i',str(path),'-af','volumedetect','-f','null','-'], timeout=30)
             stderr = (vol.stderr or '') + (vol.stdout or '')
             if vol.returncode != 0: return QAResult(False, 'audio_energy_probe_failed', dur, meta)
-            if 'mean_volume: -inf' in stderr: return QAResult(False, 'silent_audio', dur, meta)
+            # Lossy-encoded (MP3) silence carries quantization noise and
+            # reads as roughly -90dB, not literally "-inf" — matching only
+            # the exact string "mean_volume: -inf" means this check almost
+            # never fires against real chapter-audio-track output (which is
+            # always MP3), since raw digital silence only stays exactly
+            # -inf through an uncompressed path. Use a numeric threshold on
+            # max_volume instead, same approach already used and proven at
+            # the per-segment level in master_pipeline.py's own _audio_qa.
+            m = re.search(r'max_volume:\s*(-?\d+(?:\.\d+)?) dB', stderr)
+            if m is None:
+                return QAResult(False, 'audio_energy_probe_unparseable', dur, meta)
+            if float(m.group(1)) <= -50.0:
+                return QAResult(False, 'silent_audio', dur, meta)
         return QAResult(True, duration=dur, metadata=meta)
     except Exception as exc:
         return QAResult(False, f'ffprobe_audio_failed:{exc}')

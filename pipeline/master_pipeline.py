@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover
 # no validation, so a crash mid-ffmpeg-write (or a corrupt/truncated
 # encode) could leave a broken file that a resumed run would treat as
 # already-complete and silently ship. See render_chapter/finalize_output.
-from production import video_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
+from production import video_qa, audio_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
@@ -1934,12 +1934,23 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     finally:
         raw_path.unlink(missing_ok=True)
 
-def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path]) -> Path:
+def build_chapter_audio_track(
+    cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path],
+    narration_expected: bool = True,
+) -> Path:
     """Concatenate per-segment (per-panel) audio clips into one continuous
     chapter audio track, then apply loudness normalization.
     Because each input clip is now a full continuous utterance (not a lone
     word), the only joins left are the natural breath-like gaps between
-    panels/scenes — not mid-sentence chops. Resumable."""
+    panels/scenes — not mid-sentence chops. Resumable.
+
+    `narration_expected` should reflect whether ANY segment in this chapter
+    actually had real dialogue to narrate (the caller's `tts_attempted > 0`
+    count) — NOT just whether `segment_audio_paths` is non-empty, which it
+    always is even for a chapter with zero dialogue (every silent segment
+    still produces a real silence WAV). Passing that wrong signal would make
+    audio_qa's silent-audio check reject a legitimately quiet chapter's
+    audio track as a QA failure."""
     out_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3"  # final output still MP3 (re-encoded from WAV, so no padding issues)
     if out_path.exists():
         log.info("[%s] chapter audio track already assembled — skipping", chapter.tag)
@@ -1960,6 +1971,7 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
+            "-f", "wav",
             str(raw_path),
         ]
     )
@@ -1986,6 +1998,15 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
     # verified locally), which crashes ffmpeg outright. There's nothing to
     # normalize in silence anyway, so on that failure we just copy
     # the raw (silent) track through untouched instead of crashing the job.
+    #
+    # Like render_chapter/merge_chapters, this writes to a .tmp path first
+    # and only promotes to `out_path` (the resume-checked path above) after
+    # audio_qa passes — a process killed mid-loudnorm-encode used to be able
+    # to leave a truncated MP3 sitting directly at `out_path`, which a
+    # resumed run would then treat as "already assembled" and feed straight
+    # into render_chapter's video mux.
+    tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
+    tmp_path.unlink(missing_ok=True)
     af = f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11"
     try:
         run_ffmpeg(
@@ -1993,7 +2014,8 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
                 "ffmpeg", "-y", "-i", str(raw_path),
                 "-af", af,
                 "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "1",
-                str(out_path),
+                "-f", "mp3",
+                str(tmp_path),
             ]
         )
     except RuntimeError as e:
@@ -2001,7 +2023,22 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
             "[%s] audio post-processing failed (%s) — falling back to raw (unprocessed) audio track",
             chapter.tag, e,
         )
-        shutil.copy2(raw_path, out_path)
+        tmp_path.unlink(missing_ok=True)
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-f", "mp3", str(tmp_path)])
+
+    qa = audio_qa(tmp_path, narration_expected=narration_expected)
+    if not qa.ok:
+        quarantine_dir = cfg.temp_audio_dir / "quarantine"
+        quarantine_dir.mkdir(exist_ok=True)
+        bad_path = quarantine_dir / f"{chapter.tag}.{int(time.time())}.{qa.reason}.bad"
+        try:
+            tmp_path.rename(bad_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+        raw_path.unlink(missing_ok=True)
+        raise RuntimeError(f"[{chapter.tag}] chapter audio track failed QA ({qa.reason}) — see {bad_path}")
+
+    atomic_promote(tmp_path, out_path)
     raw_path.unlink(missing_ok=True)
     log.info("[%s] assembled + post-processed chapter audio (loudnorm) -> %s", chapter.tag, out_path.name)
     return out_path
@@ -2568,7 +2605,9 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: building audio track")
-            audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
+            audio_path = build_chapter_audio_track(
+                cfg, chapter, segment_audio_paths, narration_expected=tts_attempted > 0,
+            ) if segment_audio_paths else None
 
             # The video timeline (frame_durations) was built to match the RAW,
             # pre-loudnorm segment audio exactly. But build_chapter_audio_track's
