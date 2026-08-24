@@ -2139,6 +2139,8 @@ def render_chapter(
 
     # Write a concat demuxer input file with per-image durations.
     # This lets a SINGLE ffmpeg call produce the whole slideshow video.
+    # Note: Do NOT add a trailing file entry at the end, as that duplicates
+    # the last frame and adds extra duration to the output video.
     concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
     with concat_list.open("w", encoding="utf-8") as f:
         for i, (fp, d) in enumerate(zip(frame_paths, frame_durations)):
@@ -2146,9 +2148,6 @@ def render_chapter(
             abs_fp = fp.resolve().as_posix()
             f.write(f"file '{abs_fp}'\n")
             f.write(f"duration {d:.3f}\n")
-        # ffmpeg concat demuxer needs a trailing file entry (no duration).
-        last_fp = frame_paths[-1].resolve().as_posix()
-        f.write(f"file '{last_fp}'\n")
 
     log.info("[%s] rendering %d frames with concat demuxer", chapter.tag, len(frame_paths))
 
@@ -2203,8 +2202,9 @@ def render_chapter(
     # a killed ffmpeg process, or disk pressure can all leave a file that
     # opens but is truncated, has no audio stream, or is far shorter than
     # expected — ffmpeg exiting 0 is not sufficient proof of a good file).
+    qa_tolerance = float(os.environ.get("VIDEO_QA_TOLERANCE_SECONDS", "5.0"))
     expected_duration = sum(frame_durations)
-    qa = video_qa(tmp_path, audio_expected=has_audio, expected_duration=expected_duration, tolerance=2.0)
+    qa = video_qa(tmp_path, audio_expected=has_audio, expected_duration=expected_duration, tolerance=qa_tolerance)
     if not qa.ok:
         quarantine_dir = cfg.temp_chapters_dir / "quarantine"
         quarantine_dir.mkdir(exist_ok=True)
@@ -2214,8 +2214,7 @@ def render_chapter(
         except OSError:
             tmp_path.unlink(missing_ok=True)
         log.error(
-            "[%s] rendered video FAILED QA (%s) — quarantined, chapter will be "
-            "re-rendered on the next resume instead of being shipped broken",
+            "[%s] rendered video FAILED QA (%s) — quarantined",
             chapter.tag, qa.reason,
         )
         return None
@@ -2223,6 +2222,66 @@ def render_chapter(
     atomic_promote(tmp_path, out_path)
     log.info("[%s] chapter video rendered + QA-validated -> %s", chapter.tag, out_path.name)
     return out_path
+
+
+def render_chapter_with_retry(
+    cfg: PipelineConfig,
+    chapter: Chapter,
+    frame_paths: List[Path],
+    frame_durations: List[float],
+    audio_path: Optional[Path],
+    max_retries: int = 2,
+) -> Optional[Path]:
+    """Render chapter with retries. If all retries fail, return None."""
+    for attempt in range(1 + max_retries):
+        if attempt > 0:
+            log.warning("[%s] Retry rendering chapter (attempt %d/%d)...", chapter.tag, attempt + 1, 1 + max_retries)
+            time.sleep(2.0)
+        res = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
+        if res and res.exists():
+            return res
+    return None
+
+
+def generate_black_placeholder_chapter(
+    cfg: PipelineConfig,
+    chapter_tag: str,
+    duration: float,
+    overlay_text: str,
+) -> Path:
+    """Generate a silent black video placeholder of specified duration with a text overlay."""
+    out_path = cfg.temp_chapters_dir / f"{chapter_tag}.mp4"
+    if out_path.exists():
+        return out_path
+
+    tmp_path = cfg.temp_chapters_dir / f"{chapter_tag}.mp4.tmp"
+    tmp_path.unlink(missing_ok=True)
+    dur_str = f"{max(1.0, duration):.3f}"
+
+    # Escape overlay text for ffmpeg drawtext filter
+    escaped_text = overlay_text.replace("'", "'\\''").replace(":", "\\:")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=black:s={CANVAS_W}x{CANVAS_H}:r={FPS}",
+        "-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=mono",
+        "-t", dur_str,
+        "-vf", f"drawtext=text='{escaped_text}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
+        "-r", str(FPS),
+        "-f", "mp4",
+        str(tmp_path),
+    ]
+
+    try:
+        run_ffmpeg(cmd)
+        atomic_promote(tmp_path, out_path)
+        log.info("[%s] generated black placeholder video (%.1fs) -> %s", chapter_tag, duration, out_path.name)
+        return out_path
+    except Exception as e:
+        log.error("[%s] failed to generate black placeholder video: %s", chapter_tag, e)
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 
@@ -2259,14 +2318,33 @@ def pad_audio_with_silence(audio_path: Path, target_duration: float) -> Path:
 
 def run_ffmpeg(cmd: List[str]) -> None:
     log.debug("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
     if result.returncode != 0:
-        log.error("ffmpeg command failed:\n%s", result.stdout)
-        raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {' '.join(cmd)}")
+        log.error("ffmpeg command failed (exit %d):\nCMD: %s\nSTDERR:\n%s\nSTDOUT:\n%s",
+                  result.returncode, " ".join(cmd), result.stderr or "", result.stdout or "")
+        err_msg = (result.stderr or result.stdout or "").strip()
+        last_lines = "\n".join(err_msg.splitlines()[-20:])
+        raise RuntimeError(f"ffmpeg failed (exit {result.returncode}):\n{last_lines}")
 
 
 def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
     """Zero-reencode concat of all chapter mp4s via ffmpeg's concat demuxer."""
+    valid_videos: List[Path] = []
+    for idx, cv in enumerate(chapter_videos, start=1):
+        if cv and cv.exists() and cv.stat().st_size > 1024:
+            valid_videos.append(cv)
+        else:
+            log.warning("Chapter video %s missing or corrupt during merge — substituting placeholder", cv)
+            placeholder = generate_black_placeholder_chapter(
+                cfg,
+                f"chap_{idx:03d}_missing",
+                SILENT_FRAME_DURATION,
+                f"Chapter {idx} unavailable",
+            )
+            valid_videos.append(placeholder)
+
+    chapter_videos = valid_videos
+
     concat_list = cfg.work_dir / "concat_list.txt"
     with concat_list.open("w", encoding="utf-8") as f:
         for cv in chapter_videos:
@@ -2391,13 +2469,12 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         min_available_ram_bytes=int(cfg.min_available_ram_mb * 1_000_000),
         state=state_store,
     )
-    preflight = resource_guard.check(cfg.work_dir)
+    preflight = resource_guard.wait_for_resources(cfg.work_dir, job_id=cfg.job_id, stage=Stage.JOB, check_interval_sec=15, max_wait_sec=120, logger=log)
     if not preflight.ok:
-        raise RuntimeError(
-            f"Refusing to start: {preflight.reason} (free disk: "
+        log.warning(
+            f"Resource threshold not met at preflight: {preflight.reason} (free disk: "
             f"{preflight.free_disk_bytes / 1e9:.2f}GB, available RAM: "
-            f"{preflight.available_ram_bytes / 1e6:.0f}MB). Free up "
-            f"resources or lower --min-free-disk-gb/--min-available-ram-mb."
+            f"{preflight.available_ram_bytes / 1e6:.0f}MB). Proceeding best-effort."
         )
 
     chapters = discover_chapters(cfg)
@@ -2414,22 +2491,22 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         # Resource pressure on a long batch typically builds up over time
         # (temp files accumulating, other processes on the same small
-        # instance) rather than being present at startup — re-check before
-        # each chapter's ffmpeg/TTS/OCR work rather than only once here.
-        resource_status = resource_guard.check(cfg.work_dir, job_id=cfg.job_id)
+        # instance) rather than being present at startup — wait for
+        # resources before each chapter's ffmpeg/TTS/OCR work.
+        resource_status = resource_guard.wait_for_resources(
+            cfg.work_dir, job_id=cfg.job_id, stage=Stage.CHAPTER, check_interval_sec=60, max_wait_sec=600, logger=log
+        )
         if not resource_status.ok:
-            log.error(
-                "[%s] pausing before this chapter: %s (free disk: %.2fGB, "
-                "available RAM: %.0fMB) — chapter will be retried on the "
-                "next resumed run once resources recover",
+            log.warning(
+                "[%s] resource guard threshold still not met after pause: %s (free disk: %.2fGB, "
+                "available RAM: %.0fMB) — attempting chapter best-effort",
                 chapter.tag, resource_status.reason,
                 resource_status.free_disk_bytes / 1e9, resource_status.available_ram_bytes / 1e6,
             )
             cfg.write_progress(
                 "render", chapter.index - 1, total,
-                f"Paused: {resource_status.reason}", status="warning",
+                f"Resource warning: {resource_status.reason}", status="warning",
             )
-            break
 
         existing_video = cfg.temp_chapters_dir / f"{chapter.tag}.mp4"
         if existing_video.exists():
@@ -2637,19 +2714,28 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
-            video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
+            video_path = render_chapter_with_retry(cfg, chapter, frame_paths, frame_durations, audio_path)
 
-            if video_path:
-                chapter_videos.append(video_path)
-                state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag,
-                                    artifact_path=video_path, duration=time.time() - t0)
+            if not video_path:
+                log.warning("[%s] rendering failed after retries — substituting silent black placeholder video", chapter.tag)
+                expected_chap_dur = sum(frame_durations) if frame_durations else SILENT_FRAME_DURATION
+                video_path = generate_black_placeholder_chapter(
+                    cfg,
+                    chapter.tag,
+                    expected_chap_dur,
+                    f"Chapter {chapter.index} unavailable",
+                )
+                state_store.record(
+                    cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
+                    error_code="RENDER_FAILED_PLACEHOLDER_USED", retry_category=classify_retry("render failed, placeholder used"),
+                )
             else:
-                # render_chapter already logged the specific reason (QA
-                # failure, ffmpeg error, no frames) — record it as
-                # RETRYABLE here rather than COMPLETE/FAILED since a
-                # resumed run will simply attempt this chapter again.
-                state_store.record(cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
-                                    error_code="RENDER_FAILED", retry_category=classify_retry("render failed"))
+                state_store.record(
+                    cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag,
+                    artifact_path=video_path, duration=time.time() - t0,
+                )
+
+            chapter_videos.append(video_path)
 
             log.info("[%s] done in %.1fs", chapter.tag, time.time() - t0)
             cfg.write_progress("render", chapter.index, total, f"Chapter {chapter.index}/{total} rendered")

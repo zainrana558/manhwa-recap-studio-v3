@@ -66,13 +66,13 @@ def _init_ocr():
     # host is reachable) — let the real download attempt be the test.
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
-    MODEL_INIT_RETRIES = 3
-    RETRY_DELAY_SEC = 10
+    MODEL_INIT_RETRIES = 5
 
     def _try_init(ocr_version):
         # type: (str) -> Any
         from paddleocr import PaddleOCR
         last_exc = None  # type: Optional[Exception]
+        delay = 10
         for attempt in range(1, MODEL_INIT_RETRIES + 1):
             try:
                 return PaddleOCR(ocr_version=ocr_version, lang="en")
@@ -81,9 +81,10 @@ def _init_ocr():
                 if attempt < MODEL_INIT_RETRIES:
                     logger.warning(
                         "%s init attempt %d/%d failed (%s) — retrying in %ds",
-                        ocr_version, attempt, MODEL_INIT_RETRIES, exc, RETRY_DELAY_SEC,
+                        ocr_version, attempt, MODEL_INIT_RETRIES, exc, delay,
                     )
-                    time.sleep(RETRY_DELAY_SEC)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 120)
         raise last_exc  # type: ignore
 
     try:

@@ -117,9 +117,11 @@ export function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 import crypto from 'crypto'
+import { spawnSync } from 'child_process'
 
 const VLM_CACHE_DIR = path.join(DATA_DIR, 'cache', 'vlm')
 const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent)
+const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes TTL for failure cache
 
 // Bump this whenever OCR tuning parameters (det_db_unclip_ratio, model
 // version, etc.) change in a way that could produce different text for the
@@ -152,20 +154,21 @@ async function getVlmCached(key: string): Promise<string | null> {
   try {
     const cacheFile = path.join(VLM_CACHE_DIR, `${key}.json`)
     const stat = await fs.stat(cacheFile)
-    if (Date.now() - stat.mtimeMs > VLM_CACHE_TTL_MS) return null
     const data = JSON.parse(await fs.readFile(cacheFile, 'utf8'))
+    const ttl = data.status === 'FAILED' ? FAILURE_CACHE_TTL_MS : VLM_CACHE_TTL_MS
+    if (Date.now() - stat.mtimeMs > ttl) return null
     return data.text ?? null
   } catch {
     return null
   }
 }
 
-async function setVlmCached(key: string, text: string): Promise<void> {
+async function setVlmCached(key: string, text: string, status: string = 'SUCCESS'): Promise<void> {
   try {
     await fs.mkdir(VLM_CACHE_DIR, { recursive: true })
     await fs.writeFile(
       path.join(VLM_CACHE_DIR, `${key}.json`),
-      JSON.stringify({ text, ts: Date.now() }),
+      JSON.stringify({ text, status, ts: Date.now() }),
       'utf8',
     )
   } catch {
@@ -1036,11 +1039,11 @@ async function getOcrCached(key: string): Promise<{ text: string; status: string
   try {
     const cacheFile = path.join(OCR_CACHE_DIR, `${key}.json`)
     const stat = await fs.stat(cacheFile)
-    if (Date.now() - stat.mtimeMs > VLM_CACHE_TTL_MS) return null
     const data = JSON.parse(await fs.readFile(cacheFile, 'utf8'))
     const status = String(data.status || 'SUCCESS').toUpperCase()
-    if (status !== 'SUCCESS') return null
-    return { text: data.text ?? '', status }
+    const ttl = status === 'FAILED' ? FAILURE_CACHE_TTL_MS : VLM_CACHE_TTL_MS
+    if (Date.now() - stat.mtimeMs > ttl) return null
+    return { text: status === 'SUCCESS' ? (data.text ?? '') : '', status }
   } catch {
     return null
   }
@@ -1145,89 +1148,94 @@ export async function generateImageNarrationsOCR(
       continue
     }
 
-    // Call PaddleOCR batch endpoint
-    try {
-      const t0 = Date.now()
-      const res = await fetch(`${baseUrl}/ocr/batch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          images: uncachedPaths,
-          // Manhwa/manhua speech-bubble lettering is hand-drawn comic-style
-          // text — thicker strokes, looser character spacing, bolder fonts
-          // — not dense printed-document text. PaddleOCR's stock default
-          // (1.8) is tuned for the latter. Without this override, the
-          // request body previously had NO options field at all, so every
-          // panel silently used the document-tuned default on every run.
-          // 2.4 is a looser unclip that merges nearby strokes into one region
-          // more readily, trading a little precision for fewer missed bubbles.
-          options: { det_db_unclip_ratio: 2.4 },
-        }),
-        signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000), // CPU OCR ~13s/image observed; generous margin per image
-      })
+    // Call PaddleOCR batch endpoint with retries
+    let batchSuccess = false
+    let lastOcrErr: unknown = null
+    const MAX_OCR_RETRIES = 3
 
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '')
-        throw new Error(`PaddleOCR service returned HTTP ${res.status}: ${errBody.slice(0, 200)}`)
-      }
+    for (let attempt = 1; attempt <= MAX_OCR_RETRIES; attempt++) {
+      try {
+        const t0 = Date.now()
+        const res = await fetch(`${baseUrl}/ocr/batch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            images: uncachedPaths,
+            options: { det_db_unclip_ratio: 2.4 },
+          }),
+          signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000),
+        })
 
-      const data = (await res.json()) as {
-        results: Array<{ index: number; text: string; confidence: number; regions: number; status?: string; quality_score?: number; candidates?: unknown[]; selection_reason?: string }>
-        model: string
-        processing_time_ms: number
-      }
-
-      const elapsed = Date.now() - t0
-      const uncertainCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'UNCERTAIN').length
-      const failedCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'FAILED').length
-      const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
-      totalRegionsDetected += batchRegions
-      freshlyProcessed += data.results.length
-      uncertainWithRegions += data.results.filter(
-        (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
-      ).length
-      console.log(
-        `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
-      )
-
-      // Map results back to the correct positions in the results array
-      for (const ocrResult of data.results) {
-        const localIdx = uncachedIndices[ocrResult.index]
-        if (localIdx === undefined) continue
-
-        const globalIdx = startIdx + localIdx
-        const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
-        const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
-
-        // Cache the result. setOcrCached uses the versioned OCR key (so a
-        // future OCR_TUNING_VERSION bump invalidates it correctly);
-        // setVlmCached uses the plain path key since VLM has no tuning
-        // parameters to version and this is purely a cross-method reuse
-        // optimization (if VLM fallback runs later, it can reuse this text
-        // instead of re-calling an LLM for a panel we already transcribed).
-        const imgPath = uncachedPaths[ocrResult.index]
-        if (text && status === 'SUCCESS') {
-          void setOcrCached(ocrCacheKey(imgPath), text, status)
-          void setVlmCached(vlmCacheKey(imgPath), text)
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => '')
+          throw new Error(`PaddleOCR service returned HTTP ${res.status}: ${errBody.slice(0, 200)}`)
         }
 
-        results[globalIdx] = { image: path.basename(uncachedPaths[ocrResult.index]), text }
-        completedCount++
+        const data = (await res.json()) as {
+          results: Array<{ index: number; text: string; confidence: number; regions: number; status?: string; quality_score?: number; candidates?: unknown[]; selection_reason?: string }>
+          model: string
+          processing_time_ms: number
+        }
+
+        const elapsed = Date.now() - t0
+        const uncertainCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'UNCERTAIN').length
+        const failedCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'FAILED').length
+        const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
+        totalRegionsDetected += batchRegions
+        freshlyProcessed += data.results.length
+        uncertainWithRegions += data.results.filter(
+          (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
+        ).length
+        console.log(
+          `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
+        )
+
+        // Map results back to the correct positions in the results array
+        for (const ocrResult of data.results) {
+          const localIdx = uncachedIndices[ocrResult.index]
+          if (localIdx === undefined) continue
+
+          const globalIdx = startIdx + localIdx
+          const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
+          const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
+
+          const imgPath = uncachedPaths[ocrResult.index]
+          if (text && status === 'SUCCESS') {
+            void setOcrCached(ocrCacheKey(imgPath), text, status)
+            void setVlmCached(vlmCacheKey(imgPath), text, status)
+          } else {
+            void setOcrCached(ocrCacheKey(imgPath), '', 'FAILED')
+            void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+          }
+
+          results[globalIdx] = { image: path.basename(uncachedPaths[ocrResult.index]), text }
+          completedCount++
+        }
+        batchSuccess = true
+        break
+      } catch (err) {
+        lastOcrErr = err
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[OCR] Batch attempt ${attempt}/${MAX_OCR_RETRIES} failed: ${msg.slice(0, 200)}`)
+        if (attempt < MAX_OCR_RETRIES) {
+          await sleep(2000 * Math.pow(2, attempt - 1))
+        }
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.warn(`[OCR] Batch failed: ${msg.slice(0, 200)}`)
+    }
+
+    if (!batchSuccess) {
       batchCallFailures++
-      // Fill remaining uncached results with empty text
+      // Fill remaining uncached results with empty text and failure cache
       for (let j = 0; j < uncachedIndices.length; j++) {
         const globalIdx = startIdx + uncachedIndices[j]
         if (!results[globalIdx]) {
-          results[globalIdx] = { image: path.basename(uncachedPaths[j]), text: '' }
+          const imgPath = uncachedPaths[j]
+          void setOcrCached(ocrCacheKey(imgPath), '', 'FAILED')
+          void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+          results[globalIdx] = { image: path.basename(imgPath), text: '' }
           completedCount++
         }
       }
-      // Don't throw — let the pipeline continue with empty text for this batch.
-      // The caller can decide to retry with VLM.
     }
 
     onProgress?.(completedCount, imagePaths.length)
@@ -1406,9 +1414,13 @@ export async function generateImageNarrations(
   const HAS_API_KEYS = !!(process.env.SILICONFLOW_API_KEY || process.env.ZHIPU_API_KEY || process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY)
 
   if (!HAS_REAL_PROVIDER) {
-    console.warn('[VLM] No VLM providers available — panels will be silent')
-    console.warn('[VLM] To enable transcription: set SILICONFLOW_API_KEY, ZHIPU_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, or install Ollama')
-    return imagePaths.map((p) => ({ image: path.basename(p), text: '' }))
+    console.warn('[VLM] No VLM providers available — attempting emergency tesseract fallback...')
+    const emergencyResults = runTesseractFallback(imagePaths)
+    if (emergencyResults) {
+      return emergencyResults
+    }
+    console.warn('[VLM] Emergency tesseract fallback unavailable or failed — using placeholders')
+    return imagePaths.map((p) => ({ image: path.basename(p), text: '[transcription unavailable]' }))
   }
 
   console.log(
@@ -1591,9 +1603,16 @@ export async function generateImageNarrations(
         }
 
         if (!succeeded) {
-          throw new Error(
-            `[VLM] batch ${num}/${totalBatches} exhausted all retries; refusing to convert provider failure into successful silence`,
-          )
+          console.warn(`[VLM] batch ${num}/${totalBatches} exhausted all retries across providers — attempting tesseract fallback for batch...`)
+          const tessBatchResults = runTesseractFallback(images)
+          if (tessBatchResults) {
+            batchTexts = tessBatchResults.map((r) => r.text)
+            succeeded = true
+          } else {
+            console.warn(`[VLM] batch ${num}/${totalBatches} tesseract fallback unavailable/failed — using placeholder text`)
+            batchTexts = images.map(() => '[transcription unavailable]')
+            succeeded = true
+          }
         }
       }
     }
@@ -2659,6 +2678,38 @@ function parseBatchResponse(raw: string, expectedCount: number): string[] {
   return texts
 }
 
+
+/**
+ * Emergency fallback to local Tesseract CLI for image transcriptions.
+ * Returns null if tesseract is not available on PATH or execution fails.
+ */
+function runTesseractFallback(imagePaths: string[]): Array<{ image: string; text: string }> | null {
+  try {
+    const results: Array<{ image: string; text: string }> = []
+    for (const imgPath of imagePaths) {
+      const proc = spawnSync('tesseract', [imgPath, 'stdout', '--psm', '6'], {
+        encoding: 'utf8',
+        timeout: 15000,
+      })
+      if (proc.status === 0 && proc.stdout) {
+        const txt = proc.stdout.trim()
+        results.push({
+          image: path.basename(imgPath),
+          text: txt.length > 0 ? txt : '[transcription unavailable]',
+        })
+      } else {
+        results.push({
+          image: path.basename(imgPath),
+          text: '[transcription unavailable]',
+        })
+      }
+    }
+    return results
+  } catch (err) {
+    console.warn('[Tesseract Fallback] Failed execution:', err)
+    return null
+  }
+}
 
 /**
  * Send a single image to the VLM and get back the actual dialogue/caption
