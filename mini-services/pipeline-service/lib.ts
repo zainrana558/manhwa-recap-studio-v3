@@ -2681,28 +2681,36 @@ function parseBatchResponse(raw: string, expectedCount: number): string[] {
 
 /**
  * Emergency fallback to local Tesseract CLI for image transcriptions.
+ * Runs multi-pass PSM modes (--psm 6, --psm 11, --psm 3) to extract sparse or unusual bubble text.
  * Returns null if tesseract is not available on PATH or execution fails.
  */
-function runTesseractFallback(imagePaths: string[]): Array<{ image: string; text: string }> | null {
+export function runTesseractFallback(imagePaths: string[]): Array<{ image: string; text: string }> | null {
   try {
+    const check = spawnSync('which', ['tesseract'], { encoding: 'utf8' })
+    if (check.status !== 0) return null
+
     const results: Array<{ image: string; text: string }> = []
     for (const imgPath of imagePaths) {
-      const proc = spawnSync('tesseract', [imgPath, 'stdout', '--psm', '6'], {
-        encoding: 'utf8',
-        timeout: 15000,
-      })
-      if (proc.status === 0 && proc.stdout) {
-        const txt = proc.stdout.trim()
-        results.push({
-          image: path.basename(imgPath),
-          text: txt.length > 0 ? txt : '[transcription unavailable]',
+      let text = ''
+      // Try PSM 6 (uniform block of text), then PSM 11 (sparse text), then PSM 3 (fully automatic)
+      for (const psm of ['6', '11', '3']) {
+        const proc = spawnSync('tesseract', [imgPath, 'stdout', '--psm', psm], {
+          encoding: 'utf8',
+          timeout: 15000,
         })
-      } else {
-        results.push({
-          image: path.basename(imgPath),
-          text: '[transcription unavailable]',
-        })
+        if (proc.status === 0 && proc.stdout) {
+          const txt = proc.stdout.trim()
+          if (txt.length > 0 && /[a-zA-Z0-9]/.test(txt)) {
+            text = txt
+            break
+          }
+        }
       }
+
+      results.push({
+        image: path.basename(imgPath),
+        text: text.length > 0 ? text : '',
+      })
     }
     return results
   } catch (err) {

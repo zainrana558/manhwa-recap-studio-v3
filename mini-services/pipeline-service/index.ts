@@ -47,6 +47,7 @@ import {
   extFromFilename,
   generateImageNarrations,
   generateImageNarrationsOCR,
+  runTesseractFallback,
   isPaddleOCRAvailable,
   getOCRModelName,
   filterCreditPanels,
@@ -1082,23 +1083,38 @@ async function processJob(jobId: string): Promise<void> {
             )
           }
         } catch (ocrErr) {
-          // OCR failed or returned poor results — fall back to VLM for this chapter.
+          // OCR failed or returned poor results — attempt local Tesseract fallback before VLM.
           const ocrMsg = ocrErr instanceof Error ? ocrErr.message : String(ocrErr)
           await emitLog(jobId, 'warn', 'transcribe',
-            `Chapter ${ch.index}: PaddleOCR failed or low quality (${ocrMsg.slice(0, 100)}) — falling back to VLM`,
+            `Chapter ${ch.index}: PaddleOCR failed or low quality (${ocrMsg.slice(0, 100)}) — attempting local Tesseract fallback before VLM`,
           )
-          rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
-            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed via VLM`)
-          })
-          usedMethod = 'VLM (fallback)'
+          const tessOutcome = runTesseractFallback(imageFiles)
+          if (tessOutcome && tessOutcome.some((n: { text: string }) => n.text.trim())) {
+            rawNarrations = tessOutcome
+            usedMethod = 'Tesseract OCR (local fallback)'
+            await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribed via local Tesseract OCR`)
+          } else {
+            rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+              void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed via VLM`)
+            })
+            usedMethod = 'VLM (fallback)'
+          }
         }
       } else {
-        // ── FALLBACK: VLM providers (requires API keys) ──
-        await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with VLM...`)
-        rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
-          void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
-        })
-        usedMethod = 'VLM'
+        // ── FALLBACK 1: Local Tesseract OCR ──
+        const tessOutcome = runTesseractFallback(imageFiles)
+        if (tessOutcome && tessOutcome.some((n: { text: string }) => n.text.trim())) {
+          rawNarrations = tessOutcome
+          usedMethod = 'Tesseract OCR (local)'
+          await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribed ${imageFiles.length} ${modeLabel} with local Tesseract OCR`)
+        } else {
+          // ── FALLBACK 2: VLM providers (requires API keys) ──
+          await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with VLM...`)
+          rawNarrations = await generateImageNarrations(imageFiles, (done, total) => {
+            void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} ${frameKeyed ? 'panels' : 'images'} transcribed`)
+          })
+          usedMethod = 'VLM'
+        }
       }
 
       // FILTER CREDIT/AUTHOR/WEBSITE PANELS — these are non-story panels
