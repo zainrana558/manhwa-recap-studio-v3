@@ -74,7 +74,10 @@ except ImportError:  # pragma: no cover
 # no validation, so a crash mid-ffmpeg-write (or a corrupt/truncated
 # encode) could leave a broken file that a resumed run would treat as
 # already-complete and silently ship. See render_chapter/finalize_output.
-from production import video_qa, audio_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
+try:
+    from production import video_qa, audio_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
+except ImportError:
+    from pipeline.production import video_qa, audio_qa, atomic_promote, ResourceGuard, SQLiteStateStore, Stage, State, classify_retry  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
@@ -116,9 +119,9 @@ log = logging.getLogger("master_pipeline")
 class PipelineConfig:
     input_dir: Path
     output_path: Path
-    total_chapters: Optional[int]
-    bgm_path: Optional[Path]
-    work_dir: Path
+    total_chapters: Optional[int] = None
+    bgm_path: Optional[Path] = None
+    work_dir: Path = Path("./work")
     voice: str = "en-US-AndrewNeural"
     openai_model: str = "gpt-4o-mini"
     openai_api_key: Optional[str] = None
@@ -311,7 +314,11 @@ def _compose_canvas_from_source(panel_path: Path):
     original resolution (avoids expensive full-width resize)."""
     from PIL import Image
 
-    img = Image.open(panel_path).convert("RGB")
+    try:
+        img = Image.open(panel_path).convert("RGB")
+    except Exception as exc:
+        log.warning("Failed to open image %s (%s) — returning black canvas", panel_path, exc)
+        return Image.new("RGB", (CANVAS_W, CANVAS_H), (0, 0, 0))
     cw, ch = img.size
 
     if ch / cw > 1.5:
@@ -1423,53 +1430,57 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     total_blank_skipped = 0
 
     for panel_idx, panel_path in enumerate(chapter.panel_paths):
-        with Image.open(panel_path) as img:
-            img = img.convert("RGB")
-            w, h = img.size
-            gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        try:
+            with Image.open(panel_path) as img:
+                img = img.convert("RGB")
+                w, h = img.size
+                gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-            # Bubble-safe detection: gutter-aware scan for tall webtoon
-            # strips, YOLO/contour auto-detect for grid-style pages.
-            panels = _detect_panels_for_page(gray)
-            log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
+                # Bubble-safe detection: gutter-aware scan for tall webtoon
+                # strips, YOLO/contour auto-detect for grid-style pages.
+                panels = _detect_panels_for_page(gray)
+                log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
 
-            # Safety net: snap every panel's top/bottom edge to the nearest
-            # fully-clear row within a small window, so a box from ANY
-            # detector can never clip a bubble tail or a text line.
-            content_mask = _build_dilated_content_mask(gray)
+                # Safety net: snap every panel's top/bottom edge to the nearest
+                # fully-clear row within a small window, so a box from ANY
+                # detector can never clip a bubble tail or a text line.
+                content_mask = _build_dilated_content_mask(gray)
 
-            for (px, py, pw, ph) in panels:
-                if ph < 50 or pw < 50:
-                    continue
+                for (px, py, pw, ph) in panels:
+                    if ph < 50 or pw < 50:
+                        continue
 
-                safe_top = _snap_cut_to_safe_row(content_mask, py)
-                safe_bot = _snap_cut_to_safe_row(content_mask, py + ph)
-                if safe_bot - safe_top >= 50:
-                    py, ph = safe_top, safe_bot - safe_top
+                    safe_top = _snap_cut_to_safe_row(content_mask, py)
+                    safe_bot = _snap_cut_to_safe_row(content_mask, py + ph)
+                    if safe_bot - safe_top >= 50:
+                        py, ph = safe_top, safe_bot - safe_top
 
-                # Each detected panel = ONE frame. No sub-splitting.
-                # Tall panels are shown complete using cover-fit (fill the
-                # 16:9 canvas completely by cropping the excess sides).
-                # This means a tall character panel stays as ONE image —
-                # the character might appear smaller but the full panel is
-                # visible, not chopped into pieces.
-                crop = img.crop((px, py, px + pw, py + ph))
-                crop_arr = np.array(crop)
-                crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
+                    # Each detected panel = ONE frame. No sub-splitting.
+                    # Tall panels are shown complete using cover-fit (fill the
+                    # 16:9 canvas completely by cropping the excess sides).
+                    # This means a tall character panel stays as ONE image —
+                    # the character might appear smaller but the full panel is
+                    # visible, not chopped into pieces.
+                    crop = img.crop((px, py, px + pw, py + ph))
+                    crop_arr = np.array(crop)
+                    crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
 
-                # Skip blank panels
-                if _is_blank_crop(crop_gray):
-                    total_blank_skipped += 1
-                    log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
-                    continue
+                    # Skip blank panels
+                    if _is_blank_crop(crop_gray):
+                        total_blank_skipped += 1
+                        log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
+                        continue
 
-                # Composite onto 1920x1080 canvas with solid black background
-                from PIL import Image as PILImage
-                frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
-                fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                frame.save(fp, quality=92)
-                frame_data.append((fp, panel_idx))
-                frame_counter += 1
+                    # Composite onto 1920x1080 canvas with solid black background
+                    from PIL import Image as PILImage
+                    frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
+                    fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                    frame.save(fp, quality=92)
+                    frame_data.append((fp, panel_idx))
+                    frame_counter += 1
+        except Exception as exc:
+            log.warning("[%s] Skipping unreadable/corrupt image %s: %s", chapter.tag, panel_path.name, exc)
+            continue
 
     if total_blank_skipped > 0:
         log.info("[%s] skipped %d blank panel(s) during slicing", chapter.tag, total_blank_skipped)
