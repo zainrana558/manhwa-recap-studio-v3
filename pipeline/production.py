@@ -88,6 +88,20 @@ class ResourceGuard:
             self.state.record(job_id, stage, State.RETRYABLE, error_code='RESOURCE', error_message=reason, retry_category=RetryCategory.RESOURCE)
         return ResourceStatus(ok, du.free, ram, load, reason)
 
+    def wait_for_resources(self, path: Path, job_id: str='', stage: Stage|str=Stage.JOB, check_interval_sec: int=60, max_wait_sec: int=1800, logger: Any=None) -> ResourceStatus:
+        status = self.check(path, job_id, stage)
+        waited = 0
+        while not status.ok and waited < max_wait_sec:
+            msg = f"ResourceGuard threshold not met ({stage}): {status.reason}. Pausing {check_interval_sec}s for resources to recover (waited {waited}s/{max_wait_sec}s)..."
+            if logger and hasattr(logger, "warning"):
+                logger.warning(msg)
+            else:
+                print(msg)
+            time.sleep(check_interval_sec)
+            waited += check_interval_sec
+            status = self.check(path, job_id, stage)
+        return status
+
 def classify_retry(exc: Exception|str) -> RetryCategory:
     s=str(exc).lower()
     if 'timeout' in s or 'timed out' in s: return RetryCategory.TIMEOUT

@@ -1289,8 +1289,9 @@ async function processJob(jobId: string): Promise<void> {
     }
   }, 1000)
 
-  // Stream stdout/stderr line-by-line into JobLog.
+  // Stream stdout/stderr line-by-line into JobLog and collect ring buffer of stderr lines.
   const lineBuffers: { stdout: string; stderr: string } = { stdout: '', stderr: '' }
+  const stderrHistory: string[] = []
 
   child.stdout?.on('data', (chunk: Buffer) => {
     lineBuffers.stdout += chunk.toString('utf8')
@@ -1307,7 +1308,11 @@ async function processJob(jobId: string): Promise<void> {
     while ((idx = lineBuffers.stderr.indexOf('\n')) >= 0) {
       const line = lineBuffers.stderr.slice(0, idx).trim()
       lineBuffers.stderr = lineBuffers.stderr.slice(idx + 1)
-      if (line) void emitLog(jobId, 'warn', 'render', line)
+      if (line) {
+        stderrHistory.push(line)
+        if (stderrHistory.length > 100) stderrHistory.shift()
+        void emitLog(jobId, 'warn', 'render', line)
+      }
     }
   })
 
@@ -1327,7 +1332,10 @@ async function processJob(jobId: string): Promise<void> {
     await emitLog(jobId, 'info', 'render', lineBuffers.stdout.trim())
   }
   if (lineBuffers.stderr.trim()) {
-    await emitLog(jobId, 'warn', 'render', lineBuffers.stderr.trim())
+    const remainingLine = lineBuffers.stderr.trim()
+    stderrHistory.push(remainingLine)
+    if (stderrHistory.length > 100) stderrHistory.shift()
+    await emitLog(jobId, 'warn', 'render', remainingLine)
   }
 
   if (cancelledJobs.has(jobId)) {
@@ -1536,12 +1544,13 @@ async function processJob(jobId: string): Promise<void> {
     await emitStatus(jobId)
     console.log(`[job:${jobId}] done`)
   } else {
-    const err = `master_pipeline.py exited with code ${exitCode}`
+    const last50Stderr = stderrHistory.slice(-50).join('\n')
+    const err = `master_pipeline.py exited with code ${exitCode}:\n${last50Stderr || '(no stderr output captured)'}`
+    await emitLog(jobId, 'error', 'render', `Python process failure details:\n${last50Stderr || '(no stderr output captured)'}`)
     await db.job.update({
       where: { id: jobId },
-      data: { status: 'error', stage: 'render', error: err, message: err },
+      data: { status: 'error', stage: 'render', error: err.slice(0, 2000), message: `master_pipeline.py exited with code ${exitCode}` },
     })
-    await emitLog(jobId, 'error', 'render', err)
     io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: err })
     await emitStatus(jobId)
     console.error(`[job:${jobId}] failed: ${err}`)

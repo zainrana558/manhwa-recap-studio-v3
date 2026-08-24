@@ -1,6 +1,40 @@
 # Manhwa Recap Studio v3 — Development Worklog
 
 ---
+## Pipeline Hardening & Concat Fix Assessment
+
+**Cycle**: Concat Fix & Pipeline Self-Healing Hardening
+**Date**: 2025-08-20
+**Status**: Completed & Verified
+
+### Summary of Changes
+
+1. **Fixed Off-by-One Concat Duration Bug (`pipeline/master_pipeline.py`)**
+   - Removed trailing duplicate `file` entry without duration in `render_chapter()`.
+   - Updated `video_qa()` default tolerance to 5.0 seconds (override via `VIDEO_QA_TOLERANCE_SECONDS`).
+
+2. **Chapter Rendering Resilience & Fallbacks (`pipeline/master_pipeline.py`)**
+   - Implemented `render_chapter_with_retry()` with up to 2 retries on rendering QA failure.
+   - Added `generate_black_placeholder_chapter()` to substitute silent black video overlays ("Chapter X unavailable") when chapter render retries fail or when chapters are missing during `merge_chapters()`.
+
+3. **OCR & VLM Chain Absolute Robustness (`mini-services/paddleocr-service/main.py` & `mini-services/pipeline-service/lib.ts`)**
+   - PaddleOCR service initialization retries increased to 5 with exponential backoff up to 120s.
+   - Batch OCR service calls retried up to 3 times before falling back to VLM.
+   - Emergency local Tesseract CLI fallback (`runTesseractFallback`) added when all VLM providers fail or are unconfigured.
+   - Short TTL caching (5 minutes) implemented for failed OCR/VLM transcription attempts to prevent hammering broken services.
+   - VLM batch failures fill with placeholder text `"[transcription unavailable]"` without throwing or aborting.
+
+4. **Resource Guard Pause Mechanism (`pipeline/production.py` & `pipeline/master_pipeline.py`)**
+   - Added `ResourceGuard.wait_for_resources()` to sleep and re-check resource levels periodically when disk/RAM thresholds are passed, rather than failing immediately.
+
+5. **Subprocess Error Reporting (`pipeline/master_pipeline.py` & `mini-services/pipeline-service/index.ts`)**
+   - Detailed ffmpeg error output logging (full stderr + last 20 lines) in `run_ffmpeg()`.
+   - Ring buffer in Node orchestrator `index.ts` captures last 50 lines of stderr when Python pipeline process exits with code 1.
+
+6. **Unit Testing (`tests/test_concat_duration.py`)**
+   - Added automated test validating concat demuxer video duration against expected frame durations within QA tolerance.
+
+---
 ## Current Project Status Assessment
 
 **Cycle**: Round 11 (SiliconFlow VLM + Gemini fix)
