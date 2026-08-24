@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -620,6 +621,35 @@ def _tesseract_available() -> bool:
     return _tesseract_available._cached  # type: ignore
 
 
+def _preprocess_upscale(img: np.ndarray, scale: float = 1.5) -> np.ndarray:
+    """Scale up image to help OCR recognize small text fonts in webtoon panels."""
+    try:
+        h, w = img.shape[:2]
+        new_w, new_h = int(w * scale), int(h * scale)
+        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    except Exception:
+        return img
+
+
+def _preprocess_contrast(img: np.ndarray) -> np.ndarray:
+    """Apply CLAHE contrast enhancement to improve low-contrast panel text."""
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    except Exception:
+        return img
+
+
+def _preprocess_invert(img: np.ndarray) -> np.ndarray:
+    """Invert image colors to help OCR detect dark-background or inverted speech bubbles."""
+    try:
+        return 255 - img
+    except Exception:
+        return img
+
+
 def _run_tesseract_ocr(img):
     # type: (np.ndarray) -> Tuple[str, float]
     """Run the Tesseract CLI as an independent OCR candidate.
@@ -699,57 +729,80 @@ def _run_tesseract_ocr(img):
 
 def _ocr_with_cascade(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
-    """Run the primary PaddleOCR pass and, only when it comes back
+    """Run PaddleOCR pass (standard + preprocessing variants) and, if still
     UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
-
-    This is intentionally lazy (matches "the cascade is intentionally
-    lazy: easy panels consume one OCR pass; only difficult panels reach
-    later models") — Tesseract only runs for panels PaddleOCR couldn't
-    confidently read, not for every panel, to conserve CPU on the Oracle
-    free-tier instance.
-
-    Returns (text, confidence, region_count, status, quality_score,
-    candidates, selection_reason) — the same tuple shape every endpoint
-    below builds its OCRResult from.
     """
+    # Pass 1: Standard PaddleOCR
     regions = _run_ocr_on_image(img, options)
     merged_text, avg_conf, region_count = _merge_regions(regions)
     status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
 
     candidates = [{
         "text": merged_text, "confidence": avg_conf, "regions": region_count,
-        "provider": "paddleocr", "model": MODEL_NAME,
+        "provider": "paddleocr", "model": MODEL_NAME, "variant": "standard",
     }]
 
+    best_tuple = (merged_text, avg_conf, region_count, status, quality_score, candidates, reason)
+
     if status == "SUCCESS":
-        return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+        return best_tuple
 
-    tess_text, tess_conf = _run_tesseract_ocr(img)
-    if not tess_text:
-        # Tesseract found nothing either (or isn't installed) — keep the
-        # Paddle UNCERTAIN/FAILED result as-is; don't fabricate anything.
-        return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+    # Pass 2: PaddleOCR with preprocessing variants (upscale, contrast, invert)
+    preprocessing_passes = [
+        ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),
+        ("contrast_clahe", _preprocess_contrast),
+        ("color_inverted", _preprocess_invert),
+    ]
 
-    tess_regions = len(tess_text.split())
-    candidates.append({
-        "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
-        "provider": "tesseract", "model": "tesseract",
-    })
+    for variant_name, prep_fn in preprocessing_passes:
+        prep_img = prep_fn(img)
+        var_regions = _run_ocr_on_image(prep_img, options)
+        var_text, var_conf, var_count = _merge_regions(var_regions)
+        var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
 
-    # Never blindly majority-vote or prefer the newer candidate — score
-    # both and only switch if Tesseract is a genuinely better, trustworthy
-    # candidate. Do NOT hallucinate a merge between two disagreeing
-    # transcriptions; take one whole candidate or the other.
-    tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
-    if tess_status == "SUCCESS" and tess_quality > quality_score:
-        return (
-            tess_text, tess_conf, tess_regions, tess_status, tess_quality,
-            candidates, f"tesseract_fallback_beat_paddleocr:{tess_reason}",
-        )
+        candidates.append({
+            "text": var_text, "confidence": var_conf, "regions": var_count,
+            "provider": "paddleocr", "model": MODEL_NAME, "variant": variant_name,
+        })
 
-    # Neither candidate was confidently trustworthy — stay UNCERTAIN
-    # rather than accept a low-confidence guess from either provider.
-    return merged_text, avg_conf, region_count, status, quality_score, candidates, reason
+        if var_status == "SUCCESS" and var_quality > best_tuple[4]:
+            best_tuple = (
+                var_text, var_conf, var_count, var_status, var_quality,
+                candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
+            )
+            return best_tuple
+        elif var_quality > best_tuple[4]:
+            best_tuple = (
+                var_text, var_conf, var_count, var_status, var_quality,
+                candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
+            )
+
+    # Pass 3: Tesseract fallback with original & preprocessed images
+    tess_passes = [
+        ("standard", img),
+        ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
+        ("contrast_clahe", _preprocess_contrast),
+    ]
+
+    for tess_variant, t_img in tess_passes:
+        tess_text, tess_conf = _run_tesseract_ocr(t_img)
+        if not tess_text:
+            continue
+
+        tess_regions = len(tess_text.split())
+        candidates.append({
+            "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
+            "provider": "tesseract", "model": "tesseract", "variant": tess_variant,
+        })
+
+        tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
+        if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
+            return (
+                tess_text, tess_conf, tess_regions, tess_status, tess_quality,
+                candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
+            )
+
+    return best_tuple
 
 
 def _quality_status(text, confidence, regions):
