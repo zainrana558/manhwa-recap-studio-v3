@@ -76,7 +76,14 @@ def _init_ocr():
         delay = 10
         for attempt in range(1, MODEL_INIT_RETRIES + 1):
             try:
-                return PaddleOCR(ocr_version=ocr_version, lang="en")
+                # Optimized initialization with MKLDNN CPU acceleration and multi-threading
+                return PaddleOCR(
+                    ocr_version=ocr_version,
+                    lang="en",
+                    use_angle_cls=False,
+                    enable_mkldnn=True,
+                    cpu_threads=4,
+                )
             except Exception as exc:
                 last_exc = exc
                 if attempt < MODEL_INIT_RETRIES:
@@ -189,7 +196,7 @@ class OCRResult(BaseModel):
 class OCROptions(BaseModel):
     """Optional per-request OCR tuning parameters."""
     lang: str = Field(default="en", description="Language code")
-    use_angle_cls: bool = Field(default=True, description="Enable text orientation classification")
+    use_angle_cls: bool = Field(default=False, description="Enable text orientation classification")
     det_db_unclip_ratio: float = Field(
         default=1.8,
         ge=0.5,
@@ -660,10 +667,14 @@ def _run_tesseract_ocr(img):
 
     Supports pytesseract if available, falling back to the tesseract CLI if not.
     """
-    # 1. Guard against un-executed function reference or non-array/image types
+    # 1. Check if the image argument is callable before passing to PyTesseract
     if callable(img):
-        logger.error("[Tesseract] Received callable/function instead of image object; un-executed function passed!")
-        return "", 0.0
+        logger.warning("[Tesseract] Received callable/function image argument; calling function to resolve image object")
+        try:
+            img = img()
+        except Exception as exc:
+            logger.error("[Tesseract] Calling image function failed: %s", exc)
+            return "", 0.0
 
     try:
         if isinstance(img, Image.Image):
@@ -676,11 +687,17 @@ def _run_tesseract_ocr(img):
         logger.error("[Tesseract] Failed to convert image object to NumPy array: %s", conv_exc)
         return "", 0.0
 
+    # Ensure NumPy array inputs are converted to PIL Images (Image.fromarray())
+    try:
+        pil_img = Image.fromarray(img_array)
+    except Exception as exc:
+        logger.error("[Tesseract] Failed to convert NumPy array to PIL Image: %s", exc)
+        return "", 0.0
+
     # 2. Attempt pytesseract if installed
     try:
         import pytesseract
-        pil_img = Image.fromarray(img_array)
-        text = pytesseract.image_to_string(np.array(pil_img), lang="eng", config="--psm 6")
+        text = pytesseract.image_to_string(pil_img, lang="eng", config="--psm 6")
         if text and text.strip():
             return text.strip(), 0.80
     except ImportError:

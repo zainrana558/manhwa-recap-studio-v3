@@ -279,6 +279,57 @@ export function filterCreditPanels(
 // here — only pure symbol/punctuation bubbles qualify.
 const PUNCTUATION_ONLY_RE = /^[\s.,!?…\-–—~*'"()\[\]]+$/u
 
+const STANDARD_SFX_LIST = [
+  'BOOM', 'BANG', 'SWOOSH', 'RUMBLE', 'CRASH', 'CLACK', 'THUD', 'SLAM',
+  'SNAP', 'GASP', 'GULP', 'WHAM', 'SMASH', 'KABOOM', 'SZZZ', 'DRRIP',
+  'TAP', 'CLICK', 'CREAK', 'FLASH', 'SHICK', 'WHOOSH', 'SHHH', 'ROAR'
+]
+
+/**
+ * Preserve standard SFX while filtering out OCR non-ASCII / unprintable garbage
+ * and isolated 1-2 character non-word fragments.
+ */
+export function clean_ocr_text_with_sfx(text: string): string {
+  if (!text || !text.trim()) return ''
+
+  // 1. Strip non-ASCII / unprintable garbage characters except basic punctuation
+  let cleaned = text.replace(/[^\x20-\x7E]/g, '').trim()
+  if (!cleaned) return ''
+
+  // 2. Tokenize into words
+  const words = cleaned.split(/\s+/)
+  const validWords: string[] = []
+
+  for (const word of words) {
+    const rawAlpha = word.replace(/[^a-zA-Z0-9]/g, '')
+    const upperAlpha = rawAlpha.toUpperCase()
+
+    // Keep if it's a known standard SFX
+    if (STANDARD_SFX_LIST.includes(upperAlpha)) {
+      validWords.push(`*${upperAlpha}!*`)
+      continue
+    }
+
+    // Filter isolated 1-2 or 3-char non-word alphanumeric fragments (e.g. ll1, zq, xz)
+    if (rawAlpha.length <= 3 && /\d/.test(rawAlpha) && /[a-zA-Z]/.test(rawAlpha)) {
+      continue
+    }
+    if (rawAlpha.length <= 2) {
+      if (rawAlpha.length === 1 && !/^[aI1-9]$/i.test(rawAlpha)) {
+        continue
+      }
+      if (rawAlpha.length === 2 && !/^(in|on|at|to|no|go|do|me|my|he|we|so|us|it|is|if|or|of|am|an|by|up|be)$/i.test(rawAlpha)) {
+        continue
+      }
+    }
+
+    validWords.push(word)
+  }
+
+  const result = validWords.join(' ').trim()
+  return isJunkOnlyText(result) ? '' : result
+}
+
 export function isJunkOnlyText(text: string): boolean {
   if (!text || !text.trim()) return false
   return PUNCTUATION_ONLY_RE.test(text.trim())
@@ -1162,9 +1213,11 @@ export async function generateImageNarrationsOCR(
             uncertainWithRegions++
           }
 
-          if (text && status === 'SUCCESS') {
-            void setOcrCached(cacheKey, text, status)
-            void setVlmCached(vlmCacheKey(imgPath), text, status)
+          const cleanedText = clean_ocr_text_with_sfx(text)
+
+          if (cleanedText && status === 'SUCCESS') {
+            void setOcrCached(cacheKey, cleanedText, status)
+            void setVlmCached(vlmCacheKey(imgPath), cleanedText, status)
             successCount++
           } else {
             void setOcrCached(cacheKey, '', 'FAILED')
@@ -1172,7 +1225,7 @@ export async function generateImageNarrationsOCR(
             failureCount++
           }
 
-          results[i] = { image: path.basename(imgPath), text }
+          results[i] = { image: path.basename(imgPath), text: cleanedText }
           completedCount++
           singleSuccess = true
           break

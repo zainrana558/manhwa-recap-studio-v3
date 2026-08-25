@@ -27,7 +27,7 @@ echo ""
 echo "🔧 Checking pipeline dependencies..."
 
 PIPER_VOICE_DIR="$(pwd)/pipeline/voices"
-PIPER_VOICE_NAME="en_US-lessac-medium"
+PIPER_VOICE_NAME="en_US-ryan-high"
 PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
 
 # --- System packages: eSpeak-NG (TTS fallback) + Tesseract (OCR fallback) ---
@@ -103,7 +103,7 @@ fi
 if [ ! -f "$PIPER_VOICE_MODEL_PATH" ]; then
     echo "  Downloading Piper voice model ($PIPER_VOICE_NAME)..."
     mkdir -p "$PIPER_VOICE_DIR"
-    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high"
     if curl -fsSL -o "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx" \
         && curl -fsSL -o "$PIPER_VOICE_MODEL_PATH.json" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx.json"; then
         echo "  ✅ Piper voice model downloaded"
