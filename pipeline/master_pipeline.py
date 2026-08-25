@@ -503,6 +503,68 @@ def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
     return [(p[0], p[1], p[2], p[3]) for p in merged if (p[3] - p[1]) >= min_panel_h]
 
 
+def _check_bubble_union(mask, cut_y: int, img_shape: tuple) -> int:
+    """Bubble Union Check:
+    If a horizontal cut line intersects a content blob (speech bubble, text glyph, ascender, descender, or sound effect tail),
+    move the cut line below (or above) the entire speech bubble component to keep dialogue intact in a single frame.
+    """
+    h, w = img_shape[:2]
+    cut_y = max(0, min(h - 1, cut_y))
+    if not np.any(mask[cut_y, :] > 0):
+        return cut_y
+
+    # Label connected components directly on binary mask
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    intersected_bottoms = []
+    intersected_tops = []
+    for i in range(1, n_labels):
+        cy1 = stats[i, cv2.CC_STAT_TOP]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        cy2 = cy1 + ch
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 6:
+            continue
+        if cy1 <= cut_y < cy2:
+            intersected_bottoms.append(cy2)
+            intersected_tops.append(cy1)
+
+    if intersected_bottoms:
+        # Move cut line below the max bottom of intersected speech bubbles
+        target_y = max(intersected_bottoms) + 5
+        if target_y < h:
+            return target_y
+        # If moving below exceeds image height, move above the min top
+        target_y = max(0, min(intersected_tops) - 5)
+        return target_y
+
+    return cut_y
+
+
+def _apply_dynamic_padding(panel_box: tuple, mask, img_shape: tuple, padding_px: int = 30) -> tuple:
+    """Minimum Vertical Padding & Speech Bubble Protection:
+    When a panel slice contains text contours or speech bubbles near its top or bottom borders,
+    automatically expand the slice bounding box by 30 pixels vertically (clamped to image height).
+    """
+    x1, y1, w, h = panel_box
+    img_h, img_w = img_shape[:2]
+    y2 = y1 + h
+
+    # Check top boundary region (y1 to y1 + padding_px)
+    top_region = mask[max(0, y1):min(img_h, y1 + padding_px), max(0, x1):min(img_w, x1 + w)]
+    # Check bottom boundary region (y2 - padding_px to y2)
+    bot_region = mask[max(0, y2 - padding_px):min(img_h, y2), max(0, x1):min(img_w, x1 + w)]
+
+    new_y1 = y1
+    new_y2 = y2
+
+    if np.any(top_region > 0):
+        new_y1 = max(0, y1 - padding_px)
+    if np.any(bot_region > 0):
+        new_y2 = min(img_h, y2 + padding_px)
+
+    return (x1, new_y1, w, new_y2 - new_y1)
+
+
 def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
     """Nudge a candidate horizontal edge to the nearest row that is
     completely clear of content across the full width, within +/- window
@@ -513,10 +575,14 @@ def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
     keep the original box than snap arbitrarily far away)."""
     h = mask.shape[0]
     y = max(0, min(h - 1, y))
+
+    # Perform Bubble Union check if cut intersects speech bubble
+    y = _check_bubble_union(mask, y, (h, mask.shape[1]))
+
     if not np.any(mask[y, :] > 0):
         return y
     for d in range(1, window + 1):
-        for cand in (y - d, y + d):
+        for cand in (y + d, y - d):  # Prefer moving down below text
             if 0 <= cand < h and not np.any(mask[cand, :] > 0):
                 return cand
     return y
@@ -1061,24 +1127,118 @@ def _is_lines_only_crop(arr_gray) -> bool:
     return has_lines and not has_text and not has_art
 
 
+def _calc_image_entropy(arr_gray) -> float:
+    """Calculate Shannon entropy of a grayscale panel slice (0 to 8)."""
+    if arr_gray is None or arr_gray.size == 0:
+        return 0.0
+    hist, _ = np.histogram(arr_gray, bins=256, range=(0, 256))
+    prob = hist / float(arr_gray.size)
+    prob = prob[prob > 0]
+    return float(-np.sum(prob * np.log2(prob)))
+
+
+def _is_featureless_vfx(arr_gray) -> bool:
+    """Check if a panel slice candidate is a featureless background, visual effect,
+    gradient, speed line, ice shard, or light aura region lacking character faces,
+    dialogue bubbles, or structural story focal points.
+
+    Detection criteria:
+    - Structural contour density (Canny edges)
+    - Presence of text glyphs (small bounded edge components) or distinct story focal points
+    """
+    if arr_gray is None or arr_gray.size == 0:
+        return True
+
+    h, w = arr_gray.shape
+    if h < 20 or w < 20:
+        return True
+
+    edges = cv2.Canny(arr_gray, 50, 150)
+    edge_density = float(np.count_nonzero(edges)) / float(arr_gray.size)
+
+    # Analyze connected components of Canny edge contours
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+
+    text_components = 0
+    substantive_contours = 0
+
+    for i in range(1, n_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        if area < 10:
+            continue
+        # Text characters in edge domain are small bounded glyph components (e.g. 5 <= cw, ch <= 60)
+        if 5 <= cw <= 60 and 5 <= ch <= 60 and area >= 15:
+            text_components += 1
+        elif area > 800 and (cw > 80 or ch > 80):
+            substantive_contours += 1
+
+    # Featureless visual effects (ice shards, speed lines, light aura) have < 4 text glyphs and low substantive contours
+    if text_components < 4 and substantive_contours == 0:
+        return True
+    if text_components < 4 and edge_density < 0.02:
+        return True
+
+    return False
+
+
 def _should_skip_panel(arr_gray) -> bool:
     """Determine if a panel should be skipped (not included in the video).
 
     A panel is skipped if:
     1. It's blank (all-white, uniform, no content) — _is_blank_crop
     2. It contains ONLY lines/borders (no text, no art) — _is_lines_only_crop
-
-    Panels that ARE kept:
-    - Panels with text (speech bubbles, captions, narration boxes)
-    - Panels with artwork (characters, backgrounds, action scenes)
-    - Panels with both text and art
-    - Panels with text + border lines (the borders don't disqualify them)
+    3. It is a featureless visual effect frame (speed lines, ice shards, light aura) — _is_featureless_vfx
     """
     if _is_blank_crop(arr_gray):
         return True
     if _is_lines_only_crop(arr_gray):
         return True
+    if _is_featureless_vfx(arr_gray):
+        return True
     return False
+
+
+def _clean_panel_boundary_edges(arr_rgb, arr_gray, max_scan_px: int = 15):
+    """Clean panel boundary edge fragments (dual-panel overlap bug fix).
+
+    Enhances horizontal gutter detection by looking for continuous black/white pixel rows
+    or distinct edge color transitions between adjacent panels. Trims stray top/bottom edge fragments
+    from adjacent panels (such as fire panel top bleed) before finalizing slice output.
+    """
+    h, w = arr_gray.shape
+    if h < 30 or w < 30:
+        return arr_rgb, arr_gray
+
+    # Scan top rows for stray edge fragments from previous panel
+    top_trim = 0
+    for y in range(min(max_scan_px, h // 4)):
+        row = arr_gray[y, :]
+        mean_v = float(np.mean(row))
+        # Continuous black border row (<10) or white gutter row (>245)
+        if mean_v > 245 or mean_v < 10:
+            top_trim = y + 1
+        else:
+            break
+
+    # Scan bottom rows for stray edge fragments from next panel
+    bot_trim = h
+    for y in range(h - 1, max(h - max_scan_px - 1, h - h // 4), -1):
+        row = arr_gray[y, :]
+        mean_v = float(np.mean(row))
+        if mean_v > 245 or mean_v < 10:
+            bot_trim = y
+        else:
+            break
+
+    if top_trim > 0 or bot_trim < h:
+        if (bot_trim - top_trim) >= 20:
+            arr_rgb = arr_rgb[top_trim:bot_trim, :]
+            arr_gray = arr_gray[top_trim:bot_trim, :]
+
+    return arr_rgb, arr_gray
 
 
 def _trim_white_borders(arr_gray, arr_rgb, margin: int = 2):
@@ -1088,10 +1248,10 @@ def _trim_white_borders(arr_gray, arr_rgb, margin: int = 2):
     nearly white (mean > 240, std < 10). Returns (trimmed_rgb, trimmed_gray)
     or the original arrays if no trimming was needed. Always keeps at least
     `margin` pixels of border so we don't clip artwork.
-
-    This makes panels fill the frame better (no wasted white space around
-    the artwork) and improves the VLM's ability to read text.
+    Also applies edge fragment cleaning (_clean_panel_boundary_edges).
     """
+    arr_rgb, arr_gray = _clean_panel_boundary_edges(arr_rgb, arr_gray)
+
     h, w = arr_gray.shape
     if h < 20 or w < 20:
         return arr_rgb, arr_gray
@@ -1446,6 +1606,8 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 # detector can never clip a bubble tail or a text line.
                 content_mask = _build_dilated_content_mask(gray)
 
+                # Filter and merge featureless/VFX action frames into preceding/succeeding panel slices
+                merged_panel_boxes = []
                 for (px, py, pw, ph) in panels:
                     if ph < 50 or pw < 50:
                         continue
@@ -1455,29 +1617,67 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     if safe_bot - safe_top >= 50:
                         py, ph = safe_top, safe_bot - safe_top
 
-                    # Each detected panel = ONE frame. No sub-splitting.
-                    # Tall panels are shown complete using cover-fit (fill the
-                    # 16:9 canvas completely by cropping the excess sides).
-                    # This means a tall character panel stays as ONE image —
-                    # the character might appear smaller but the full panel is
-                    # visible, not chopped into pieces.
+                    # Apply dynamic 30px vertical padding & speech bubble protection
+                    px, py, pw, ph = _apply_dynamic_padding((px, py, pw, ph), content_mask, (h, w), padding_px=30)
+
+                    crop_candidate = img.crop((px, py, px + pw, py + ph))
+                    crop_candidate_gray = cv2.cvtColor(np.array(crop_candidate), cv2.COLOR_RGB2GRAY)
+
+                    if _is_blank_crop(crop_candidate_gray) or _is_lines_only_crop(crop_candidate_gray):
+                        total_blank_skipped += 1
+                        continue
+
+                    # Featureless / VFX merging rule: merge into preceding panel box if present, else succeeding
+                    if _is_featureless_vfx(crop_candidate_gray):
+                        if merged_panel_boxes:
+                            prev_x, prev_y, prev_w, prev_h = merged_panel_boxes[-1]
+                            new_y1 = min(prev_y, py)
+                            new_y2 = max(prev_y + prev_h, py + ph)
+                            new_x1 = min(prev_x, px)
+                            new_x2 = max(prev_x + prev_w, px + pw)
+                            merged_panel_boxes[-1] = (new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1)
+                        else:
+                            merged_panel_boxes.append((px, py, pw, ph))
+                    else:
+                        if merged_panel_boxes and _is_featureless_vfx(
+                            cv2.cvtColor(np.array(img.crop((merged_panel_boxes[-1][0], merged_panel_boxes[-1][1], merged_panel_boxes[-1][0] + merged_panel_boxes[-1][2], merged_panel_boxes[-1][1] + merged_panel_boxes[-1][3]))), cv2.COLOR_RGB2GRAY)
+                        ):
+                            prev_x, prev_y, prev_w, prev_h = merged_panel_boxes.pop()
+                            new_y1 = min(prev_y, py)
+                            new_y2 = max(prev_y + prev_h, py + ph)
+                            new_x1 = min(prev_x, px)
+                            new_x2 = max(prev_x + prev_w, px + pw)
+                            merged_panel_boxes.append((new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1))
+                        else:
+                            merged_panel_boxes.append((px, py, pw, ph))
+
+                for (px, py, pw, ph) in merged_panel_boxes:
                     crop = img.crop((px, py, px + pw, py + ph))
                     crop_arr = np.array(crop)
                     crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
 
-                    # Skip blank panels
                     if _is_blank_crop(crop_gray):
                         total_blank_skipped += 1
                         log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
                         continue
 
-                    # Composite onto 1920x1080 canvas with solid black background
-                    from PIL import Image as PILImage
-                    frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
-                    fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                    frame.save(fp, quality=92)
-                    frame_data.append((fp, panel_idx))
-                    frame_counter += 1
+                    # Check for tall rectangular system/quest UI card aspect ratio exceeding 16:9 vertical bounds (aspect ratio height/width > 1.8)
+                    cw, ch = crop.size
+                    if (ch / max(1, cw)) > 1.8:
+                        from PIL import Image as PILImage
+                        scroll_frames = _generate_ui_card_scroll_frames(crop, num_scroll_frames=4)
+                        for s_frame in scroll_frames:
+                            fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                            s_frame.save(fp, quality=92)
+                            frame_data.append((fp, panel_idx))
+                            frame_counter += 1
+                    else:
+                        from PIL import Image as PILImage
+                        frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
+                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                        frame.save(fp, quality=92)
+                        frame_data.append((fp, panel_idx))
+                        frame_counter += 1
         except Exception as exc:
             log.warning("[%s] Skipping unreadable/corrupt image %s: %s", chapter.tag, panel_path.name, exc)
             continue
@@ -1492,6 +1692,36 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     log.info("[%s] sliced %d source pages into %d frames (contour-based detection)",
              chapter.tag, len(chapter.panel_paths), len(frame_data))
     return frame_data
+
+
+def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["Image.Image"]:
+    """Generate a sequence of linear vertical scroll sub-frames for tall rectangular system/quest UI cards.
+    Maintains full resolution width and generates vertical panning steps down the UI card rather than squishing or cropping.
+    """
+    from PIL import Image
+
+    cw, ch = crop.size
+    # Visible window height in source space to match 16:9 ratio at full width cw
+    window_h = int(cw * CANVAS_H / CANVAS_W)
+    if window_h >= ch:
+        return [_compose_canvas(crop, None)]
+
+    scroll_frames = []
+    max_top = ch - window_h
+    step = max_top / max(1, num_scroll_frames - 1)
+
+    for i in range(num_scroll_frames):
+        top = int(round(i * step))
+        bot = min(ch, top + window_h)
+        sub_crop = crop.crop((0, top, cw, bot))
+
+        # Scale sub_crop to 1920x1080 canvas preserving aspect ratio
+        canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (0, 0, 0))
+        fg = sub_crop.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+        canvas.paste(fg, (0, 0))
+        scroll_frames.append(canvas)
+
+    return scroll_frames
 
 
 def _compose_canvas(crop, ImageFilter):
