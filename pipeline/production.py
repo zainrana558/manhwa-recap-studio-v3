@@ -213,5 +213,73 @@ def video_qa(path: Path, audio_expected: bool=True, expected_duration: Optional[
         return QAResult(False, f'ffprobe_video_failed:{exc}')
 
 
+KNOWN_SFX = {
+    "BOOM", "BANG", "SWOOSH", "RUMBLE", "CRASH", "CLACK", "THUD", "SLAP",
+    "WHAM", "BAM", "CLANG", "SMASH", "GASP", "UGH", "AHH", "OHH", "WHOOSH",
+    "SNAP", "CRACK", "POP", "CLICK", "TAP", "ZAP", "POOF", "BLAST", "SCREECH",
+    "ROAR", "GROWL", "HISS", "GRUNT", "SIGH", "RATTLE", "RUSTLE", "SQUEAK",
+}
+
+def clean_ocr_text_with_sfx(text: str) -> str:
+    """Sanitize OCR text output for narration.
+
+    - Strips non-ASCII / unprintable garbage characters.
+    - Removes isolated non-word fragments and random 1-2 char letter clusters (e.g. "xz", "ll1").
+    - Preserves standard sound effects (e.g. BOOM, BANG, SWOOSH, RUMBLE, CRASH, CLACK)
+      and standard English words.
+    - Normalizes recognized SFX words into clean readable text.
+    """
+    if not text:
+        return ""
+
+    # Strip non-ASCII / unprintable characters (keep standard ASCII printable range 32-126)
+    ascii_clean = "".join(ch for ch in text if 32 <= ord(ch) <= 126)
+
+    # Normalize whitespace
+    words = ascii_clean.split()
+    cleaned_words = []
+
+    for word in words:
+        # Separate trailing/leading punctuation for inspection
+        match = re.match(r"^([^\w]*)([\w]+)([^\w]*)$", word)
+        if not match:
+            # Contains mixed characters or symbols only — skip isolated single non-word symbols
+            if len(word) > 1 and any(c.isalnum() for c in word):
+                cleaned_words.append(word)
+            continue
+
+        prefix, core, suffix = match.groups()
+        core_upper = core.upper()
+
+        # Check if core is a recognized SFX word
+        if core_upper in KNOWN_SFX:
+            # Preserve & normalize SFX word (e.g. capitalized standard word)
+            normalized_core = core_upper if core.isupper() else core.capitalize()
+            cleaned_words.append(f"{prefix}{normalized_core}{suffix}")
+            continue
+
+        # Filter out obvious 1-2 character random non-word fragments (e.g., "xz", "ll1", "q1")
+        # Allowed 1-2 char standard words: I, a, in, on, at, to, do, go, he, me, my, no, so, up, us, is, it, if, am, an, as, be, by, we, or, of
+        if len(core) <= 2:
+            lower_core = core.lower()
+            valid_short_words = {
+                "i", "a", "in", "on", "at", "to", "do", "go", "he", "me", "my",
+                "no", "so", "up", "us", "is", "it", "if", "am", "an", "as", "be",
+                "by", "we", "or", "of", "ok", "oh", "ah", "ha", "hi", "ho", "um",
+            }
+            if lower_core not in valid_short_words and not core.isdigit():
+                continue
+
+        # Filter out clusters containing numbers mixed with letters unless digits-only or standard
+        if re.search(r"[a-zA-Z]", core) and re.search(r"\d", core):
+            continue
+
+        cleaned_words.append(word)
+
+    return " ".join(cleaned_words).strip()
+
+
 def ocr_text_for_narration(result: OCRResult) -> str:
-    return result.text.strip() if result.status == State.COMPLETE or str(result.status) == 'SUCCESS' else ''
+    if result.status == State.COMPLETE or str(result.status) == 'SUCCESS':
+        return clean_ocr_text_with_sfx(result.text)
+    return ''

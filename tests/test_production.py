@@ -48,3 +48,32 @@ def test_resource_guard_persists_resource_state(tmp_path: Path):
     assert not status.ok
     row = st.get('job1', Stage.VIDEO_RENDER)
     assert row and row['error_code'] == 'RESOURCE'
+
+
+def test_ocr_text_for_narration():
+    res = OCRResult(text=" Hello ", status=State.COMPLETE)
+    assert ocr_text_for_narration(res) == "Hello"
+    res_failed = OCRResult(text=" Hello ", status=State.FAILED)
+    assert ocr_text_for_narration(res_failed) == ""
+
+
+def test_clean_ocr_text_with_sfx():
+    # 1. Non-ASCII / unprintable stripping
+    dirty = "Hello \x00World\x07! \u200bBOOM!"
+    cleaned = clean_ocr_text_with_sfx(dirty)
+    assert "BOOM!" in cleaned
+    assert "\x00" not in cleaned
+
+    # 2. SFX preservation & normalization
+    sfx_text = "The hero strikes xz ll1 BOOM!! BANG swoosh"
+    cleaned_sfx = clean_ocr_text_with_sfx(sfx_text)
+    assert "xz" not in cleaned_sfx
+    assert "ll1" not in cleaned_sfx
+    assert "BOOM!!" in cleaned_sfx
+    assert "BANG" in cleaned_sfx
+    assert "Swoosh" in cleaned_sfx
+
+    # 3. 1-2 char fragment filtering
+    fragments = "I am a warrior xz q1 q2 to the end"
+    cleaned_frag = clean_ocr_text_with_sfx(fragments)
+    assert cleaned_frag == "I am a warrior to the end"

@@ -76,7 +76,13 @@ def _init_ocr():
         delay = 10
         for attempt in range(1, MODEL_INIT_RETRIES + 1):
             try:
-                return PaddleOCR(ocr_version=ocr_version, lang="en")
+                return PaddleOCR(
+                    ocr_version=ocr_version,
+                    lang="en",
+                    use_angle_cls=False,
+                    cpu_threads=4,
+                    enable_mkldnn=True,
+                )
             except Exception as exc:
                 last_exc = exc
                 if attempt < MODEL_INIT_RETRIES:
@@ -189,7 +195,7 @@ class OCRResult(BaseModel):
 class OCROptions(BaseModel):
     """Optional per-request OCR tuning parameters."""
     lang: str = Field(default="en", description="Language code")
-    use_angle_cls: bool = Field(default=True, description="Enable text orientation classification")
+    use_angle_cls: bool = Field(default=False, description="Enable text orientation classification")
     det_db_unclip_ratio: float = Field(
         default=1.8,
         ge=0.5,
@@ -654,7 +660,7 @@ def _run_tesseract_ocr(img):
     # type: (Any) -> Tuple[str, float]
     """Run Tesseract as an independent OCR candidate.
 
-    Ensures the image is explicitly converted to a valid NumPy array (`np.array(image)`),
+    Ensures the image is explicitly converted to a valid NumPy array and PIL Image,
     preventing `'function' object has no attribute '__array_interface__'` errors if
     an un-executed function reference or PIL Image/other object is passed.
 
@@ -662,25 +668,33 @@ def _run_tesseract_ocr(img):
     """
     # 1. Guard against un-executed function reference or non-array/image types
     if callable(img):
-        logger.error("[Tesseract] Received callable/function instead of image object; un-executed function passed!")
+        try:
+            img = img()
+        except Exception as call_exc:
+            logger.error("[Tesseract] Failed to execute callable image argument: %s", call_exc)
+            return "", 0.0
+
+    if img is None:
         return "", 0.0
 
     try:
-        if isinstance(img, Image.Image):
-            img_array = np.array(img)
-        elif hasattr(img, "__array_interface__") or isinstance(img, np.ndarray):
+        if isinstance(img, np.ndarray):
+            pil_img = Image.fromarray(img)
+            img_array = img
+        elif isinstance(img, Image.Image):
+            pil_img = img
             img_array = np.array(img)
         else:
             img_array = np.array(img)
+            pil_img = Image.fromarray(img_array)
     except Exception as conv_exc:
-        logger.error("[Tesseract] Failed to convert image object to NumPy array: %s", conv_exc)
+        logger.error("[Tesseract] Failed to convert image object to PIL Image / NumPy array: %s", conv_exc)
         return "", 0.0
 
     # 2. Attempt pytesseract if installed
     try:
         import pytesseract
-        pil_img = Image.fromarray(img_array)
-        text = pytesseract.image_to_string(np.array(pil_img), lang="eng", config="--psm 6")
+        text = pytesseract.image_to_string(pil_img, lang="eng", config="--psm 6")
         if text and text.strip():
             return text.strip(), 0.80
     except ImportError:
@@ -695,7 +709,7 @@ def _run_tesseract_ocr(img):
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
-        Image.fromarray(img_array).save(tmp_path)
+        pil_img.save(tmp_path)
         result = subprocess.run(
             ["tesseract", tmp_path, "stdout", "--psm", "6", "tsv"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
