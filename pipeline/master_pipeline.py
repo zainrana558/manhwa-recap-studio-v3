@@ -1874,26 +1874,45 @@ def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
 
 def _synthesize_with_piper(text: str, out_wav: Path) -> None:
     piper = shutil.which("piper")
-    model = os.environ.get("PIPER_VOICE_MODEL")
-    if not piper or not model:
-        raise RuntimeError("piper binary/model unavailable")
+    model = os.environ.get("PIPER_VOICE_MODEL", "en_US-ryan-high.onnx")
+    if not piper:
+        raise RuntimeError("piper binary unavailable")
+    # If model is a relative path or filename, let piper resolve it unless explicitly missing as an absolute path
+    if Path(model).is_absolute() and not Path(model).exists():
+        raise RuntimeError(f"piper voice model unavailable: {model}")
     with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
         _out, err = proc.communicate(text, timeout=120)
         if proc.returncode != 0:
             raise RuntimeError(f"piper failed: {err[-200:]}")
 
 
+def _srt_to_vtt(srt_content: str) -> str:
+    """Convert SRT subtitle content to WebVTT format."""
+    lines = ["WEBVTT", ""]
+    for line in srt_content.splitlines():
+        # Convert comma to dot in timestamps: 00:00:01,234 -> 00:00:01.234
+        if "-->" in line:
+            lines.append(line.replace(",", "."))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
-    """Generate atomic segment audio. Production never uses edge-tts or network TTS."""
+    """Generate atomic segment audio with Edge-TTS (primary), Piper ONNX (fallback), eSpeak NG (tertiary fallback).
+    Also exports matching .vtt / .srt timing markers alongside Edge-TTS audio outputs for caption syncing.
+    """
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
     final_path = seg_audio_dir / f"{tag}.wav"
     text = text.strip()
     if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
         return final_path, False
+
     final_path.unlink(missing_ok=True)
     tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
     tmp_path.unlink(missing_ok=True)
+
     if not text:
         _generate_silence(tmp_path, SILENT_FRAME_DURATION)
         if not _audio_qa(tmp_path, allow_silence=True):
@@ -1901,34 +1920,35 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
             raise RuntimeError(f"silent audio QA failed for {tag}")
         os.replace(tmp_path, final_path)
         return final_path, False
+
     failures = []
-    if getattr(cfg, "production_mode", False):
-        for provider in ("piper", "piper", "espeak"):
-            tmp_path.unlink(missing_ok=True)
-            try:
-                if provider == "piper":
-                    _synthesize_with_piper(text, tmp_path)
-                else:
-                    _synthesize_with_espeak(text, tmp_path)
-                if not _audio_qa(tmp_path, allow_silence=False):
-                    raise RuntimeError(f"{provider} output failed audio QA")
-                os.replace(tmp_path, final_path)
-                return final_path, False
-            except Exception as e:
-                failures.append(f"{provider}: {e}")
-        tmp_path.unlink(missing_ok=True)
-        raise RuntimeError("Production TTS failed; no silent substitution: " + " | ".join(failures))
 
     import asyncio
     import edge_tts
+
+    voice = cfg.voice or "en-US-ChristopherNeural"
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
-    async def _run():
-        communicate = edge_tts.Communicate(text, cfg.voice)
-        await communicate.save(str(raw_path))
+    srt_path = seg_audio_dir / f"{tag}.srt"
+    vtt_path = seg_audio_dir / f"{tag}.vtt"
+
+    async def _run_edge_tts():
+        communicate = edge_tts.Communicate(text, voice, rate="+5%")
+        submaker = edge_tts.SubMaker()
+        with open(raw_path, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                    submaker.feed(chunk)
+        srt_text = submaker.get_srt()
+        if srt_text:
+            srt_path.write_text(srt_text, encoding="utf-8")
+            vtt_path.write_text(_srt_to_vtt(srt_text), encoding="utf-8")
+
     try:
-        asyncio.run(_run())
+        asyncio.run(_run_edge_tts())
         if not raw_path.exists() or raw_path.stat().st_size < 100:
-            raise RuntimeError("edge-tts produced an empty audio file")
+            raise RuntimeError("edge-tts produced empty or invalid audio file")
         raw_dur = get_audio_duration(raw_path)
         fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
         seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
@@ -1938,12 +1958,41 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         os.replace(tmp_path, final_path)
         return final_path, False
     except Exception as e:
-        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence in legacy mode", chapter.tag, tag, e)
-        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
-        os.replace(tmp_path, final_path)
-        return final_path, True
+        failures.append(f"edge-tts: {e}")
+        log.warning("[%s] edge-tts failed for segment %s (%s) — attempting Piper ONNX fallback", chapter.tag, tag, e)
     finally:
         raw_path.unlink(missing_ok=True)
+
+    # Fallback 1: Piper ONNX
+    tmp_path.unlink(missing_ok=True)
+    try:
+        _synthesize_with_piper(text, tmp_path)
+        if _audio_qa(tmp_path, allow_silence=False):
+            os.replace(tmp_path, final_path)
+            log.info("[%s] Piper ONNX fallback succeeded for segment %s", chapter.tag, tag)
+            return final_path, False
+        raise RuntimeError("piper output failed audio QA")
+    except Exception as e:
+        failures.append(f"piper: {e}")
+        log.warning("[%s] Piper ONNX fallback failed for segment %s (%s) — attempting eSpeak NG fallback", chapter.tag, tag, e)
+
+    # Fallback 2: eSpeak NG
+    tmp_path.unlink(missing_ok=True)
+    try:
+        _synthesize_with_espeak(text, tmp_path)
+        if _audio_qa(tmp_path, allow_silence=False):
+            os.replace(tmp_path, final_path)
+            log.info("[%s] eSpeak NG fallback succeeded for segment %s", chapter.tag, tag)
+            return final_path, False
+        raise RuntimeError("espeak output failed audio QA")
+    except Exception as e:
+        failures.append(f"espeak: {e}")
+        log.warning("[%s] All TTS engines failed for segment %s (%s) — using silence fallback", chapter.tag, tag, " | ".join(failures))
+
+    # Ultimate fallback in legacy mode: generate silence
+    _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+    os.replace(tmp_path, final_path)
+    return final_path, True
 
 def build_chapter_audio_track(
     cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path],
@@ -2018,13 +2067,13 @@ def build_chapter_audio_track(
     # into render_chapter's video mux.
     tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
     tmp_path.unlink(missing_ok=True)
-    af = f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11"
+    af = "loudnorm=I=-16:TP=-1.5:LRA=11"
     try:
         run_ffmpeg(
             [
                 "ffmpeg", "-y", "-i", str(raw_path),
                 "-af", af,
-                "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "1",
+                "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "2",
                 "-f", "mp3",
                 str(tmp_path),
             ]
@@ -2035,7 +2084,7 @@ def build_chapter_audio_track(
             chapter.tag, e,
         )
         tmp_path.unlink(missing_ok=True)
-        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-f", "mp3", str(tmp_path)])
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2", "-f", "mp3", str(tmp_path)])
 
     qa = audio_qa(tmp_path, narration_expected=narration_expected)
     if not qa.ok:
