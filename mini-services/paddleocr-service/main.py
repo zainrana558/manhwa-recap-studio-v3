@@ -79,7 +79,9 @@ def _init_ocr():
                 return PaddleOCR(
                     ocr_version=ocr_version,
                     lang="en",
-                    use_angle_cls=False,
+                    use_angle_cls=True,
+                    det_db_thresh=0.3,
+                    det_limit_side_len=1216,
                     cpu_threads=4,
                     enable_mkldnn=True,
                 )
@@ -508,6 +510,73 @@ def _ensure_list(x):
         return [x]
 
 
+def parse_ocr_results(result):
+    """Refactored universal OCRResult parser.
+
+    Seamlessly handles both PaddleOCR 3.x dataclasses/objects/dicts (OCRResult)
+    and legacy tuple/list structures.
+    """
+    extracted_lines = []
+    if not result:
+        return extracted_lines
+
+    # Convert generator to list if necessary
+    if not isinstance(result, (list, tuple)):
+        try:
+            result = list(result)
+        except Exception:
+            pass
+
+    for item in result:
+        if item is None:
+            continue
+
+        # Handle PaddleOCR 3.x OCRResult object attributes or dict-like objects
+        has_attr_rec = hasattr(item, 'rec_texts') and hasattr(item, 'rec_scores')
+        has_key_rec = hasattr(item, 'keys') and 'rec_texts' in item and 'rec_scores' in item
+
+        if has_attr_rec or has_key_rec:
+            if has_attr_rec:
+                texts = getattr(item, 'rec_texts', [])
+                scores = getattr(item, 'rec_scores', [])
+                boxes = getattr(item, 'rec_boxes', getattr(item, 'rec_polys', []))
+            else:
+                texts = item.get('rec_texts', [])
+                scores = item.get('rec_scores', [])
+                boxes = item.get('rec_boxes', item.get('rec_polys', []))
+
+            texts = _ensure_list(texts)
+            scores = _ensure_list(scores)
+            boxes = _ensure_list(boxes)
+
+            for text, score, box in zip(texts, scores, boxes):
+                box_val = box.tolist() if hasattr(box, 'tolist') else box
+                extracted_lines.append({
+                    "text": str(text),
+                    "confidence": float(score),
+                    "box": box_val
+                })
+
+        # Legacy tuple/list fallback: [[[box], (text, score)]]
+        elif isinstance(item, (list, tuple)):
+            for line in item:
+                if isinstance(line, (list, tuple)) and len(line) >= 2:
+                    box = line[0]
+                    text_info = line[1]
+                    if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                        text, score = text_info[0], text_info[1]
+                    else:
+                        text, score = text_info, 0.0
+                    box_val = box.tolist() if hasattr(box, 'tolist') else box
+                    extracted_lines.append({
+                        "text": str(text),
+                        "confidence": float(score),
+                        "box": box_val
+                    })
+
+    return extracted_lines
+
+
 def _run_ocr_on_image(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
@@ -521,42 +590,12 @@ def _run_ocr_on_image(img, options=None):
 
     opts = options or OCROptions()
 
-    # --- CRITICAL: disable document preprocessing for manga/manhwa panels ---
-    # PaddleOCR 3.x's predict() runs a document-orientation classifier and a
-    # document-unwarping model by default (use_doc_orientation_classify=True,
-    # use_doc_unwarping=True at the pipeline level). Those models are trained
-    # for photographed/scanned PAPER documents. Run against a stylized comic
-    # panel, doc-unwarping in particular can warp/distort the image before
-    # detection ever runs, causing the detector to find zero text regions —
-    # OCR "succeeds" (no exception) but silently returns empty text for every
-    # panel. This was very likely the cause of empty transcriptions + silent
-    # output video. Explicitly disabling both restores normal detection.
-    predict_kwargs = dict(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=opts.use_angle_cls,
-        text_det_unclip_ratio=opts.det_db_unclip_ratio,
-        text_det_limit_side_len=opts.det_limit_side_len,
-        text_det_db_thresh=opts.det_db_thresh,
-        text_det_db_box_thresh=opts.det_db_box_thresh,
-    )
-
     try:
-        # PaddleOCR v3.7+ uses predict(); older versions use ocr()
-        raw_result = ocr.predict(img, **predict_kwargs)
-    except TypeError as exc:
-        # predict() exists but rejected one of our kwargs (older/newer API
-        # drift) — retry without the extra kwargs before falling back to the
-        # legacy ocr() method entirely.
-        logger.warning("predict() kwarg mismatch (%s) — retrying without extra kwargs", exc)
-        try:
+        # Call predict() or ocr() without invalid keyword arguments to prevent kwarg mismatch warnings
+        if hasattr(ocr, "predict") and callable(getattr(ocr, "predict")):
             raw_result = ocr.predict(img)
-        except Exception:
-            try:
-                raw_result = ocr.ocr(img)
-            except Exception as exc2:
-                logger.warning("OCR inference failed: %s", exc2)
-                return []
+        else:
+            raw_result = ocr.ocr(img)
     except Exception as exc:
         logger.warning("OCR inference failed: %s", exc)
         return []
@@ -566,154 +605,41 @@ def _run_ocr_on_image(img, options=None):
     if not raw_result:
         return regions
 
-    # Convert generator to list
-    if not isinstance(raw_result, list):
-        try:
-            raw_result = list(raw_result)
-        except Exception:
-            pass
+    lines = parse_ocr_results(raw_result)
+    img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
 
-    for item in raw_result:
-        if item is None:
+    for line_data in lines:
+        text = line_data.get("text", "")
+        confidence = float(line_data.get("confidence", 0.0))
+        box = line_data.get("box")
+
+        if not box or not isinstance(box, (list, tuple)) or len(box) == 0:
             continue
 
-        # --- Debug: dump first result structure ---
-        if not _run_ocr_on_image._debugged:  # type: ignore
-            _run_ocr_on_image._debugged = True  # type: ignore
-            logger.info("[DEBUG] result item type: %s", type(item).__name__)
-            if hasattr(item, 'keys'):
-                try:
-                    logger.info("[DEBUG] result item keys: %s", list(item.keys()))  # type: ignore
-                except Exception:
-                    pass
-            if hasattr(item, '__dict__'):
-                logger.info("[DEBUG] result item attrs: %s", list(item.__dict__.keys()))
+        try:
+            xs = [float(pt[0]) for pt in box]
+            ys = [float(pt[1]) for pt in box]
+        except (TypeError, ValueError, IndexError):
+            continue
 
-        # --- PaddleX PipelineResult / OCRResult: supports item[key] access ---
-        if hasattr(item, 'keys'):
-            # Try direct key access (works for OCRResult, PipelineResult, dict)
-            all_keys = []  # type: List[str]
-            try:
-                all_keys = list(item.keys())  # type: ignore
-            except Exception:
-                pass
+        reg = _TextRegion(
+            text=text,
+            confidence=confidence,
+            x_min=min(xs), y_min=min(ys),
+            y_max=max(ys), x_max=max(xs),
+        )
 
-            if all_keys:
-                # Find the right key names
-                texts = None  # type: Optional[list]
-                scores = None  # type: Optional[list]
-                polys = None  # type: Optional[list]
+        # Scrubbing & filtering rules
+        if confidence < CONFIDENCE_CUTOFF:
+            continue
+        if _is_slash_or_math_artifact(text):
+            continue
+        if _symbol_ratio_exceeded(text):
+            continue
+        if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
+            continue
 
-                # NOTE: deliberately does NOT include a bare 'text' key here.
-                # A bare 'text' key is far more likely to hold a single
-                # whole-image joined STRING than a per-region list, and
-                # Python's list() on a string silently char-splits it
-                # ('Ohh no' -> ['O','h','h',' ','n','o']) rather than
-                # wrapping it — which, after _merge_regions' space-join,
-                # produces exactly "O H H N O" letter-by-letter output
-                # instead of real words. rec_texts is the real PaddleOCR
-                # 3.x per-region key; that's what we want here.
-                for tk in ('rec_texts', 'rec_text', 'texts'):
-                    if tk in all_keys:
-                        try:
-                            texts = item[tk]  # type: ignore
-                        except Exception:
-                            pass
-                        if texts is not None:
-                            break
-                for sk in ('rec_scores', 'rec_score', 'scores', 'score', 'confs'):
-                    if sk in all_keys:
-                        try:
-                            scores = item[sk]  # type: ignore
-                        except Exception:
-                            pass
-                        if scores is not None:
-                            break
-                for pk in ('rec_polys', 'dt_polys', 'dt_poly', 'polys', 'poly', 'boxes', 'bboxes'):
-                    if pk in all_keys:
-                        try:
-                            polys = item[pk]  # type: ignore
-                        except Exception:
-                            pass
-                        if polys is not None:
-                            break
-
-                if texts is not None:
-                    # _ensure_list is the critical fix: plain list()/isinstance
-                    # checks treat a bare string as an iterable-of-characters,
-                    # which silently shatters "Ohh no a dungeon" into
-                    # ['O','h','h',...]. A string must always be wrapped as a
-                    # single-element list, never iterated. Applied uniformly
-                    # to texts/scores/polys as defense in depth even though
-                    # scores/polys are far less likely to be a bare string.
-                    texts = _ensure_list(texts)
-                    scores = _ensure_list(scores)
-                    polys = _ensure_list(polys)
-
-                    logger.info("[OCR] Extracted %d texts, %d scores, %d polys from OCRResult", len(texts), len(scores), len(polys))
-
-                    img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
-                    for k in range(len(texts)):
-                        text = str(texts[k]) if k < len(texts) else ''
-                        confidence = float(scores[k]) if k < len(scores) else 0.0
-                        poly = polys[k] if k < len(polys) else None
-                        if poly is None:
-                            continue
-                        if hasattr(poly, 'tolist'):
-                            poly = poly.tolist()
-                        if not isinstance(poly, (list, tuple)) or len(poly) == 0:
-                            continue
-                        xs = [float(pt[0]) for pt in poly]
-                        ys = [float(pt[1]) for pt in poly]
-                        reg = _TextRegion(
-                            text=text,
-                            confidence=confidence,
-                            x_min=min(xs), y_min=min(ys),
-                            y_max=max(ys), x_max=max(xs),
-                        )
-                        # Scrubbing & filtering rules
-                        if confidence < CONFIDENCE_CUTOFF:
-                            continue
-                        if _is_slash_or_math_artifact(text):
-                            continue
-                        if _symbol_ratio_exceeded(text):
-                            continue
-                        if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
-                            continue
-
-                        regions.append(reg)
-                    continue
-
-                # If we had keys but no texts, log for debug
-                logger.warning("[OCR] OCRResult had keys %s but no rec_texts found", all_keys)
-
-        # --- Old format: list of pages, each page is list of (bbox, (text, conf)) ---
-        if isinstance(item, list):
-            img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
-            for line in item:
-                if not isinstance(line, (list, tuple)) or len(line) < 2:
-                    continue
-                bbox = line[0]
-                text_info = line[1]
-                text = text_info[0] if isinstance(text_info, (list, tuple)) else str(text_info)
-                confidence = float(text_info[1]) if isinstance(text_info, (list, tuple)) and len(text_info) > 1 else 0.0
-                xs = [pt[0] for pt in bbox]
-                ys = [pt[1] for pt in bbox]
-                reg = _TextRegion(
-                    text=text,
-                    confidence=confidence,
-                    x_min=min(xs), y_min=min(ys),
-                    y_max=max(ys), x_max=max(xs),
-                )
-                if confidence < CONFIDENCE_CUTOFF:
-                    continue
-                if _is_slash_or_math_artifact(text):
-                    continue
-                if _symbol_ratio_exceeded(text):
-                    continue
-                if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
-                    continue
-                regions.append(reg)
+        regions.append(reg)
 
     return regions
 
