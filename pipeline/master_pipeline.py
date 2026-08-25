@@ -122,7 +122,7 @@ class PipelineConfig:
     total_chapters: Optional[int] = None
     bgm_path: Optional[Path] = None
     work_dir: Path = Path("./work")
-    voice: str = "en-US-AndrewNeural"
+    voice: str = "en-US-ChristopherNeural"
     openai_model: str = "gpt-4o-mini"
     openai_api_key: Optional[str] = None
     keep_temp: bool = False
@@ -2878,8 +2878,8 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
              "path across runs to resume an interrupted pipeline.",
     )
     parser.add_argument(
-        "--voice", default="en-US-AndrewNeural",
-        help="edge-tts voice name (default: en-US-AndrewNeural).",
+        "--voice", default="en-US-ChristopherNeural",
+        help="edge-tts voice name (default: en-US-ChristopherNeural).",
     )
     parser.add_argument(
         "--openai-model", default="gpt-4o-mini",

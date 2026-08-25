@@ -406,7 +406,7 @@ log_step "4b" "Installing Piper TTS + voice model..."
 PIPER_DIR="$PROJECT_DIR/pipeline/piper"
 PIPER_BIN="$PIPER_DIR/piper/piper"
 PIPER_VOICE_DIR="$PROJECT_DIR/pipeline/voices"
-PIPER_VOICE_NAME="en_US-lessac-medium"
+PIPER_VOICE_NAME="en_US-ryan-high"
 PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
 
 PIPER_ARCH="$(uname -m)"
@@ -437,7 +437,7 @@ if [[ -f "$PIPER_VOICE_MODEL_PATH" ]]; then
     log_info "Piper voice model already present: $PIPER_VOICE_MODEL_PATH"
 else
     mkdir -p "$PIPER_VOICE_DIR"
-    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    PIPER_VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high"
     if curl -fsSL -o "$PIPER_VOICE_MODEL_PATH" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx" \
         && curl -fsSL -o "$PIPER_VOICE_MODEL_PATH.json" "$PIPER_VOICE_BASE_URL/${PIPER_VOICE_NAME}.onnx.json"; then
         log_info "Piper voice model downloaded"
