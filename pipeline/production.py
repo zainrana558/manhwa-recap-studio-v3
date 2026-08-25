@@ -228,9 +228,28 @@ def clean_ocr_text_with_sfx(text: str) -> str:
     - Preserves standard sound effects (e.g. BOOM, BANG, SWOOSH, RUMBLE, CRASH, CLACK)
       and standard English words.
     - Normalizes recognized SFX words into clean readable text.
+    - Performs sentence-boundary punctuation cleanup, OCR character substitutions, and end card corrections.
     """
     if not text:
         return ""
+
+    # Sentence boundary symbol conversions & ellipsis normalization
+    text = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', text, flags=re.IGNORECASE)
+    text = re.sub(r'\.{2,}', '...', text)
+
+    # OCR character substitutions & mistranslation fixes
+    text = re.sub(r'\bHO[0O]\b', 'HOO', text)
+    text = re.sub(r'\bHO\s+O\b', 'HOO', text)
+    text = re.sub(r'\bgood-curdling\b', 'blood-curdling', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bgood\s+curdling\b', 'blood-curdling', text, flags=re.IGNORECASE)
+
+    # End card corrections
+    text = re.sub(r'\bB\s+to\s+be\s+continued\.*', 'To Be Continued...', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\s*B\s+to\s+be\b(?!\s+continued)', 'To Be Continued', text, flags=re.IGNORECASE)
+    text = re.sub(r'\.{2,}', '...', text)
+
+    # Graphic logo / stylized title card filter
+    text = re.sub(r'\bsouls?\s+lac(?:ing|e)\b', '', text, flags=re.IGNORECASE)
 
     # Strip non-ASCII / unprintable characters (keep standard ASCII printable range 32-126)
     ascii_clean = "".join(ch for ch in text if 32 <= ord(ch) <= 126)
@@ -259,7 +278,6 @@ def clean_ocr_text_with_sfx(text: str) -> str:
             continue
 
         # Filter out obvious 1-2 character random non-word fragments (e.g., "xz", "ll1", "q1")
-        # Allowed 1-2 char standard words: I, a, in, on, at, to, do, go, he, me, my, no, so, up, us, is, it, if, am, an, as, be, by, we, or, of
         if len(core) <= 2:
             lower_core = core.lower()
             valid_short_words = {
