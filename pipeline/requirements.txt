@@ -1,7 +1,5 @@
 # Production target: Oracle Cloud Free Tier CPU-only with Python 3.10.4.
-# Production TTS is local-first (Piper -> retry -> eSpeak NG) and does not
-# require edge-tts/openai/API keys. Install edge-tts/openai separately only for
-# explicit legacy/development mode (PRODUCTION_PIPELINE=0).
+edge-tts>=6.1.0
 Pillow>=10.4.0,<12.0.0
 opencv-python-headless>=4.10.0,<4.11.0
 numpy>=1.24.4,<2.0.0
