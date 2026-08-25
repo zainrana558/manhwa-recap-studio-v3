@@ -63,7 +63,7 @@ interface SettingsForm {
 }
 
 const DEFAULTS: SettingsForm = {
-  defaultVoice: "en-US-AndrewNeural",
+  defaultVoice: "en-US-ChristopherNeural",
   defaultChapterLimit: 5,
   defaultLanguage: "en",
   groqKey: "",

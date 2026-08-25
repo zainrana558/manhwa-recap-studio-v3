@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
       mangaTitle,
       language: language || "en",
       sourceLang: sourceLang ?? null,
-      voice: voice || "en-US-AndrewNeural",
+      voice: voice || "en-US-ChristopherNeural",
       chapterLimit: chapterLimit ?? 0,
       translate: translate !== false,
       useBgm: useBgm !== false,

@@ -79,7 +79,7 @@ export async function POST(req: NextRequest) {
     const language = body.language || "en";
     const chapterLimit = Math.max(0, body.chapterLimit || 0);
     const chapterIds = body.chapterIds ?? null;
-    const voice = body.voice || "en-US-AndrewNeural";
+    const voice = body.voice || "en-US-ChristopherNeural";
     const translate = body.translate === true;
     const bgmPath = body.bgmPath ?? null;
     const useBgm = body.useBgm !== false;

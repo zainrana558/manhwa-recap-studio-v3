@@ -67,7 +67,7 @@ model Job {
   r2SecretAccessKey String?
   r2Bucket      String?
   autoArchive   Boolean  @default(false)
-  voice       String    @default("en-US-AndrewNeural")
+  voice       String    @default("en-US-ChristopherNeural")
   chapterLimit Int      @default(0)
   chapterStart Int      @default(1)
   chapterEnd   Int      @default(0)

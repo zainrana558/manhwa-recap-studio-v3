@@ -55,7 +55,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [chapterLoading, setChapterLoading] = useState(true);
   const [language, setLanguage] = useState("en");
   const [chapterLimit, setChapterLimit] = useState(5);
-  const [voice, setVoice] = useState("en-US-AndrewNeural");
+  const [voice, setVoice] = useState("en-US-ChristopherNeural");
   const [groqKey, setGroqKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
   const [openRouterKey, setOpenRouterKey] = useState("");
@@ -99,7 +99,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
         setMegaEmail(s.megaEmail ?? "");
         setMegaPassword(s.megaPassword ?? "");
         setAutoArchive(s.autoArchive ?? false);
-        setVoice(s.defaultVoice ?? "en-US-AndrewNeural");
+        setVoice(s.defaultVoice ?? "en-US-ChristopherNeural");
         setChapterLimit(s.defaultChapterLimit ?? 5);
 
         const allChapters: ChapterFeedItem[] = chaptersRes.chapters ?? [];

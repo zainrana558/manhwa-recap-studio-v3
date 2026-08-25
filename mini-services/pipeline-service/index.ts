@@ -610,7 +610,7 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     '--input-dir', datasetDir(jobId),
     '--output', outputVideoPath(jobId),
     '--work-dir', workDir(jobId),
-    '--voice', 'en-US-AndrewNeural', // unused by slice-only, but required by argparse
+    '--voice', 'en-US-ChristopherNeural', // unused by slice-only, but required by argparse
     '--narration-provider', 'none',
     '--job-id', jobId,
     ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
