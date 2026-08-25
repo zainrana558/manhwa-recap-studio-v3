@@ -297,23 +297,116 @@ class _TextRegion:
         self.x_max = x_max
 
 
-def _sort_regions_reading_order(regions):
-    # type: (List[_TextRegion]) -> List[_TextRegion]
-    """Sort detected text regions in natural reading order (top-to-bottom,
-    left-to-right within each line).
+import re
 
-    Previously this bucketed each region into a "row" via fixed-size floor
-    division (y_min // vertical_tolerance). Two regions only a couple
-    pixels apart can straddle a bucket boundary and land in different
-    buckets, while two regions genuinely on different lines can land in
-    the same bucket purely by chance — silently scrambling word/line order
-    within a merged panel's narration text (e.g. interleaving two
-    side-by-side speech bubbles). Cluster by actual vertical proximity to
-    the row being built instead, which has no arbitrary boundary to
-    straddle.
+CONFIDENCE_CUTOFF = 0.70
+SYMBOL_RATIO_LIMIT = 0.35
+
+
+def _is_slash_or_math_artifact(text: str) -> bool:
+    """Check if text consists of repetitive slashes, backslashes, dashes, or isolated math symbols."""
+    if not text:
+        return True
+    s = text.strip()
+    if re.fullmatch(r'[/\-\\—_\s]+', s):
+        return True
+    if re.search(r'[/\\—\-]{2,}', s) and not re.search(r'[a-zA-Z0-9]', s):
+        return True
+    if re.fullmatch(r'[*+\\/\-—=]\s*[0-9A-Za-z]{0,3}', s):
+        return True
+    if re.fullmatch(r'[*+\\/\-—=]+', s):
+        return True
+    return False
+
+
+def _symbol_ratio_exceeded(text: str, max_ratio: float = SYMBOL_RATIO_LIMIT) -> bool:
+    """Check if ratio of non-alphanumeric to alphanumeric characters exceeds threshold."""
+    if not text:
+        return True
+    alnum_count = len(re.findall(r'[a-zA-Z0-9]', text))
+    if alnum_count == 0:
+        return True
+    non_alnum_count = len(re.findall(r'[^a-zA-Z0-9\s]', text))
+    ratio = non_alnum_count / float(alnum_count)
+    return ratio > max_ratio
+
+
+def _is_graphic_logo(region: '_TextRegion', img_h: int = 0, img_w: int = 0) -> bool:
+    """Identify stylized main title cards / graphic logos (e.g. Solo Leveling logo misreads like 'Souls Lacing')."""
+    box_w = region.x_max - region.x_min
+    box_h = region.y_max - region.y_min
+    if box_h <= 0 or box_w <= 0:
+        return False
+
+    text_lower = region.text.lower()
+    if re.search(r'\bsouls?\s+lac(?:ing|e)\b', text_lower):
+        return True
+
+    if img_h > 0 and img_w > 0:
+        aspect_ratio = box_w / float(box_h)
+        area_ratio = (box_w * box_h) / float(img_w * img_h)
+        if (area_ratio > 0.15 or aspect_ratio > 5.0 or box_h > img_h * 0.4) and region.confidence < 0.85:
+            if not re.fullmatch(r'[\w\s.,!\'\"]+', region.text) or region.confidence < 0.75:
+                return True
+
+    return False
+
+
+def _detect_ui_card_or_borders(img: np.ndarray) -> bool:
+    """Check if panel image contains structured rectangular borders or high density UI/quest notification cards."""
+    try:
+        if img is None or img.size == 0:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 and img.shape[2] == 3 else img
+        edges = cv2.Canny(gray, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        img_h, img_w = gray.shape[:2]
+        img_area = img_h * img_w
+        rect_count = 0
+        for cnt in contours:
+            approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+            if len(approx) == 4:
+                area = cv2.contourArea(cnt)
+                if 0.08 * img_area < area < 0.95 * img_area:
+                    rect_count += 1
+        return rect_count >= 1
+    except Exception as e:
+        logger.debug("UI card detection exception: %s", e)
+        return False
+
+
+def _clean_and_normalize_ocr_text(text: str) -> str:
+    """Normalize ellipses, punctuation, character substitutions, and end cards."""
+    if not text:
+        return ""
+    # Strip erroneous spoken symbol conversions at sentence boundaries
+    t = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', text, flags=re.IGNORECASE)
+    t = re.sub(r'\.{2,}', '...', t)
+
+    # OCR character substitutions
+    t = re.sub(r'\bHO[0O]\b', 'HOO', t)
+    t = re.sub(r'\bHO\s+O\b', 'HOO', t)
+    t = re.sub(r'\bgood-curdling\b', 'blood-curdling', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bgood\s+curdling\b', 'blood-curdling', t, flags=re.IGNORECASE)
+
+    # End card first-letter / misread correction logic
+    t = re.sub(r'\bB\s+to\s+be\s+continued\.*', 'To Be Continued...', t, flags=re.IGNORECASE)
+    t = re.sub(r'^\s*B\s+to\s+be\b(?!\s+continued)', 'To Be Continued', t, flags=re.IGNORECASE)
+    t = re.sub(r'\.{2,}', '...', t)
+
+    return t
+
+
+def _sort_regions_reading_order(regions, is_ui_box=False):
+    # type: (List[_TextRegion], bool) -> List[_TextRegion]
+    """Sort detected text regions in natural reading order.
+    For UI boxes / quest windows, strictly sort top-to-bottom by y_min coordinates.
     """
     if not regions:
         return regions
+
+    if is_ui_box:
+        return sorted(regions, key=lambda r: (r.y_min, r.x_min))
 
     heights = [r.y_max - r.y_min for r in regions]
     mean_height = sum(heights) / len(heights) if heights else 20.0
@@ -340,13 +433,13 @@ def _sort_regions_reading_order(regions):
     return ordered
 
 
-def _merge_regions(regions):
-    # type: (List[_TextRegion]) -> Tuple[str, float, int]
+def _merge_regions(regions, is_ui_box=False):
+    # type: (List[_TextRegion], bool) -> Tuple[str, float, int]
     """Merge sorted text regions into a single coherent string."""
     if not regions:
         return "", 0.0, 0
 
-    sorted_regions = _sort_regions_reading_order(regions)
+    sorted_regions = _sort_regions_reading_order(regions, is_ui_box=is_ui_box)
 
     lines = []  # type: List[List[_TextRegion]]
     current_line = [sorted_regions[0]]  # type: List[_TextRegion]
@@ -355,7 +448,8 @@ def _merge_regions(regions):
         prev = current_line[-1]
         vertical_gap = abs(region.y_min - prev.y_min)
         mean_h = (region.y_max - region.y_min + prev.y_max - prev.y_min) / 2
-        threshold = max(mean_h * 0.5, 10.0)
+        # Reduced line height threshold for quest / UI boxes so itemized multi-line lists segment into individual lines
+        threshold = max(mean_h * 0.2, 4.0) if is_ui_box else max(mean_h * 0.5, 10.0)
 
         if vertical_gap < threshold:
             current_line.append(region)
@@ -370,14 +464,14 @@ def _merge_regions(regions):
 
     for line in lines:
         line_sorted = sorted(line, key=lambda r: r.x_min)
-        line_text = " ".join(r.text.strip() for r in line_sorted if r.text.strip())
+        line_text = " ".join(_clean_and_normalize_ocr_text(r.text.strip()) for r in line_sorted if r.text.strip())
         if line_text:
             text_parts.append(line_text)
         for r in line_sorted:
             if r.confidence > 0:
                 all_confidences.append(r.confidence)
 
-    merged_text = " ".join(text_parts)
+    merged_text = _clean_and_normalize_ocr_text(" ".join(text_parts))
     avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
@@ -558,6 +652,7 @@ def _run_ocr_on_image(img, options=None):
 
                     logger.info("[OCR] Extracted %d texts, %d scores, %d polys from OCRResult", len(texts), len(scores), len(polys))
 
+                    img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
                     for k in range(len(texts)):
                         text = str(texts[k]) if k < len(texts) else ''
                         confidence = float(scores[k]) if k < len(scores) else 0.0
@@ -570,12 +665,23 @@ def _run_ocr_on_image(img, options=None):
                             continue
                         xs = [float(pt[0]) for pt in poly]
                         ys = [float(pt[1]) for pt in poly]
-                        regions.append(_TextRegion(
+                        reg = _TextRegion(
                             text=text,
                             confidence=confidence,
                             x_min=min(xs), y_min=min(ys),
                             y_max=max(ys), x_max=max(xs),
-                        ))
+                        )
+                        # Scrubbing & filtering rules
+                        if confidence < CONFIDENCE_CUTOFF:
+                            continue
+                        if _is_slash_or_math_artifact(text):
+                            continue
+                        if _symbol_ratio_exceeded(text):
+                            continue
+                        if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
+                            continue
+
+                        regions.append(reg)
                     continue
 
                 # If we had keys but no texts, log for debug
@@ -583,6 +689,7 @@ def _run_ocr_on_image(img, options=None):
 
         # --- Old format: list of pages, each page is list of (bbox, (text, conf)) ---
         if isinstance(item, list):
+            img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
             for line in item:
                 if not isinstance(line, (list, tuple)) or len(line) < 2:
                     continue
@@ -592,12 +699,21 @@ def _run_ocr_on_image(img, options=None):
                 confidence = float(text_info[1]) if isinstance(text_info, (list, tuple)) and len(text_info) > 1 else 0.0
                 xs = [pt[0] for pt in bbox]
                 ys = [pt[1] for pt in bbox]
-                regions.append(_TextRegion(
+                reg = _TextRegion(
                     text=text,
                     confidence=confidence,
                     x_min=min(xs), y_min=min(ys),
                     y_max=max(ys), x_max=max(xs),
-                ))
+                )
+                if confidence < CONFIDENCE_CUTOFF:
+                    continue
+                if _is_slash_or_math_artifact(text):
+                    continue
+                if _symbol_ratio_exceeded(text):
+                    continue
+                if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
+                    continue
+                regions.append(reg)
 
     return regions
 
@@ -789,10 +905,16 @@ def _ocr_with_cascade(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
     """Run PaddleOCR pass (standard + preprocessing variants) and, if still
     UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
+    Automatically detects high-density UI/quest cards to set det_limit_side_len >= 1216.
     """
+    opts = options or OCROptions()
+    is_ui_box = _detect_ui_card_or_borders(img)
+    if is_ui_box and opts.det_limit_side_len < 1216:
+        opts = opts.copy(update={"det_limit_side_len": 1216})
+
     # Pass 1: Standard PaddleOCR
-    regions = _run_ocr_on_image(img, options)
-    merged_text, avg_conf, region_count = _merge_regions(regions)
+    regions = _run_ocr_on_image(img, opts)
+    merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
     status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
 
     candidates = [{
