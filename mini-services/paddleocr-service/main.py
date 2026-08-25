@@ -202,6 +202,24 @@ class OCROptions(BaseModel):
         le=3.0,
         description="Unclip ratio for DB detector.",
     )
+    det_limit_side_len: int = Field(
+        default=1536,
+        ge=320,
+        le=4096,
+        description="Maximum side length for detection resize to preserve small font accuracy.",
+    )
+    det_db_thresh: float = Field(
+        default=0.3,
+        ge=0.1,
+        le=0.9,
+        description="Binarization threshold for DB detector.",
+    )
+    det_db_box_thresh: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=0.9,
+        description="Box score threshold for DB detector.",
+    )
 
 
 class BatchOCRRequest(BaseModel):
@@ -424,6 +442,9 @@ def _run_ocr_on_image(img, options=None):
         use_doc_unwarping=False,
         use_textline_orientation=opts.use_angle_cls,
         text_det_unclip_ratio=opts.det_db_unclip_ratio,
+        text_det_limit_side_len=opts.det_limit_side_len,
+        text_det_db_thresh=opts.det_db_thresh,
+        text_det_db_box_thresh=opts.det_db_box_thresh,
     )
 
     try:
@@ -712,7 +733,7 @@ def _run_tesseract_ocr(img):
         pil_img.save(tmp_path)
         result = subprocess.run(
             ["tesseract", tmp_path, "stdout", "--psm", "6", "tsv"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
         )
         if result.returncode != 0:
             logger.warning("tesseract exited %d: %s", result.returncode, (result.stderr or "")[:200])
@@ -751,7 +772,7 @@ def _run_tesseract_ocr(img):
         avg_conf = (sum(confs) / len(confs)) / 100.0  # Tesseract reports 0-100
         return text, max(0.0, min(1.0, avg_conf))
     except subprocess.TimeoutExpired:
-        logger.warning("tesseract timed out after 20s")
+        logger.warning("tesseract timed out after 5s")
         return "", 0.0
     except Exception as exc:
         logger.warning("tesseract OCR failed: %s", exc)
@@ -814,30 +835,33 @@ def _ocr_with_cascade(img, options=None):
                 candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
             )
 
-    # Pass 3: Tesseract fallback with original & preprocessed images
-    tess_passes = [
-        ("standard", img),
-        ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
-        ("contrast_clahe", _preprocess_contrast),
-    ]
+    # Pass 3: Tesseract fallback with original & preprocessed images (guarded to prevent exception spikes)
+    try:
+        tess_passes = [
+            ("standard", img),
+            ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
+            ("contrast_clahe", _preprocess_contrast(img)),
+        ]
 
-    for tess_variant, t_img in tess_passes:
-        tess_text, tess_conf = _run_tesseract_ocr(t_img)
-        if not tess_text:
-            continue
+        for tess_variant, t_img in tess_passes:
+            tess_text, tess_conf = _run_tesseract_ocr(t_img)
+            if not tess_text:
+                continue
 
-        tess_regions = len(tess_text.split())
-        candidates.append({
-            "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
-            "provider": "tesseract", "model": "tesseract", "variant": tess_variant,
-        })
+            tess_regions = len(tess_text.split())
+            candidates.append({
+                "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
+                "provider": "tesseract", "model": "tesseract", "variant": tess_variant,
+            })
 
-        tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
-        if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
-            return (
-                tess_text, tess_conf, tess_regions, tess_status, tess_quality,
-                candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
-            )
+            tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
+            if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
+                return (
+                    tess_text, tess_conf, tess_regions, tess_status, tess_quality,
+                    candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
+                )
+    except Exception as tess_err:
+        logger.warning("Tesseract fallback cascade failed gracefully: %s", tess_err)
 
     return best_tuple
 
