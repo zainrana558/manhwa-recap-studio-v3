@@ -8,10 +8,14 @@ from speech bubbles and captions.
 Port: 3002
 """
 
+import os
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+
 import base64
 import io
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -82,8 +86,9 @@ def _init_ocr():
                     use_angle_cls=True,
                     det_db_thresh=0.3,
                     det_limit_side_len=1216,
-                    cpu_threads=4,
-                    enable_mkldnn=True,
+                    cpu_threads=2,
+                    enable_mkldnn=False,
+                    use_gpu=False,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -511,68 +516,36 @@ def _ensure_list(x):
 
 
 def parse_ocr_results(result):
-    """Refactored universal OCRResult parser.
-
-    Seamlessly handles both PaddleOCR 3.x dataclasses/objects/dicts (OCRResult)
-    and legacy tuple/list structures.
-    """
     extracted_lines = []
     if not result:
         return extracted_lines
 
-    # Convert generator to list if necessary
-    if not isinstance(result, (list, tuple)):
-        try:
-            result = list(result)
-        except Exception:
-            pass
+    # If result is a list, unwrap the primary page container
+    page_res = result[0] if isinstance(result, list) and len(result) > 0 else result
 
-    for item in result:
-        if item is None:
-            continue
+    # Check for PP-OCRv5 / PaddleOCR 3.x OCRResult object or dictionary
+    if hasattr(page_res, 'rec_texts') or (isinstance(page_res, dict) and 'rec_texts' in page_res):
+        rec_texts = getattr(page_res, 'rec_texts', None) or page_res.get('rec_texts', [])
+        rec_scores = getattr(page_res, 'rec_scores', None) or page_res.get('rec_scores', [])
+        rec_boxes = getattr(page_res, 'rec_boxes', None) or getattr(page_res, 'dt_polys', None) or page_res.get('rec_boxes', [])
 
-        # Handle PaddleOCR 3.x OCRResult object attributes or dict-like objects
-        has_attr_rec = hasattr(item, 'rec_texts') and hasattr(item, 'rec_scores')
-        has_key_rec = hasattr(item, 'keys') and 'rec_texts' in item and 'rec_scores' in item
+        for text, score, box in zip(rec_texts, rec_scores, rec_boxes):
+            extracted_lines.append({
+                "text": str(text),
+                "confidence": float(score),
+                "box": box.tolist() if hasattr(box, 'tolist') else box
+            })
 
-        if has_attr_rec or has_key_rec:
-            if has_attr_rec:
-                texts = getattr(item, 'rec_texts', [])
-                scores = getattr(item, 'rec_scores', [])
-                boxes = getattr(item, 'rec_boxes', getattr(item, 'rec_polys', []))
-            else:
-                texts = item.get('rec_texts', [])
-                scores = item.get('rec_scores', [])
-                boxes = item.get('rec_boxes', item.get('rec_polys', []))
-
-            texts = _ensure_list(texts)
-            scores = _ensure_list(scores)
-            boxes = _ensure_list(boxes)
-
-            for text, score, box in zip(texts, scores, boxes):
-                box_val = box.tolist() if hasattr(box, 'tolist') else box
+    # Fallback for standard nested list output: [[ [box], (text, score) ]]
+    elif isinstance(page_res, (list, tuple)):
+        for line in page_res:
+            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                box, (text, score) = line[0], line[1]
                 extracted_lines.append({
                     "text": str(text),
                     "confidence": float(score),
-                    "box": box_val
+                    "box": box.tolist() if hasattr(box, 'tolist') else box
                 })
-
-        # Legacy tuple/list fallback: [[[box], (text, score)]]
-        elif isinstance(item, (list, tuple)):
-            for line in item:
-                if isinstance(line, (list, tuple)) and len(line) >= 2:
-                    box = line[0]
-                    text_info = line[1]
-                    if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
-                        text, score = text_info[0], text_info[1]
-                    else:
-                        text, score = text_info, 0.0
-                    box_val = box.tolist() if hasattr(box, 'tolist') else box
-                    extracted_lines.append({
-                        "text": str(text),
-                        "confidence": float(score),
-                        "box": box_val
-                    })
 
     return extracted_lines
 
