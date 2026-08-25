@@ -1091,79 +1091,51 @@ export async function generateImageNarrationsOCR(
   if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0 } }
 
   const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
-  const OCR_BATCH_SIZE = 20 // PaddleOCR is fast on CPU; larger batches reduce HTTP overhead
+  const OCR_REQUEST_TIMEOUT_MS = 120000 // 120,000 ms (2 minutes) per single panel request
   const results: Array<{ image: string; text: string }> = new Array(imagePaths.length)
+
+  const startTime = Date.now()
   let completedCount = 0
-  // Tracked separately from "empty text ratio" — manhwa/manhua panels are
-  // frequently text-free by design (action beats, establishing shots,
-  // transitions), so a high empty-text ratio is often CORRECT output, not
-  // a failure. What actually indicates a broken OCR pipeline (bad model
-  // init, doc-preprocessing distortion, wrong image format, etc.) is the
-  // TEXT DETECTOR never firing at all across an entire chapter — i.e.
-  // totalRegionsDetected stays at 0 even though panels were processed.
   let totalRegionsDetected = 0
   let batchCallFailures = 0
   let freshlyProcessed = 0
-  // Distinct failure signal from both of the above: the DETECTOR found real
-  // text regions (regions > 0) but the RECOGNIZER couldn't read them
-  // confidently enough to be trusted (status UNCERTAIN/FAILED). That text
-  // gets discarded below (text = '') exactly like a legitimately silent
-  // panel — indistinguishable from "no dialogue" by emptyRatio alone. A
-  // chapter where this happens a lot means real dialogue is being silently
-  // thrown away because the recognizer is struggling with this chapter's
-  // font/art style, not that the panels are quiet.
   let uncertainWithRegions = 0
+  let successCount = 0
+  let failureCount = 0
 
-  // Process in batches
-  for (let i = 0; i < imagePaths.length; i += OCR_BATCH_SIZE) {
-    const batchPaths = imagePaths.slice(i, i + OCR_BATCH_SIZE)
-    const startIdx = i
+  // Single-Panel Sequential Processing: loop through imagePaths 1 panel at a time
+  for (let i = 0; i < imagePaths.length; i++) {
+    const imgPath = imagePaths[i]
+    const cacheKey = ocrCacheKey(imgPath)
+    const cached = await getOcrCached(cacheKey)
 
-    // Check cache for each image in this batch
-    const uncachedIndices: number[] = []
-    const uncachedPaths: string[] = []
-
-    for (let j = 0; j < batchPaths.length; j++) {
-      // ocrCacheKey (not vlmCacheKey) — versioned so a change to OCR tuning
-      // (det_db_unclip_ratio etc., see OCR_TUNING_VERSION above) invalidates
-      // stale cached results instead of a permanently-empty result from an
-      // old detector setting being reused forever under the 1-year TTL.
-      const cacheKey = ocrCacheKey(batchPaths[j])
-      const cached = await getOcrCached(cacheKey)
-      if (cached !== null) {
-        results[startIdx + j] = { image: path.basename(batchPaths[j]), text: cached.text }
-        // Cached non-empty text is itself evidence the detector fired at
-        // some point in the past — count it toward the "detector works" signal.
-        if (cached.text.trim()) totalRegionsDetected += 1
-        completedCount++
+    if (cached !== null) {
+      results[i] = { image: path.basename(imgPath), text: cached.text }
+      if (cached.text.trim()) totalRegionsDetected += 1
+      if (cached.status === 'SUCCESS') {
+        successCount++
       } else {
-        uncachedIndices.push(j)
-        uncachedPaths.push(batchPaths[j])
+        failureCount++
       }
-    }
-
-    // If all cached, skip the API call
-    if (uncachedPaths.length === 0) {
+      completedCount++
       onProgress?.(completedCount, imagePaths.length)
       continue
     }
 
-    // Call PaddleOCR batch endpoint with retries
-    let batchSuccess = false
-    let lastOcrErr: unknown = null
+    // Send exactly 1 sliced image panel per HTTP POST request with 120,000 ms timeout
+    let singleSuccess = false
     const MAX_OCR_RETRIES = 3
 
     for (let attempt = 1; attempt <= MAX_OCR_RETRIES; attempt++) {
       try {
-        const t0 = Date.now()
         const res = await fetch(`${baseUrl}/ocr/batch`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            images: uncachedPaths,
+            images: [imgPath],
             options: { det_db_unclip_ratio: 2.4 },
           }),
-          signal: AbortSignal.timeout(20000 + uncachedPaths.length * 20000),
+          signal: AbortSignal.timeout(OCR_REQUEST_TIMEOUT_MS),
         })
 
         if (!res.ok) {
@@ -1177,69 +1149,69 @@ export async function generateImageNarrationsOCR(
           processing_time_ms: number
         }
 
-        const elapsed = Date.now() - t0
-        const uncertainCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'UNCERTAIN').length
-        const failedCount = data.results.filter((r) => String(r.status || 'SUCCESS').toUpperCase() === 'FAILED').length
-        const batchRegions = data.results.reduce((sum, r) => sum + (r.regions || 0), 0)
-        totalRegionsDetected += batchRegions
-        freshlyProcessed += data.results.length
-        uncertainWithRegions += data.results.filter(
-          (r) => (r.regions || 0) > 0 && String(r.status || 'SUCCESS').toUpperCase() !== 'SUCCESS',
-        ).length
-        console.log(
-          `[OCR] Batch ${Math.floor(i / OCR_BATCH_SIZE) + 1}: ${uncachedPaths.length} images in ${elapsed}ms (${data.model}), ${batchRegions} text regions detected, ${uncertainCount} uncertain, ${failedCount} failed`,
-        )
-
-        // Map results back to the correct positions in the results array
-        for (const ocrResult of data.results) {
-          const localIdx = uncachedIndices[ocrResult.index]
-          if (localIdx === undefined) continue
-
-          const globalIdx = startIdx + localIdx
+        const ocrResult = data.results[0]
+        if (ocrResult) {
           const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
           const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
+          const regions = ocrResult.regions || 0
 
-          const imgPath = uncachedPaths[ocrResult.index]
-          if (text && status === 'SUCCESS') {
-            void setOcrCached(ocrCacheKey(imgPath), text, status)
-            void setVlmCached(vlmCacheKey(imgPath), text, status)
-          } else {
-            void setOcrCached(ocrCacheKey(imgPath), '', 'FAILED')
-            void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+          totalRegionsDetected += regions
+          freshlyProcessed++
+
+          if (regions > 0 && status !== 'SUCCESS') {
+            uncertainWithRegions++
           }
 
-          results[globalIdx] = { image: path.basename(uncachedPaths[ocrResult.index]), text }
+          if (text && status === 'SUCCESS') {
+            void setOcrCached(cacheKey, text, status)
+            void setVlmCached(vlmCacheKey(imgPath), text, status)
+            successCount++
+          } else {
+            void setOcrCached(cacheKey, '', 'FAILED')
+            void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+            failureCount++
+          }
+
+          results[i] = { image: path.basename(imgPath), text }
           completedCount++
+          singleSuccess = true
+          break
         }
-        batchSuccess = true
-        break
       } catch (err) {
-        lastOcrErr = err
         const msg = err instanceof Error ? err.message : String(err)
-        console.warn(`[OCR] Batch attempt ${attempt}/${MAX_OCR_RETRIES} failed: ${msg.slice(0, 200)}`)
+        console.warn(`[OCR] Panel ${i + 1}/${imagePaths.length} (${path.basename(imgPath)}) attempt ${attempt}/${MAX_OCR_RETRIES} failed: ${msg.slice(0, 200)}`)
         if (attempt < MAX_OCR_RETRIES) {
-          await sleep(2000 * Math.pow(2, attempt - 1))
+          await sleep(1000 * Math.pow(2, attempt - 1))
         }
       }
     }
 
-    if (!batchSuccess) {
+    if (!singleSuccess) {
       batchCallFailures++
-      // Fill remaining uncached results with empty text and failure cache
-      for (let j = 0; j < uncachedIndices.length; j++) {
-        const globalIdx = startIdx + uncachedIndices[j]
-        if (!results[globalIdx]) {
-          const imgPath = uncachedPaths[j]
-          void setOcrCached(ocrCacheKey(imgPath), '', 'FAILED')
-          void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
-          results[globalIdx] = { image: path.basename(imgPath), text: '' }
-          completedCount++
-        }
-      }
+      failureCount++
+      void setOcrCached(cacheKey, '', 'FAILED')
+      void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+      results[i] = { image: path.basename(imgPath), text: '' }
+      completedCount++
     }
 
     onProgress?.(completedCount, imagePaths.length)
   }
+
+  const totalDurationMs = Date.now() - startTime
+  const totalPanels = imagePaths.length
+  const avgTimePerPanelMs = totalPanels > 0 ? totalDurationMs / totalPanels : 0
+
+  console.log(
+    `\n==================================================\n` +
+    `[OCR RUN SUMMARY]\n` +
+    `Total Panels Processed: ${totalPanels}\n` +
+    `Success Count:          ${successCount}\n` +
+    `Failure/Uncertain Count:${failureCount}\n` +
+    `Total Duration:         ${(totalDurationMs / 1000).toFixed(2)}s\n` +
+    `Avg Time Per Panel:     ${avgTimePerPanelMs.toFixed(2)}ms\n` +
+    `==================================================\n`
+  )
 
   return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } }
 }
