@@ -651,28 +651,51 @@ def _preprocess_invert(img: np.ndarray) -> np.ndarray:
 
 
 def _run_tesseract_ocr(img):
-    # type: (np.ndarray) -> Tuple[str, float]
-    """Run the Tesseract CLI as an independent OCR candidate.
+    # type: (Any) -> Tuple[str, float]
+    """Run Tesseract as an independent OCR candidate.
 
-    Returns (text, confidence) where confidence is the mean per-word
-    confidence (0-1) reported by Tesseract's TSV output, and text is the
-    words joined in Tesseract's own reading order (its layout analysis
-    already groups by block/paragraph/line, so no extra clustering is
-    needed here the way the Paddle region-merge required).
+    Ensures the image is explicitly converted to a valid NumPy array (`np.array(image)`),
+    preventing `'function' object has no attribute '__array_interface__'` errors if
+    an un-executed function reference or PIL Image/other object is passed.
 
-    Never raises — a Tesseract failure (bad install, unreadable image,
-    timeout) degrades to an empty/zero-confidence result so callers can
-    treat it as "this candidate didn't pan out" rather than an error that
-    needs handling, matching "Model unavailable -> skip provider and use
-    fallback" from the OCR taxonomy.
+    Supports pytesseract if available, falling back to the tesseract CLI if not.
     """
+    # 1. Guard against un-executed function reference or non-array/image types
+    if callable(img):
+        logger.error("[Tesseract] Received callable/function instead of image object; un-executed function passed!")
+        return "", 0.0
+
+    try:
+        if isinstance(img, Image.Image):
+            img_array = np.array(img)
+        elif hasattr(img, "__array_interface__") or isinstance(img, np.ndarray):
+            img_array = np.array(img)
+        else:
+            img_array = np.array(img)
+    except Exception as conv_exc:
+        logger.error("[Tesseract] Failed to convert image object to NumPy array: %s", conv_exc)
+        return "", 0.0
+
+    # 2. Attempt pytesseract if installed
+    try:
+        import pytesseract
+        pil_img = Image.fromarray(img_array)
+        text = pytesseract.image_to_string(np.array(pil_img), lang="eng", config="--psm 6")
+        if text and text.strip():
+            return text.strip(), 0.80
+    except ImportError:
+        pass
+    except Exception as pytess_exc:
+        logger.warning("[Tesseract] pytesseract.image_to_string failed (%s); falling back to CLI", pytess_exc)
+
+    # 3. Fallback to CLI
     if not _tesseract_available():
         return "", 0.0
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
-        Image.fromarray(img).save(tmp_path)
+        Image.fromarray(img_array).save(tmp_path)
         result = subprocess.run(
             ["tesseract", tmp_path, "stdout", "--psm", "6", "tsv"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
