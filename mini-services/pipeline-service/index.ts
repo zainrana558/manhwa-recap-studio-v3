@@ -1137,6 +1137,27 @@ async function processJob(jobId: string): Promise<void> {
         await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: silenced ${junkRemoved} punctuation-only panel(s) (e.g. "...", "?!!") instead of narrating them literally`)
       }
 
+      // SILENCE THE "[transcription unavailable]" FALLBACK MARKER — the deep
+      // end of the transcription fallback chain (OCR -> every VLM provider
+      // -> Tesseract, all exhausted for one panel/batch) writes this literal
+      // string as a last-resort placeholder so the pipeline can keep moving
+      // instead of crashing the whole chapter. It's meant to be an honest
+      // "we don't know" marker, NOT real dialogue — nothing downstream
+      // treats it specially, so left as-is it would get handed straight to
+      // Piper/eSpeak and the narrator would literally say the words
+      // "transcription unavailable" out loud over that panel. Same shape as
+      // the credit/junk filters above: convert it to silence instead.
+      let unavailableSilenced = 0
+      for (const n of narrations) {
+        if (n.text.trim() === '[transcription unavailable]') {
+          n.text = ''
+          unavailableSilenced++
+        }
+      }
+      if (unavailableSilenced > 0) {
+        await emitLog(jobId, 'warn', 'transcribe', `Chapter ${ch.index}: ${unavailableSilenced} panel(s) exhausted every transcription method (OCR, all VLM providers, Tesseract) — silenced rather than narrating "transcription unavailable" literally`)
+      }
+
       // Save narrations as narration.json. When frameKeyed, keys are sliced
       // frame filenames (frame_00000.jpg) which the Python render step
       // matches to individual frames for per-panel narration sync.

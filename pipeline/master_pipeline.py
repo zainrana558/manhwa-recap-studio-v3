@@ -2491,6 +2491,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     chapters = discover_chapters(cfg)
     total = len(chapters)
     chapter_videos: List[Path] = []
+    # Chapters that rendering genuinely failed for, where a black
+    # "unavailable" placeholder was substituted so the merged video still
+    # has a slot for every chapter instead of jump-cutting. Tracked
+    # SEPARATELY from chapter_videos (which now includes placeholders) so
+    # the end-of-run success/UNCERTAIN decision below can't be fooled by a
+    # placeholder padding chapter_videos up to `total` and looking like a
+    # clean run.
+    placeholder_chapters: List[str] = []
     prev_tail = ""
 
     cfg.write_progress("render", 0, total, f"Starting pipeline over {total} chapters")
@@ -2736,6 +2744,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                     expected_chap_dur,
                     f"Chapter {chapter.index} unavailable",
                 )
+                placeholder_chapters.append(chapter.tag)
                 state_store.record(
                     cfg.job_id, Stage.CHAPTER, State.RETRYABLE, chapter_id=chapter.tag,
                     error_code="RENDER_FAILED_PLACEHOLDER_USED", retry_category=classify_retry("render failed, placeholder used"),
@@ -2782,6 +2791,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             "for RETRYABLE chapters and rerun the same --work-dir to fill them in.",
             dropped_chapters, total,
         )
+    if placeholder_chapters:
+        log.warning(
+            "%d/%d chapters rendered as black \"unavailable\" placeholders "
+            "after render retries failed (%s) — job will complete but is NOT "
+            "a clean success. Check pipeline_state.sqlite3 for RETRYABLE "
+            "chapters and rerun the same --work-dir to fill them in.",
+            len(placeholder_chapters), total, ", ".join(placeholder_chapters),
+        )
 
     cfg.write_progress("merge", total, total, "Merging chapter videos")
     state_store.record(cfg.job_id, Stage.MERGE, State.RUNNING)
@@ -2808,17 +2825,26 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     cleanup_temp(cfg)
 
     elapsed = time.time() - start
-    final_state = State.UNCERTAIN if dropped_chapters > 0 else State.COMPLETE
+    # A placeholder chapter pads chapter_videos up to `total`, so
+    # dropped_chapters alone would read as 0 for a run that actually has a
+    # black "unavailable" screen standing in for real content — check both,
+    # or a placeholder-only run would be misreported as a clean COMPLETE.
+    final_state = State.UNCERTAIN if (dropped_chapters > 0 or placeholder_chapters) else State.COMPLETE
     state_store.record(cfg.job_id, Stage.JOB, final_state,
                         duration=elapsed, artifact_path=cfg.output_path,
-                        metadata={"chapters_total": total, "chapters_dropped": dropped_chapters})
+                        metadata={
+                            "chapters_total": total,
+                            "chapters_dropped": dropped_chapters,
+                            "chapters_placeholder": len(placeholder_chapters),
+                        })
     cfg.write_progress("done", total, total, f"Pipeline complete in {elapsed/60:.1f} min", status="done")
     log.info("PIPELINE COMPLETE in %.1f minutes. Output: %s", elapsed / 60, cfg.output_path)
-    if dropped_chapters > 0:
+    if dropped_chapters > 0 or placeholder_chapters:
         log.warning(
-            "Job marked UNCERTAIN (not COMPLETE): %d/%d chapters are missing "
-            "from this output. This is not a silent success.",
-            dropped_chapters, total,
+            "Job marked UNCERTAIN (not COMPLETE): %d/%d chapters missing, "
+            "%d/%d chapters are black \"unavailable\" placeholders. This is "
+            "not a silent success.",
+            dropped_chapters, total, len(placeholder_chapters), total,
         )
 
 
