@@ -572,15 +572,43 @@ def _run_ocr_on_image(img, options=None):
 
     opts = options or OCROptions()
 
-    try:
-        # Call predict() or ocr() without invalid keyword arguments to prevent kwarg mismatch warnings
-        if hasattr(ocr, "predict") and callable(getattr(ocr, "predict")):
-            raw_result = ocr.predict(img)
-        else:
+    raw_result = None
+    if hasattr(ocr, "predict") and callable(getattr(ocr, "predict")):
+        # Per-request tuning (e.g. the pipeline's det_db_unclip_ratio=2.4 for
+        # tightly-kerned/close speech bubbles) was silently dropped when the
+        # kwarg-mismatch warning fix removed ALL predict() kwargs instead of
+        # just fixing the parameter names. Re-attempt with the real kwargs
+        # once per process; if this build's predict() rejects them, fall
+        # back to the bare call permanently instead of retrying every call.
+        if not hasattr(_run_ocr_on_image, '_predict_kwargs_supported'):
+            _run_ocr_on_image._predict_kwargs_supported = True  # type: ignore
+        if _run_ocr_on_image._predict_kwargs_supported:  # type: ignore
+            try:
+                raw_result = ocr.predict(
+                    img,
+                    text_det_unclip_ratio=opts.det_db_unclip_ratio,
+                    text_det_limit_side_len=opts.det_limit_side_len,
+                    text_det_thresh=opts.det_db_thresh,
+                    text_det_box_thresh=opts.det_db_box_thresh,
+                )
+            except TypeError as exc:
+                logger.warning("predict() rejected tuning kwargs (%s) — disabling for remaining calls", exc)
+                _run_ocr_on_image._predict_kwargs_supported = False  # type: ignore
+            except Exception as exc:
+                logger.warning("OCR inference failed: %s", exc)
+                return []
+        if raw_result is None and _run_ocr_on_image._predict_kwargs_supported is False:  # type: ignore
+            try:
+                raw_result = ocr.predict(img)
+            except Exception as exc:
+                logger.warning("OCR inference failed: %s", exc)
+                return []
+    else:
+        try:
             raw_result = ocr.ocr(img)
-    except Exception as exc:
-        logger.warning("OCR inference failed: %s", exc)
-        return []
+        except Exception as exc:
+            logger.warning("OCR inference failed: %s", exc)
+            return []
 
     regions = []  # type: List[_TextRegion]
 
@@ -932,42 +960,72 @@ async def reload_model():
     return {"ready": MODEL_READY, "model": MODEL_NAME}
 
 
+# Every image in a batch — and every batch across sequential HTTP calls —
+# used to run fully one-at-a-time: an `async def` route calling straight
+# into blocking CPU inference blocks the whole single-worker event loop, so
+# concurrent requests just queue behind each other regardless of client-side
+# batching. That serial chain (up to 6 heavy PaddleOCR/Tesseract passes per
+# panel when a panel doesn't hit SUCCESS on pass 1) is what 17min/50 panels
+# is made of, not the HTTP batch size.
+#
+# Real parallelism is opt-in and OFF by default (OCR_CONCURRENCY=1): the
+# cpu_threads=2/no-mkldnn settings above were specifically chosen to stop a
+# CPU inference deadlock, and running N inferences at once multiplies actual
+# core usage by N on top of that. Raise OCR_CONCURRENCY only after checking
+# how many OCPUs the box actually has free (e.g. 2 on a 4-OCPU free-tier
+# instance) — and watch for the deadlock symptom (a request that never
+# returns) after raising it.
+OCR_CONCURRENCY = max(1, int(os.environ.get("OCR_CONCURRENCY", "1")))
+_ocr_semaphore = None  # type: Any
+
+
+def _get_ocr_semaphore():
+    global _ocr_semaphore
+    if _ocr_semaphore is None:
+        import asyncio
+        _ocr_semaphore = asyncio.Semaphore(OCR_CONCURRENCY)
+    return _ocr_semaphore
+
+
+async def _ocr_one(idx, img_path, options):
+    # type: (int, str, Optional[OCROptions]) -> OCRResult
+    import asyncio
+    img_array = _load_image_from_path(img_path)
+    if img_array is None:
+        logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
+        return OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image")
+
+    async with _get_ocr_semaphore():
+        text, avg_conf, region_count, status, quality_score, candidates, reason = await asyncio.to_thread(
+            _ocr_with_cascade, img_array, options
+        )
+
+    if region_count == 0:
+        logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
+
+    return OCRResult(
+        index=idx, text=text, confidence=avg_conf, regions=region_count,
+        status=status, quality_score=quality_score, candidates=candidates, selection_reason=reason,
+    )
+
+
 @app.post("/ocr/batch", response_model=BatchOCRResponse)
 async def ocr_batch(request: BatchOCRRequest):
     """
     Accepts a list of absolute file paths to images.
     Returns an array of {index, text, confidence, regions} objects.
+    Images within (and across concurrent) requests run with up to
+    OCR_CONCURRENCY inferences in flight at once; default 1 = old
+    fully-sequential behaviour.
     """
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="OCR model not initialised")
 
+    import asyncio
     t_start = time.perf_counter()
-    results = []  # type: List[OCRResult]
-
-    for idx, img_path in enumerate(request.images):
-        img_array = _load_image_from_path(img_path)
-        if img_array is None:
-            logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
-            results.append(OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image"))
-            continue
-
-        text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
-
-        if region_count == 0:
-            logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
-
-        results.append(
-            OCRResult(
-                index=idx,
-                text=text,
-                confidence=avg_conf,
-                regions=region_count,
-                status=status,
-                quality_score=quality_score,
-                candidates=candidates,
-                selection_reason=reason,
-            )
-        )
+    results = list(await asyncio.gather(*[
+        _ocr_one(idx, img_path, request.options) for idx, img_path in enumerate(request.images)
+    ]))  # type: List[OCRResult]
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(

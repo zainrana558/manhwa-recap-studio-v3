@@ -1070,9 +1070,12 @@ async function setOcrCached(key: string, text: string, status = 'SUCCESS'): Prom
  * text extraction. Unlike VLM, OCR runs entirely on-device with no API keys
  * or network latency.
  *
- * The function sends images in batches of 20 to the PaddleOCR service's
- * `/ocr/batch` endpoint. Results are cached per-image (same cache key as VLM)
- * so re-runs are instant.
+ * The function sends images in chunks of BATCH_SIZE to the PaddleOCR service's
+ * `/ocr/batch` endpoint, one HTTP call at a time. Results are cached per-image
+ * (same cache key as VLM) so re-runs are instant. The server processes a batch
+ * with up to OCR_CONCURRENCY inferences in flight (see paddleocr-service);
+ * chunking here only bounds request/response payload size, it does not by
+ * itself add parallelism — that's controlled server-side.
  *
  * @param imagePaths - Absolute paths to panel/page images
  * @param onProgress - Optional callback (done, total) for progress tracking
