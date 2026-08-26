@@ -26,10 +26,30 @@ kill_service() {
   sleep 1
 }
 
+kill_port() {
+  # kill_service matches by process command-line pattern, which silently
+  # misses anything started with a slightly different invocation (a
+  # different interpreter path, an old checkout, a leftover from before a
+  # refactor). Whatever is actually bound to the port is unambiguous --
+  # use that as the ground truth instead of guessing a name pattern.
+  local port="$1"
+  local pids
+  pids=$(ss -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -oP 'pid=\K[0-9]+' | sort -u)
+  if [ -n "$pids" ]; then
+    echo "  (killing stale process(es) on port $port: $pids)"
+    kill -9 $pids 2>/dev/null
+  fi
+  for _ in $(seq 1 20); do
+    ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" || return 0
+    sleep 0.5
+  done
+}
+
 echo "=== Starting Manhwa Recap Studio services ==="
 
 # 1. PaddleOCR (port 3002)
 kill_service "python3 main.py"
+kill_port 3002
 echo "[1/3] Starting PaddleOCR on port 3002..."
 cd "$PROJECT_DIR/mini-services/paddleocr-service"
 setsid python3 main.py > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
@@ -53,6 +73,7 @@ fi
 
 # 2. Pipeline service (port 3001)
 kill_service "bun index.ts"
+kill_port 3001
 echo "[2/3] Starting Pipeline on port 3001..."
 cd "$PROJECT_DIR/mini-services/pipeline-service"
 setsid bun run start > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null &
@@ -65,11 +86,26 @@ fi
 
 # 3. Next.js (port 3000)
 kill_service "server.js"
+kill_port 3000
 echo "[3/3] Starting Next.js on port 3000..."
 cd "$PROJECT_DIR"
 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
-sleep 3
-if curl -s http://localhost:3000/ | head -c 5 | grep -q DOCTYPE; then
+# Old check did `head -c 5 | grep -q DOCTYPE`: "<!DOCTYPE html>" truncated to
+# 5 bytes is "<!DOC" -- grep can never find the 7-byte string "DOCTYPE"
+# inside a 5-byte string. This check was reporting failure unconditionally,
+# regardless of whether Next.js was actually up. Check the real HTTP status
+# instead, with a poll loop since a cold Turbopack start can take a few
+# seconds.
+ready=0
+for _ in $(seq 1 20); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null)
+  if [ "$code" = "200" ]; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" = "1" ]; then
   echo "  ✅ Next.js running"
 else
   echo "  ❌ Next.js failed - check $LOG_DIR/nextjs.log"
