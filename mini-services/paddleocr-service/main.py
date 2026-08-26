@@ -306,7 +306,16 @@ class _TextRegion:
 
 import re
 
-CONFIDENCE_CUTOFF = 0.70
+# Regions below this are dropped BEFORE merging, so this is a hard "never
+# transcribed" floor, not a quality label. 0.70 (introduced in the speed
+# refactor) silently discarded most real dialogue: PaddleOCR routinely
+# scores stylized/small webtoon speech-bubble text in the 0.4-0.65 range,
+# while bold high-contrast SFX text scores 0.7-0.95 — so raising the cutoff
+# left SFX intact but erased normal dialogue lines wholesale (they never
+# reached the confidence>=0.55 SUCCESS check downstream, or _merge_regions
+# at all). Genuine noise is caught separately by the symbol/artifact/logo
+# filters below, not by this cutoff, so it doesn't need to be high.
+CONFIDENCE_CUTOFF = 0.40
 SYMBOL_RATIO_LIMIT = 0.35
 
 
