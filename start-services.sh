@@ -6,7 +6,23 @@ PROJECT_DIR="$HOME/manhwa-recap-studio-v3"
 LOG_DIR="/tmp"
 
 kill_service() {
-  pkill -f "$1" 2>/dev/null
+  # Plain `sleep 1` after pkill isn't reliable: uvicorn installs a SIGTERM
+  # handler for graceful shutdown, so a process mid-request (or mid-init,
+  # once past module load) can take longer than 1s to actually release its
+  # port -- the next step then binds too early, the new process dies on
+  # "address already in use", and the OLD process silently keeps serving
+  # (exactly what happened on this box: health checks kept answering from
+  # a stale process while the new one's log showed nothing but a bind
+  # error). Poll until the process is actually gone instead of guessing.
+  local pattern="$1"
+  pkill -f "$pattern" 2>/dev/null
+  for _ in $(seq 1 20); do
+    pgrep -f "$pattern" > /dev/null || return 0
+    sleep 0.5
+  done
+  # Still alive after 10s of SIGTERM -- force it so we don't proceed with
+  # two processes fighting over the same port.
+  pkill -9 -f "$pattern" 2>/dev/null
   sleep 1
 }
 
@@ -17,8 +33,19 @@ kill_service "python3 main.py"
 echo "[1/3] Starting PaddleOCR on port 3002..."
 cd "$PROJECT_DIR/mini-services/paddleocr-service"
 setsid python3 main.py > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
-sleep 8
-if curl -s http://localhost:3002/health | grep -q ready; then
+# Poll for real readiness instead of a fixed sleep + a substring grep that
+# matches "ready":false as happily as "ready":true. Model init (with the
+# self-healing kwarg retries, or a cold model download) can legitimately
+# take longer than a fixed 8s, so give it a real timeout instead of a guess.
+ready=0
+for _ in $(seq 1 60); do
+  if curl -s http://localhost:3002/health | grep -q '"ready":[[:space:]]*true'; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+if [ "$ready" = "1" ]; then
   echo "  ✅ PaddleOCR ready"
 else
   echo "  ❌ PaddleOCR failed - check $LOG_DIR/paddleocr.log"
