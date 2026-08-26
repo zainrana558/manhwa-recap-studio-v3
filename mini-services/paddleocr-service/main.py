@@ -9,9 +9,15 @@ Port: 3002
 """
 
 import os
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
+# Tuned for a 2 OCPU box: 1 thread per inference call, so that running
+# OCR_CONCURRENCY=2 concurrent inferences (2x1 threads) exactly fills 2
+# cores without oversubscribing them. The prior cpu_threads=4 setting
+# (single inference, no concurrency) oversubscribed this same 2-core class
+# of box on its own and deadlocked; keep this at 1 unless the box has more
+# cores AND you correspondingly lower OCR_CONCURRENCY to match.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import base64
 import io
@@ -86,7 +92,7 @@ def _init_ocr():
                     use_angle_cls=True,
                     det_db_thresh=0.3,
                     det_limit_side_len=1216,
-                    cpu_threads=2,
+                    cpu_threads=int(os.environ.get("PADDLE_CPU_THREADS", "1")),
                     enable_mkldnn=False,
                     use_gpu=False,
                 )
@@ -968,13 +974,14 @@ async def reload_model():
 # panel when a panel doesn't hit SUCCESS on pass 1) is what 17min/50 panels
 # is made of, not the HTTP batch size.
 #
-# Real parallelism is opt-in and OFF by default (OCR_CONCURRENCY=1): the
-# cpu_threads=2/no-mkldnn settings above were specifically chosen to stop a
-# CPU inference deadlock, and running N inferences at once multiplies actual
-# core usage by N on top of that. Raise OCR_CONCURRENCY only after checking
-# how many OCPUs the box actually has free (e.g. 2 on a 4-OCPU free-tier
-# instance) — and watch for the deadlock symptom (a request that never
-# returns) after raising it.
+# Real parallelism is opt-in and OFF by default (OCR_CONCURRENCY=1).
+# On this box (2 OCPU): PADDLE_CPU_THREADS defaults to 1, so
+# OCR_CONCURRENCY=2 exactly fills both cores without oversubscribing —
+# that combination is the recommended setting here. Do NOT raise
+# OCR_CONCURRENCY without also lowering PADDLE_CPU_THREADS so
+# (OCR_CONCURRENCY x PADDLE_CPU_THREADS) stays <= nproc, or you'll
+# reproduce the exact oversubscription deadlock the old cpu_threads=4
+# setting caused on this same 2-core class of box.
 OCR_CONCURRENCY = max(1, int(os.environ.get("OCR_CONCURRENCY", "1")))
 _ocr_semaphore = None  # type: Any
 
