@@ -82,29 +82,51 @@ def _init_ocr():
     def _try_init(ocr_version):
         # type: (str) -> Any
         from paddleocr import PaddleOCR
+        import re as _re
         last_exc = None  # type: Optional[Exception]
         delay = 10
         for attempt in range(1, MODEL_INIT_RETRIES + 1):
-            try:
-                return PaddleOCR(
-                    ocr_version=ocr_version,
-                    lang="en",
-                    use_angle_cls=True,
-                    det_db_thresh=0.3,
-                    det_limit_side_len=1216,
-                    cpu_threads=int(os.environ.get("PADDLE_CPU_THREADS", "1")),
-                    enable_mkldnn=False,
-                    use_gpu=False,
+            init_kwargs = {
+                "ocr_version": ocr_version,
+                "lang": "en",
+                "use_angle_cls": True,
+                "det_db_thresh": 0.3,
+                "det_limit_side_len": 1216,
+                "cpu_threads": int(os.environ.get("PADDLE_CPU_THREADS", "1")),
+                "enable_mkldnn": False,
+                "use_gpu": False,
+            }
+            # Installed paddleocr/paddlex versions vary in which constructor
+            # kwargs they accept -- renames/removals land silently between
+            # releases (use_gpu was dropped entirely in some builds, as hit
+            # on the OCI box: "Unknown argument: use_gpu"). Rather than
+            # hardcode one version's parameter names, drop whichever single
+            # kwarg the installed version rejects and retry construction
+            # immediately -- self-heals across version drift instead of
+            # burning through all MODEL_INIT_RETRIES on a deterministic,
+            # never-going-to-succeed argument error.
+            attempt_exc = None  # type: Optional[Exception]
+            for _ in range(len(init_kwargs) + 1):
+                try:
+                    return PaddleOCR(**init_kwargs)
+                except Exception as exc:
+                    m = _re.match(r"Unknown argument:\s*(\w+)", str(exc))
+                    if m and m.group(1) in init_kwargs:
+                        bad_kwarg = m.group(1)
+                        logger.warning("%s: dropping unsupported constructor kwarg '%s' (%s)", ocr_version, bad_kwarg, exc)
+                        del init_kwargs[bad_kwarg]
+                        attempt_exc = exc
+                        continue
+                    attempt_exc = exc
+                    break
+            last_exc = attempt_exc
+            if attempt < MODEL_INIT_RETRIES:
+                logger.warning(
+                    "%s init attempt %d/%d failed (%s) — retrying in %ds",
+                    ocr_version, attempt, MODEL_INIT_RETRIES, last_exc, delay,
                 )
-            except Exception as exc:
-                last_exc = exc
-                if attempt < MODEL_INIT_RETRIES:
-                    logger.warning(
-                        "%s init attempt %d/%d failed (%s) — retrying in %ds",
-                        ocr_version, attempt, MODEL_INIT_RETRIES, exc, delay,
-                    )
-                    time.sleep(delay)
-                    delay = min(delay * 2, 120)
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
         raise last_exc  # type: ignore
 
     try:
