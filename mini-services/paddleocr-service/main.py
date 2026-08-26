@@ -9,15 +9,14 @@ Port: 3002
 """
 
 import os
-# Tuned for a 2 OCPU box: 1 thread per inference call, so that running
-# OCR_CONCURRENCY=2 concurrent inferences (2x1 threads) exactly fills 2
-# cores without oversubscribing them. The prior cpu_threads=4 setting
-# (single inference, no concurrency) oversubscribed this same 2-core class
-# of box on its own and deadlocked; keep this at 1 unless the box has more
-# cores AND you correspondingly lower OCR_CONCURRENCY to match.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+# Prevent OpenMP and C++ thread collisions & PIR interpreter SIGSEGV
+os.environ["FLAGS_enable_pir_api"] = "0"          # Disable experimental PIR interpreter
+os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import base64
 import io
@@ -92,7 +91,7 @@ def _init_ocr():
                 "use_angle_cls": True,
                 "det_db_thresh": 0.3,
                 "det_limit_side_len": 1216,
-                "cpu_threads": int(os.environ.get("PADDLE_CPU_THREADS", "1")),
+                "cpu_threads": 1,
                 "enable_mkldnn": False,
                 "use_gpu": False,
             }
@@ -590,96 +589,100 @@ def parse_ocr_results(result):
 def _run_ocr_on_image(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array and return structured regions."""
-    global ocr
-    if ocr is None:
-        return []
-
-    # One-time debug flag to dump result structure
-    if not hasattr(_run_ocr_on_image, '_debugged'):
-        _run_ocr_on_image._debugged = False  # type: ignore
-
-    opts = options or OCROptions()
-
-    raw_result = None
-    if hasattr(ocr, "predict") and callable(getattr(ocr, "predict")):
-        # Per-request tuning (e.g. the pipeline's det_db_unclip_ratio=2.4 for
-        # tightly-kerned/close speech bubbles) was silently dropped when the
-        # kwarg-mismatch warning fix removed ALL predict() kwargs instead of
-        # just fixing the parameter names. Re-attempt with the real kwargs
-        # once per process; if this build's predict() rejects them, fall
-        # back to the bare call permanently instead of retrying every call.
-        if not hasattr(_run_ocr_on_image, '_predict_kwargs_supported'):
-            _run_ocr_on_image._predict_kwargs_supported = True  # type: ignore
-        if _run_ocr_on_image._predict_kwargs_supported:  # type: ignore
-            try:
-                raw_result = ocr.predict(
-                    img,
-                    text_det_unclip_ratio=opts.det_db_unclip_ratio,
-                    text_det_limit_side_len=opts.det_limit_side_len,
-                    text_det_thresh=opts.det_db_thresh,
-                    text_det_box_thresh=opts.det_db_box_thresh,
-                )
-            except TypeError as exc:
-                logger.warning("predict() rejected tuning kwargs (%s) — disabling for remaining calls", exc)
-                _run_ocr_on_image._predict_kwargs_supported = False  # type: ignore
-            except Exception as exc:
-                logger.warning("OCR inference failed: %s", exc)
-                return []
-        if raw_result is None and _run_ocr_on_image._predict_kwargs_supported is False:  # type: ignore
-            try:
-                raw_result = ocr.predict(img)
-            except Exception as exc:
-                logger.warning("OCR inference failed: %s", exc)
-                return []
-    else:
-        try:
-            raw_result = ocr.ocr(img)
-        except Exception as exc:
-            logger.warning("OCR inference failed: %s", exc)
+    try:
+        global ocr
+        if ocr is None:
             return []
 
-    regions = []  # type: List[_TextRegion]
+        # One-time debug flag to dump result structure
+        if not hasattr(_run_ocr_on_image, '_debugged'):
+            _run_ocr_on_image._debugged = False  # type: ignore
 
-    if not raw_result:
+        opts = options or OCROptions()
+
+        raw_result = None
+        if hasattr(ocr, "predict") and callable(getattr(ocr, "predict")):
+            # Per-request tuning (e.g. the pipeline's det_db_unclip_ratio=2.4 for
+            # tightly-kerned/close speech bubbles) was silently dropped when the
+            # kwarg-mismatch warning fix removed ALL predict() kwargs instead of
+            # just fixing the parameter names. Re-attempt with the real kwargs
+            # once per process; if this build's predict() rejects them, fall
+            # back to the bare call permanently instead of retrying every call.
+            if not hasattr(_run_ocr_on_image, '_predict_kwargs_supported'):
+                _run_ocr_on_image._predict_kwargs_supported = True  # type: ignore
+            if _run_ocr_on_image._predict_kwargs_supported:  # type: ignore
+                try:
+                    raw_result = ocr.predict(
+                        img,
+                        text_det_unclip_ratio=opts.det_db_unclip_ratio,
+                        text_det_limit_side_len=opts.det_limit_side_len,
+                        text_det_thresh=opts.det_db_thresh,
+                        text_det_box_thresh=opts.det_db_box_thresh,
+                    )
+                except TypeError as exc:
+                    logger.warning("predict() rejected tuning kwargs (%s) — disabling for remaining calls", exc)
+                    _run_ocr_on_image._predict_kwargs_supported = False  # type: ignore
+                except Exception as exc:
+                    logger.warning("OCR inference failed: %s", exc)
+                    return []
+            if raw_result is None and _run_ocr_on_image._predict_kwargs_supported is False:  # type: ignore
+                try:
+                    raw_result = ocr.predict(img)
+                except Exception as exc:
+                    logger.warning("OCR inference failed: %s", exc)
+                    return []
+        else:
+            try:
+                raw_result = ocr.ocr(img)
+            except Exception as exc:
+                logger.warning("OCR inference failed: %s", exc)
+                return []
+
+        regions = []  # type: List[_TextRegion]
+
+        if not raw_result:
+            return regions
+
+        lines = parse_ocr_results(raw_result)
+        img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
+
+        for line_data in lines:
+            text = line_data.get("text", "")
+            confidence = float(line_data.get("confidence", 0.0))
+            box = line_data.get("box")
+
+            if not box or not isinstance(box, (list, tuple)) or len(box) == 0:
+                continue
+
+            try:
+                xs = [float(pt[0]) for pt in box]
+                ys = [float(pt[1]) for pt in box]
+            except (TypeError, ValueError, IndexError):
+                continue
+
+            reg = _TextRegion(
+                text=text,
+                confidence=confidence,
+                x_min=min(xs), y_min=min(ys),
+                y_max=max(ys), x_max=max(xs),
+            )
+
+            # Scrubbing & filtering rules
+            if confidence < CONFIDENCE_CUTOFF:
+                continue
+            if _is_slash_or_math_artifact(text):
+                continue
+            if _symbol_ratio_exceeded(text):
+                continue
+            if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
+                continue
+
+            regions.append(reg)
+
         return regions
-
-    lines = parse_ocr_results(raw_result)
-    img_h, img_w = img.shape[:2] if hasattr(img, 'shape') and len(img.shape) >= 2 else (0, 0)
-
-    for line_data in lines:
-        text = line_data.get("text", "")
-        confidence = float(line_data.get("confidence", 0.0))
-        box = line_data.get("box")
-
-        if not box or not isinstance(box, (list, tuple)) or len(box) == 0:
-            continue
-
-        try:
-            xs = [float(pt[0]) for pt in box]
-            ys = [float(pt[1]) for pt in box]
-        except (TypeError, ValueError, IndexError):
-            continue
-
-        reg = _TextRegion(
-            text=text,
-            confidence=confidence,
-            x_min=min(xs), y_min=min(ys),
-            y_max=max(ys), x_max=max(xs),
-        )
-
-        # Scrubbing & filtering rules
-        if confidence < CONFIDENCE_CUTOFF:
-            continue
-        if _is_slash_or_math_artifact(text):
-            continue
-        if _symbol_ratio_exceeded(text):
-            continue
-        if _is_graphic_logo(reg, img_h=img_h, img_w=img_w):
-            continue
-
-        regions.append(reg)
-
-    return regions
+    except Exception as exc:
+        logger.error("Unexpected error in _run_ocr_on_image: %s", exc, exc_info=True)
+        return []
 
 
 def _load_image_from_path(file_path):
@@ -871,85 +874,89 @@ def _ocr_with_cascade(img, options=None):
     UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
     Automatically detects high-density UI/quest cards to set det_limit_side_len >= 1216.
     """
-    opts = options or OCROptions()
-    is_ui_box = _detect_ui_card_or_borders(img)
-    if is_ui_box and opts.det_limit_side_len < 1216:
-        opts = opts.copy(update={"det_limit_side_len": 1216})
-
-    # Pass 1: Standard PaddleOCR
-    regions = _run_ocr_on_image(img, opts)
-    merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
-    status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
-
-    candidates = [{
-        "text": merged_text, "confidence": avg_conf, "regions": region_count,
-        "provider": "paddleocr", "model": MODEL_NAME, "variant": "standard",
-    }]
-
-    best_tuple = (merged_text, avg_conf, region_count, status, quality_score, candidates, reason)
-
-    if status == "SUCCESS":
-        return best_tuple
-
-    # Pass 2: PaddleOCR with preprocessing variants (upscale, contrast, invert)
-    preprocessing_passes = [
-        ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),
-        ("contrast_clahe", _preprocess_contrast),
-        ("color_inverted", _preprocess_invert),
-    ]
-
-    for variant_name, prep_fn in preprocessing_passes:
-        prep_img = prep_fn(img)
-        var_regions = _run_ocr_on_image(prep_img, options)
-        var_text, var_conf, var_count = _merge_regions(var_regions)
-        var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
-
-        candidates.append({
-            "text": var_text, "confidence": var_conf, "regions": var_count,
-            "provider": "paddleocr", "model": MODEL_NAME, "variant": variant_name,
-        })
-
-        if var_status == "SUCCESS" and var_quality > best_tuple[4]:
-            best_tuple = (
-                var_text, var_conf, var_count, var_status, var_quality,
-                candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
-            )
-            return best_tuple
-        elif var_quality > best_tuple[4]:
-            best_tuple = (
-                var_text, var_conf, var_count, var_status, var_quality,
-                candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
-            )
-
-    # Pass 3: Tesseract fallback with original & preprocessed images (guarded to prevent exception spikes)
     try:
-        tess_passes = [
-            ("standard", img),
-            ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
-            ("contrast_clahe", _preprocess_contrast(img)),
+        opts = options or OCROptions()
+        is_ui_box = _detect_ui_card_or_borders(img)
+        if is_ui_box and opts.det_limit_side_len < 1216:
+            opts = opts.copy(update={"det_limit_side_len": 1216})
+
+        # Pass 1: Standard PaddleOCR
+        regions = _run_ocr_on_image(img, opts)
+        merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
+        status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
+
+        candidates = [{
+            "text": merged_text, "confidence": avg_conf, "regions": region_count,
+            "provider": "paddleocr", "model": MODEL_NAME, "variant": "standard",
+        }]
+
+        best_tuple = (merged_text, avg_conf, region_count, status, quality_score, candidates, reason)
+
+        if status == "SUCCESS":
+            return best_tuple
+
+        # Pass 2: PaddleOCR with preprocessing variants (upscale, contrast, invert)
+        preprocessing_passes = [
+            ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),
+            ("contrast_clahe", _preprocess_contrast),
+            ("color_inverted", _preprocess_invert),
         ]
 
-        for tess_variant, t_img in tess_passes:
-            tess_text, tess_conf = _run_tesseract_ocr(t_img)
-            if not tess_text:
-                continue
+        for variant_name, prep_fn in preprocessing_passes:
+            prep_img = prep_fn(img)
+            var_regions = _run_ocr_on_image(prep_img, options)
+            var_text, var_conf, var_count = _merge_regions(var_regions)
+            var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
 
-            tess_regions = len(tess_text.split())
             candidates.append({
-                "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
-                "provider": "tesseract", "model": "tesseract", "variant": tess_variant,
+                "text": var_text, "confidence": var_conf, "regions": var_count,
+                "provider": "paddleocr", "model": MODEL_NAME, "variant": variant_name,
             })
 
-            tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
-            if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
-                return (
-                    tess_text, tess_conf, tess_regions, tess_status, tess_quality,
-                    candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
+            if var_status == "SUCCESS" and var_quality > best_tuple[4]:
+                best_tuple = (
+                    var_text, var_conf, var_count, var_status, var_quality,
+                    candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
                 )
-    except Exception as tess_err:
-        logger.warning("Tesseract fallback cascade failed gracefully: %s", tess_err)
+                return best_tuple
+            elif var_quality > best_tuple[4]:
+                best_tuple = (
+                    var_text, var_conf, var_count, var_status, var_quality,
+                    candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
+                )
 
-    return best_tuple
+        # Pass 3: Tesseract fallback with original & preprocessed images (guarded to prevent exception spikes)
+        try:
+            tess_passes = [
+                ("standard", img),
+                ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
+                ("contrast_clahe", _preprocess_contrast(img)),
+            ]
+
+            for tess_variant, t_img in tess_passes:
+                tess_text, tess_conf = _run_tesseract_ocr(t_img)
+                if not tess_text:
+                    continue
+
+                tess_regions = len(tess_text.split())
+                candidates.append({
+                    "text": tess_text, "confidence": tess_conf, "regions": tess_regions,
+                    "provider": "tesseract", "model": "tesseract", "variant": tess_variant,
+                })
+
+                tess_status, tess_quality, tess_reason = _quality_status(tess_text, tess_conf, tess_regions)
+                if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
+                    return (
+                        tess_text, tess_conf, tess_regions, tess_status, tess_quality,
+                        candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
+                    )
+        except Exception as tess_err:
+            logger.warning("Tesseract fallback cascade failed gracefully: %s", tess_err)
+
+        return best_tuple
+    except Exception as exc:
+        logger.error("Unexpected error in _ocr_with_cascade: %s", exc, exc_info=True)
+        return "", 0.0, 0, "FAILED", 0.0, [], f"ocr_cascade_exception:{exc}"
 
 
 def _quality_status(text, confidence, regions):
@@ -1019,23 +1026,30 @@ def _get_ocr_semaphore():
 async def _ocr_one(idx, img_path, options):
     # type: (int, str, Optional[OCROptions]) -> OCRResult
     import asyncio
-    img_array = _load_image_from_path(img_path)
-    if img_array is None:
-        logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
-        return OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image")
+    try:
+        img_array = _load_image_from_path(img_path)
+        if img_array is None:
+            logger.warning("Skipping unreadable image at index %d: %s", idx, img_path)
+            return OCRResult(index=idx, text="", confidence=0.0, regions=0, status="FAILED", quality_score=0.0, selection_reason="unreadable_image")
 
-    async with _get_ocr_semaphore():
-        text, avg_conf, region_count, status, quality_score, candidates, reason = await asyncio.to_thread(
-            _ocr_with_cascade, img_array, options
+        async with _get_ocr_semaphore():
+            text, avg_conf, region_count, status, quality_score, candidates, reason = await asyncio.to_thread(
+                _ocr_with_cascade, img_array, options
+            )
+
+        if region_count == 0:
+            logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
+
+        return OCRResult(
+            index=idx, text=text, confidence=avg_conf, regions=region_count,
+            status=status, quality_score=quality_score, candidates=candidates, selection_reason=reason,
         )
-
-    if region_count == 0:
-        logger.warning("[OCR] Zero regions detected for %s (index %d) — panel may be blank, or detection failed", img_path, idx)
-
-    return OCRResult(
-        index=idx, text=text, confidence=avg_conf, regions=region_count,
-        status=status, quality_score=quality_score, candidates=candidates, selection_reason=reason,
-    )
+    except Exception as exc:
+        logger.error("[OCR] Exception during OCR for image %s at index %d: %s", img_path, idx, exc, exc_info=True)
+        return OCRResult(
+            index=idx, text="", confidence=0.0, regions=0, status="FAILED",
+            quality_score=0.0, candidates=[], selection_reason=f"ocr_exception:{exc}",
+        )
 
 
 @app.post("/ocr/batch", response_model=BatchOCRResponse)
@@ -1085,7 +1099,11 @@ async def ocr_base64(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
+    try:
+        text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
+    except Exception as exc:
+        logger.error("Base64 OCR exception: %s", exc, exc_info=True)
+        text, avg_conf, region_count, status, quality_score, candidates, reason = "", 0.0, 0, "FAILED", 0.0, [], f"ocr_exception:{exc}"
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
@@ -1122,7 +1140,11 @@ async def ocr_single(request: Base64OCRRequest):
     if img_array is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
+    try:
+        text, avg_conf, region_count, status, quality_score, candidates, reason = _ocr_with_cascade(img_array, request.options)
+    except Exception as exc:
+        logger.error("Single OCR exception: %s", exc, exc_info=True)
+        text, avg_conf, region_count, status, quality_score, candidates, reason = "", 0.0, 0, "FAILED", 0.0, [], f"ocr_exception:{exc}"
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
     logger.info(
