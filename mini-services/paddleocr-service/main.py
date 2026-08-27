@@ -818,7 +818,7 @@ def _ocr_with_cascade(img, options=None):
     tess_passes = [
         ("standard", img),
         ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
-        ("contrast_clahe", _preprocess_contrast),
+        ("contrast_clahe", _preprocess_contrast(img)),
     ]
 
     for tess_variant, t_img in tess_passes:

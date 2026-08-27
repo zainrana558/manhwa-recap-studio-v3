@@ -1056,11 +1056,27 @@ async function processJob(jobId: string): Promise<void> {
           const uncertainRatio = regionsWithText > 0 ? uncertainWithRegions / regionsWithText : 0
           const recognizerStruggling = uncertainWithRegions >= 4 && uncertainRatio > 0.5
 
-          if (batchCallFailures > 0) {
+          // batchCallFailures used to mean "an entire ~20-image HTTP call to
+          // the OCR service failed" — a rare, strong signal of a genuinely
+          // broken/unreachable service, so any occurrence at all (>0) was a
+          // reasonable trigger. Since generateImageNarrationsOCR moved to
+          // one-panel-per-HTTP-request (better fault isolation: a single
+          // slow/hanging image can no longer time out an entire batch), this
+          // counter now increments per INDIVIDUAL PANEL that exhausts all 3
+          // retries. A single hard-to-process image (blurry scan, corrupt
+          // JPEG, extreme rotation) is normal at real-world scale and no
+          // longer implies the service itself is broken — so >0 would now
+          // discard every successfully-OCR'd panel in the chapter over one
+          // unlucky image, every single run. Apply the same "systemic, not
+          // a couple of hard crops" bar used by recognizerStruggling above.
+          const batchFailureRatio = freshlyProcessed > 0 ? batchCallFailures / freshlyProcessed : 0
+          const ocrServiceFailing = freshlyProcessed <= 3 ? batchCallFailures > 0 : batchFailureRatio > 0.3
+
+          if (ocrServiceFailing) {
             await emitLog(jobId, 'warn', 'transcribe',
-              `Chapter ${ch.index}: PaddleOCR service call failed ${batchCallFailures}x — falling back to VLM for this chapter`,
+              `Chapter ${ch.index}: PaddleOCR failed on ${batchCallFailures}/${freshlyProcessed} panels — falling back to VLM for this chapter`,
             )
-            throw new Error(`OCR service unreachable/erroring (${batchCallFailures} batch failures)`)
+            throw new Error(`OCR service unreachable/erroring (${batchCallFailures}/${freshlyProcessed} panel failures)`)
           }
           if (detectorNeverFired) {
             await emitLog(jobId, 'warn', 'transcribe',
