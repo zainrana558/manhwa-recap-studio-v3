@@ -1,6 +1,9 @@
+import os
 import importlib.util
 import sys
 from pathlib import Path
+
+os.environ["SKIP_OCR_INIT"] = "1"
 
 # Load parse_ocr_results dynamically from mini-services/paddleocr-service/main.py
 main_path = Path(__file__).parent.parent / "mini-services" / "paddleocr-service" / "main.py"

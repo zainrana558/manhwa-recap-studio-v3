@@ -249,6 +249,213 @@ class Chapter:
 
 
 # ---------------------------------------------------------------------------
+# Canonical Frame Identity & Manifest Data Model (v2.0 Schema)
+# ---------------------------------------------------------------------------
+
+MANIFEST_VERSION = "2.0"
+
+
+@dataclass
+class FrameEntry:
+    frame_id: str
+    filename: str
+    path: str
+    source_page: str
+    source_index: int
+    frame_kind: str = "panel"  # "panel" | "scroll_frame" | "full_page"
+    ocr_status: str = "NONE"
+    ocr_text: str = ""
+    narration_text: str = ""
+    audio_path: Optional[str] = None
+    duration: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "frame_id": self.frame_id,
+            "filename": self.filename,
+            "path": self.path,
+            "source_page": self.source_page,
+            "source_index": self.source_index,
+            "frame_kind": self.frame_kind,
+            "ocr_status": self.ocr_status,
+            "ocr_text": self.ocr_text,
+            "narration_text": self.narration_text,
+            "audio_path": self.audio_path,
+            "duration": self.duration,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, default_chapter_tag: str = "chap_000") -> "FrameEntry":
+        fname = str(data.get("filename") or "")
+        fpath = str(data.get("path") or "")
+        if not fname and fpath:
+            fname = Path(fpath).name
+
+        fid = str(data.get("frame_id") or "")
+        if not fid:
+            if fname:
+                stem = Path(fname).stem
+                fid = f"{default_chapter_tag}_{stem}"
+            else:
+                fid = f"{default_chapter_tag}_frame_00000"
+
+        return cls(
+            frame_id=fid,
+            filename=fname,
+            path=fpath,
+            source_page=str(data.get("source_page") or ""),
+            source_index=int(data.get("source_index", 0)),
+            frame_kind=str(data.get("frame_kind") or "panel"),
+            ocr_status=str(data.get("ocr_status") or "NONE"),
+            ocr_text=str(data.get("ocr_text") or ""),
+            narration_text=str(data.get("narration_text") or ""),
+            audio_path=data.get("audio_path"),
+            duration=float(data["duration"]) if data.get("duration") is not None else None,
+        )
+
+
+@dataclass
+class CanonicalManifest:
+    manifest_version: str
+    job_id: str
+    chapter_tag: str
+    source_pages: List[str]
+    frames: List[FrameEntry]
+
+    def to_dict(self) -> dict:
+        return {
+            "manifest_version": self.manifest_version,
+            "job_id": self.job_id,
+            "chapter_tag": self.chapter_tag,
+            "source_pages": self.source_pages,
+            "frames": [f.to_dict() for f in self.frames],
+            "legacy_frames": [f.path for f in self.frames],
+            "sources": [f.source_index for f in self.frames],
+        }
+
+    def save(self, manifest_path: Path) -> None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp_path.replace(manifest_path)
+
+
+def load_or_migrate_manifest(
+    manifest_path: Path,
+    chapter: Optional[Chapter] = None,
+    job_id: str = "local",
+) -> Optional[CanonicalManifest]:
+    """Load a manifest file. If legacy v1 format, migrate explicitly to v2.0."""
+    if not manifest_path.exists():
+        return None
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Manifest %s is invalid JSON: %s", manifest_path, exc)
+        return None
+
+    chapter_tag = chapter.tag if chapter else str(data.get("chapter_tag") or "chap_000")
+    source_pages = []
+    if "source_pages" in data and isinstance(data["source_pages"], list):
+        source_pages = [str(sp) for sp in data["source_pages"]]
+    elif chapter:
+        source_pages = [p.name for p in chapter.panel_paths]
+
+    raw_frames = data.get("frames")
+    if not isinstance(raw_frames, list):
+        return None
+
+    if data.get("manifest_version") == MANIFEST_VERSION and raw_frames and isinstance(raw_frames[0], dict):
+        entries = [FrameEntry.from_dict(f, chapter_tag) for f in raw_frames]
+        manifest = CanonicalManifest(
+            manifest_version=MANIFEST_VERSION,
+            job_id=str(data.get("job_id") or job_id),
+            chapter_tag=chapter_tag,
+            source_pages=source_pages or [str(sp) for sp in data.get("source_pages", [])],
+            frames=entries,
+        )
+        return manifest
+
+    sources = data.get("sources") or []
+    entries = []
+    for idx, f_item in enumerate(raw_frames):
+        if isinstance(f_item, str):
+            fpath = f_item
+            fname = Path(f_item).name
+            src_idx = sources[idx] if idx < len(sources) and isinstance(sources[idx], int) else 0
+            src_page = source_pages[src_idx] if src_idx < len(source_pages) else f"page_{src_idx:03d}.jpg"
+            frame_id = f"{chapter_tag}_frame_{idx:05d}"
+            entries.append(
+                FrameEntry(
+                    frame_id=frame_id,
+                    filename=fname,
+                    path=fpath,
+                    source_page=src_page,
+                    source_index=src_idx,
+                    frame_kind="panel",
+                )
+            )
+        elif isinstance(f_item, dict):
+            entries.append(FrameEntry.from_dict(f_item, chapter_tag))
+
+    migrated = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=str(data.get("job_id") or job_id),
+        chapter_tag=chapter_tag,
+        source_pages=source_pages,
+        frames=entries,
+    )
+    try:
+        migrated.save(manifest_path)
+        log.info("[%s] Migrated legacy manifest to v2.0 format (%d frames)", chapter_tag, len(entries))
+    except Exception as exc:
+        log.warning("[%s] Failed to save migrated manifest: %s", chapter_tag, exc)
+
+    return migrated
+
+
+def validate_canonical_manifest(
+    manifest_path: Path,
+    chapter: Chapter,
+    job_id: str = "local",
+) -> tuple[bool, Optional[CanonicalManifest], str]:
+    """Strictly validate existing manifest for resume behavior.
+
+    Returns (is_valid, canonical_manifest_obj, reason).
+    Checks:
+    1. Manifest file exists and is valid JSON/schema.
+    2. All expected frame files exist on disk and are non-empty.
+    3. Frame IDs are consistent and unique.
+    4. Source page relationships match the current chapter's panel paths.
+    """
+    manifest = load_or_migrate_manifest(manifest_path, chapter=chapter, job_id=job_id)
+    if not manifest:
+        return False, None, "Manifest missing or unparseable"
+
+    if not manifest.frames:
+        return False, None, "Manifest contains zero frames"
+
+    frame_ids = [f.frame_id for f in manifest.frames]
+    if len(frame_ids) != len(set(frame_ids)):
+        return False, None, "Manifest contains duplicate frame IDs"
+
+    expected_sources = [p.name for p in chapter.panel_paths]
+    if manifest.source_pages and manifest.source_pages != expected_sources:
+        return False, None, f"Source pages mismatch: expected {expected_sources}, manifest has {manifest.source_pages}"
+
+    slice_dir = manifest_path.parent
+    for frame in manifest.frames:
+        target = Path(frame.path)
+        if not target.exists():
+            target = slice_dir / frame.filename
+        if not target.exists() or target.stat().st_size < 100:
+            return False, None, f"Frame file missing or invalid on disk: {frame.filename}"
+
+    return True, manifest, "Valid manifest"
+
+
+# ---------------------------------------------------------------------------
 # 1. INGESTION
 # ---------------------------------------------------------------------------
 
@@ -322,38 +529,46 @@ def _fast_prepare_frames(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     duration of its narration TTS, keeping voice and image perfectly in sync.
 
     Returns list of (frame_path, source_panel_index) tuples.
-    Resumable: reuses existing frames from the slices directory."""
+    Resumable: reuses existing frames from the slices directory if valid."""
     out_dir = cfg.temp_slices_dir / chapter.tag
     manifest_path = out_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            data = json.loads(manifest_path.read_text())
-            frames = data["frames"]
-            sources = data.get("sources")
-            if sources and len(sources) == len(frames):
-                log.info("[%s] frames already exist (%d frames) — skipping", chapter.tag, len(frames))
-                return [(Path(f), s) for f, s in zip(frames, sources)]
-        except Exception:
-            pass
+
+    is_valid, manifest, reason = validate_canonical_manifest(manifest_path, chapter, job_id=cfg.job_id)
+    if is_valid and manifest:
+        log.info("[%s] canonical manifest verified (%d frames, %s) — skipping frame prep", chapter.tag, len(manifest.frames), reason)
+        return [(Path(f.path if Path(f.path).exists() else out_dir / f.filename), f.source_index) for f in manifest.frames]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    frame_data: List[tuple] = []
+    frame_entries: List[FrameEntry] = []
 
     for panel_idx, panel_path in enumerate(chapter.panel_paths):
         fp = out_dir / f"frame_{panel_idx:05d}.jpg"
-        if fp.exists():
-            frame_data.append((fp, panel_idx))
-            continue
-        frame = _compose_canvas_from_source(panel_path)
-        frame.save(fp, quality=92)
-        frame_data.append((fp, panel_idx))
+        if not fp.exists():
+            frame = _compose_canvas_from_source(panel_path)
+            frame.save(fp, quality=92)
 
-    manifest_path.write_text(json.dumps({
-        "frames": [str(f) for f, _ in frame_data],
-        "sources": [s for _, s in frame_data],
-    }, indent=2))
-    log.info("[%s] prepared %d frames (one per source panel)", chapter.tag, len(frame_data))
-    return frame_data
+        frame_id = f"{chapter.tag}_frame_{panel_idx:05d}"
+        frame_entries.append(
+            FrameEntry(
+                frame_id=frame_id,
+                filename=fp.name,
+                path=str(fp.resolve()),
+                source_page=panel_path.name,
+                source_index=panel_idx,
+                frame_kind="full_page",
+            )
+        )
+
+    manifest = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=cfg.job_id,
+        chapter_tag=chapter.tag,
+        source_pages=[p.name for p in chapter.panel_paths],
+        frames=frame_entries,
+    )
+    manifest.save(manifest_path)
+    log.info("[%s] prepared %d frames (one per source panel)", chapter.tag, len(frame_entries))
+    return [(Path(f.path), f.source_index) for f in manifest.frames]
 
 
 def _compose_canvas_from_source(panel_path: Path):
@@ -1604,36 +1819,25 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     Slice each source image into individual panel frames using contour-based,
     gutter-aware panel detection.
 
-    This uses the approach from the comic-manga-narrator project:
-    1. Threshold to binary (inverted: gutters are white, panels are dark)
-    2. Dilate to close small text/art gaps within panels
-    3. Find external contours → bounding rectangles
-    4. Filter by minimum area, reject speech bubbles and slivers
-    5. Safe fallback: if detection covers < 50% of image, use whole page
-
     Each detected panel is composited onto a 1920x1080 canvas with
     blurred background fill (contain-fit).
 
     Returns list of (frame_path, source_panel_index) tuples in order.
-    Resumable: if the chapter's slice folder has a manifest, reuse it.
+    Resumable: if the chapter's slice folder has a valid manifest, reuse it.
     """
     from PIL import Image, ImageFilter
 
     out_dir = cfg.temp_slices_dir / chapter.tag
     manifest_path = out_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            data = json.loads(manifest_path.read_text())
-            frames = data["frames"]
-            sources = data.get("sources")
-            if sources and len(sources) == len(frames):
-                log.info("[%s] frames already exist (%d frames) — skipping", chapter.tag, len(frames))
-                return [(Path(f), s) for f, s in zip(frames, sources)]
-        except Exception:
-            pass
 
+    is_valid, manifest, reason = validate_canonical_manifest(manifest_path, chapter, job_id=cfg.job_id)
+    if is_valid and manifest:
+        log.info("[%s] canonical manifest verified (%d frames, %s) — skipping slicing", chapter.tag, len(manifest.frames), reason)
+        return [(Path(f.path if Path(f.path).exists() else out_dir / f.filename), f.source_index) for f in manifest.frames]
+
+    log.info("[%s] manifest invalid or missing (%s) — slicing source pages into canonical frames", chapter.tag, reason)
     out_dir.mkdir(parents=True, exist_ok=True)
-    frame_data: List[tuple] = []
+    frame_entries: List[FrameEntry] = []
     frame_counter = 0
     total_blank_skipped = 0
 
@@ -1644,17 +1848,11 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 w, h = img.size
                 gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-                # Bubble-safe detection: gutter-aware scan for tall webtoon
-                # strips, YOLO/contour auto-detect for grid-style pages.
                 panels = _detect_panels_for_page(gray)
                 log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
 
-                # Safety net: snap every panel's top/bottom edge to the nearest
-                # fully-clear row within a small window, so a box from ANY
-                # detector can never clip a bubble tail or a text line.
                 content_mask = _build_dilated_content_mask(gray)
 
-                # Filter and merge featureless/VFX action frames into preceding/succeeding panel slices
                 merged_panel_boxes = []
                 for (px, py, pw, ph) in panels:
                     if ph < 50 or pw < 50:
@@ -1665,7 +1863,6 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     if safe_bot - safe_top >= 50:
                         py, ph = safe_top, safe_bot - safe_top
 
-                    # Apply dynamic 30px vertical padding & speech bubble protection
                     px, py, pw, ph = _apply_dynamic_padding((px, py, pw, ph), content_mask, (h, w), padding_px=30)
 
                     crop_candidate = img.crop((px, py, px + pw, py + ph))
@@ -1675,7 +1872,6 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         total_blank_skipped += 1
                         continue
 
-                    # Featureless / VFX merging rule: merge into preceding panel box if present, else succeeding
                     if _is_featureless_vfx(crop_candidate_gray):
                         if merged_panel_boxes:
                             prev_x, prev_y, prev_w, prev_h = merged_panel_boxes[-1]
@@ -1709,7 +1905,6 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
                         continue
 
-                    # Check for tall rectangular system/quest UI card aspect ratio exceeding 16:9 vertical bounds (aspect ratio height/width > 1.8)
                     cw, ch = crop.size
                     if (ch / max(1, cw)) > 1.8:
                         from PIL import Image as PILImage
@@ -1717,14 +1912,34 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         for s_frame in scroll_frames:
                             fp = out_dir / f"frame_{frame_counter:05d}.jpg"
                             s_frame.save(fp, quality=92)
-                            frame_data.append((fp, panel_idx))
+                            frame_id = f"{chapter.tag}_frame_{frame_counter:05d}"
+                            frame_entries.append(
+                                FrameEntry(
+                                    frame_id=frame_id,
+                                    filename=fp.name,
+                                    path=str(fp.resolve()),
+                                    source_page=panel_path.name,
+                                    source_index=panel_idx,
+                                    frame_kind="scroll_frame",
+                                )
+                            )
                             frame_counter += 1
                     else:
                         from PIL import Image as PILImage
                         frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
                         fp = out_dir / f"frame_{frame_counter:05d}.jpg"
                         frame.save(fp, quality=92)
-                        frame_data.append((fp, panel_idx))
+                        frame_id = f"{chapter.tag}_frame_{frame_counter:05d}"
+                        frame_entries.append(
+                            FrameEntry(
+                                frame_id=frame_id,
+                                filename=fp.name,
+                                path=str(fp.resolve()),
+                                source_page=panel_path.name,
+                                source_index=panel_idx,
+                                frame_kind="panel",
+                            )
+                        )
                         frame_counter += 1
         except Exception as exc:
             log.warning("[%s] Skipping unreadable/corrupt image %s: %s", chapter.tag, panel_path.name, exc)
@@ -1733,13 +1948,17 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     if total_blank_skipped > 0:
         log.info("[%s] skipped %d blank panel(s) during slicing", chapter.tag, total_blank_skipped)
 
-    manifest_path.write_text(json.dumps({
-        "frames": [str(f) for f, _ in frame_data],
-        "sources": [s for _, s in frame_data],
-    }, indent=2))
-    log.info("[%s] sliced %d source pages into %d frames (contour-based detection)",
-             chapter.tag, len(chapter.panel_paths), len(frame_data))
-    return frame_data
+    manifest = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=cfg.job_id,
+        chapter_tag=chapter.tag,
+        source_pages=[p.name for p in chapter.panel_paths],
+        frames=frame_entries,
+    )
+    manifest.save(manifest_path)
+    log.info("[%s] sliced %d source pages into %d canonical frames (contour-based detection)",
+             chapter.tag, len(chapter.panel_paths), len(frame_entries))
+    return [(Path(f.path), f.source_index) for f in manifest.frames]
 
 
 def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["Image.Image"]:
@@ -2878,53 +3097,57 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
         try:
-            # Slice returns [(frame_path, source_panel_index), ...] so we can map
-            # each frame to its source image's narration for perfect sync.
-            # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
-            # horizontal AND vertical panel boundaries, so each manga panel
-            # gets its own individual 1920x1080 frame.
             cfg.write_progress("slice", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: slicing panels...")
             frame_data = slice_chapter_panels(cfg, chapter)
-            frame_paths = [fp for fp, _ in frame_data]
-            frame_sources = [si for _, si in frame_data]
 
-            log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+            manifest_path = cfg.temp_slices_dir / chapter.tag / "manifest.json"
+            manifest = load_or_migrate_manifest(manifest_path, chapter=chapter, job_id=cfg.job_id)
+            if manifest and manifest.frames:
+                frame_paths = [Path(f.path) if Path(f.path).exists() else cfg.temp_slices_dir / chapter.tag / f.filename for f in manifest.frames]
+                frame_sources = [f.source_index for f in manifest.frames]
+            else:
+                frame_paths = [fp for fp, _ in frame_data]
+                frame_sources = [si for _, si in frame_data]
+
+            log.info("[%s] %d canonical frames from %d source pages", chapter.tag, len(frame_paths), len(chapter.panel_paths))
             cfg.write_progress("slice", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
             # Build an ordered list of (tag, text, frame_positions) "segments" —
             # each one gets exactly ONE continuous edge-tts synthesis call, then
             # real word timestamps from that single clip drive per-frame timing.
-            # This is what eliminates the audible stop-after-every-word chop:
-            # previously every one of these frame positions triggered its own
-            # separate edge-tts call.
             segments: List[tuple] = []  # (tag, text, positions)
 
             if chapter.image_narrations:
-                # PER-PANEL NARRATION MODE (preferred).
-                #
-                # Two narration.json key formats are supported:
-                #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
-                #      filenames like "frame_00000.jpg". Each frame already shows
-                #      ONE individual panel, so the VLM transcription is precise.
-                #      We build one TTS segment per frame.
-                #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
-                #      filenames like "001.jpg". The VLM read the whole page, so
-                #      all sliced frames from the same source page share one
-                #      narration. We group frame positions by source panel index.
                 frame_keyed = any(
-                    k.startswith("frame_") for k in chapter.image_narrations.keys()
+                    k.startswith("frame_") or (manifest and k in [f.frame_id for f in manifest.frames])
+                    for k in chapter.image_narrations.keys()
                 )
 
                 if frame_keyed:
-                    log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
+                    log.info("[%s] per-frame narration mode: %d frames (canonical frame transcriptions)",
                              chapter.tag, len(frame_paths))
                     # One segment per frame — narration perfectly synced to each panel.
                     for pos, fp in enumerate(frame_paths):
-                        parsed = parse_narration_item(chapter.image_narrations.get(fp.name))
+                        f_entry = manifest.frames[pos] if (manifest and pos < len(manifest.frames)) else None
+                        raw_narr_entry = None
+                        if f_entry:
+                            raw_narr_entry = (
+                                chapter.image_narrations.get(f_entry.frame_id)
+                                or chapter.image_narrations.get(f_entry.filename)
+                                or chapter.image_narrations.get(fp.name)
+                            )
+                        else:
+                            raw_narr_entry = chapter.image_narrations.get(fp.name)
+
+                        parsed = parse_narration_item(raw_narr_entry)
                         raw_text, ocr_status = parsed["text"], parsed["status"]
                         img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
+
+                        if f_entry:
+                            f_entry.ocr_status = ocr_status
+                            f_entry.ocr_text = raw_text
 
                         if ocr_status == OcrStatus.FAILED:
                             log.warning("[%s] [%s] OCR FAILED for frame %s — retaining FAILED status, producing silent frame", chapter.tag, img_tag, fp.name)
@@ -3085,6 +3308,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 else:
                     frame_durations.append(MIN_FRAME_DURATION)
                     log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
+
+            if manifest and manifest.frames:
+                for pos, f_entry in enumerate(manifest.frames):
+                    if pos < len(frame_durations):
+                        f_entry.duration = frame_durations[pos]
+                    if pos < len(segments) and len(segments[pos]) > 1:
+                        f_entry.narration_text = segments[pos][1]
+                manifest.save(manifest_path)
 
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: building audio track")
