@@ -868,18 +868,16 @@ async function processJob(jobId: string): Promise<void> {
   if (cancelledJobs.has(jobId)) return
 
   // -----------------------------
-  // Phase 1b: VIEWPORT FRAME CREATION (Python --slice-only)
+  // Phase 1b: CANONICAL FRAME CREATION (Python --slice-only)
   // -----------------------------
-  // The new approach creates overlapping viewport frames that scroll through
-  // each page top-to-bottom (no panel detection — just equal-height segments
-  // with 20% overlap). This shows every pixel of the page with no cuts through
-  // text or artwork. The VLM then transcribes the full-page images (not the
-  // viewport frames) and the narration is split proportionally across viewports.
+  // Slices chapter source pages into canonical panel and scroll frames,
+  // creating work/temp_slices/chap_XXX/frame_NNNNN.jpg + manifest.json.
+  // The VLM or PaddleOCR then transcribes text mapped to individual canonical frames.
   const sliced = await sliceJobChapters(jobId)
   if (sliced) {
-    await emitLog(jobId, 'success', 'slice', 'Viewport frames created — VLM will transcribe full pages.')
+    await emitLog(jobId, 'success', 'slice', 'Canonical frames created and manifest validated.')
   } else {
-    await emitLog(jobId, 'warn', 'slice', 'Viewport creation failed — will use full-page images directly.')
+    await emitLog(jobId, 'warn', 'slice', 'Canonical frame creation failed — falling back to full-page images.')
   }
 
   // -----------------------------

@@ -1,6 +1,8 @@
+import os
+os.environ["SKIP_OCR_INIT"] = "1"
+
 import base64
 import io
-import os
 import sys
 import threading
 import time

@@ -197,7 +197,8 @@ def _init_ocr() -> None:
 
 
 # Run initialisation at module load so the model is ready before requests arrive.
-_init_ocr()
+if os.environ.get("SKIP_OCR_INIT") != "1":
+    _init_ocr()
 
 # If startup init failed outright, run background retry loop.
 if SERVICE_STATE != ServiceState.READY:
