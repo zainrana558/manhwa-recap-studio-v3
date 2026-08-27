@@ -1,10 +1,32 @@
 :80 {
 	@transform_port_query {
-		query XTransformPort=*
+		query XTransformPort=3000
+	}
+	@transform_port_3001 {
+		query XTransformPort=3001
+	}
+	@transform_port_3002 {
+		query XTransformPort=3002
 	}
 
 	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle @transform_port_3001 {
+		reverse_proxy 127.0.0.1:3001 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle @transform_port_3002 {
+		reverse_proxy 127.0.0.1:3002 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}
@@ -12,8 +34,15 @@
 		}
 	}
 
+	@transform_port_blocked {
+		query XTransformPort=*
+	}
+	handle @transform_port_blocked {
+		respond "Forbidden: port not allowed" 403
+	}
+
 	handle {
-		reverse_proxy localhost:3000 {
+		reverse_proxy 127.0.0.1:3000 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}

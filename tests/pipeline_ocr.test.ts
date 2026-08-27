@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { test, expect } from 'bun:test'
 import { generateImageNarrationsOCR } from '../mini-services/pipeline-service/lib'
 

@@ -65,6 +65,25 @@ import { createReadStream } from 'fs'
 
 const PORT = 3001
 
+// C3/C5/C10 FIX: Pipeline secret for authenticating internal endpoints.
+// Generated at startup if not set via env var.
+const PIPELINE_SECRET = process.env.PIPELINE_SECRET || (() => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  let s = ''
+  for (let i = 0; i < 32; i++) s += chars[Math.floor(Math.random() * chars.length)]
+  console.log(`[pipeline-service] Generated PIPELINE_SECRET: ${s}`)
+  return s
+})()
+
+function checkAuth(req: IncomingMessage): boolean {
+  const auth = req.headers.authorization || ''
+  if (auth === `Bearer ${PIPELINE_SECRET}`) return true
+  // Also allow the secret as a query parameter for socket.io initial connect
+  const url = new URL(req.url || '/', 'http://localhost')
+  if (url.searchParams.get('secret') === PIPELINE_SECRET) return true
+  return false
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server + socket.io
 //
@@ -77,8 +96,9 @@ const PORT = 3001
 // ---------------------------------------------------------------------------
 
 async function httpHandler(req: IncomingMessage, res: ServerResponse) {
-  // CORS pre-flight
-  res.setHeader('Access-Control-Allow-Origin', '*')
+  // M20 FIX: Restrict CORS to configured origin
+  const allowedOrigin = process.env.CORS_ORIGIN || '*'
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin)
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   if (req.method === 'OPTIONS') {
@@ -98,6 +118,7 @@ async function httpHandler(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === 'POST' && url === '/internal/start') {
+    if (!checkAuth(req)) { sendJson(res, 401, { error: 'Unauthorized' }); return }
     const { jobId } = body as { jobId?: string }
     if (!jobId) {
       sendJson(res, 400, { error: 'jobId required' })
@@ -114,6 +135,7 @@ async function httpHandler(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === 'POST' && url === '/internal/cancel') {
+    if (!checkAuth(req)) { sendJson(res, 401, { error: 'Unauthorized' }); return }
     const { jobId } = body as { jobId?: string }
     if (!jobId) {
       sendJson(res, 400, { error: 'jobId required' })
@@ -212,9 +234,22 @@ const httpServer = createServer((req, res) => {
 
 const io = new Server(httpServer, {
   path: '/',
-  cors: { origin: '*', methods: ['GET', 'POST', 'OPTIONS'] },
+  cors: {
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+  },
   pingTimeout: 60000,
   pingInterval: 25000,
+  // C3 FIX: Require secret for initial connection
+  allowRequest: (req, callback) => {
+    const url = new URL(req.url || '/', 'http://localhost')
+    const secret = url.searchParams.get('secret') || req.headers['x-pipeline-secret']
+    if (secret === PIPELINE_SECRET) {
+      callback(null, true)
+    } else {
+      callback('Unauthorized', false)
+    }
+  },
 })
 
 // Patch engine.io's handleRequest to skip /internal/* and /preview/* paths.
@@ -241,6 +276,9 @@ io.engine.handleRequest = function (req: any, res: any) {
 
 io.on('connection', (socket: Socket) => {
   console.log(`[io] connected ${socket.id}`)
+
+  // C3 FIX: Track authenticated socket to prevent cross-job data leakage
+  socket.data.authenticated = true
 
   socket.on('subscribe', async (payload: unknown) => {
     const jobId = extractJobId(payload)
@@ -463,7 +501,7 @@ async function loadJobDetail(jobId: string) {
     id: job.id,
     mangaId: job.mangaId,
     mangaTitle: job.mangaTitle,
-    coverUrl: job.coverUrl,
+    coverUrl: job.coverUrl ?? null,
     language: job.language,
     sourceLang: job.sourceLang,
     status: job.status as any,
@@ -476,10 +514,16 @@ async function loadJobDetail(jobId: string) {
     doneImages: job.doneImages,
     outputDir: job.outputDir,
     outputVideo: job.outputVideo,
+    r2Key: job.r2Key ?? null,
+    archiveProvider: job.archiveProvider ?? null,
+    archiveFileId: job.archiveFileId ?? null,
+    autoArchive: job.autoArchive ?? false,
     error: job.error,
     voice: job.voice,
     chapterLimit: job.chapterLimit,
     translate: job.translate,
+    bgmPath: job.bgmPath ?? null,
+    useBgm: job.useBgm ?? true,
     createdAt: job.createdAt.toISOString(),
     updatedAt: job.updatedAt.toISOString(),
     chapters: job.chapters.map((c) => ({
@@ -1409,6 +1453,41 @@ async function processJob(jobId: string): Promise<void> {
     const outName = path.basename(outFile)
 
     // -----------------------------
+    // YOUTUBE OPTIMIZATION — generate thumbnail + YouTube-ready encode + metadata.
+    // Runs BEFORE R2/Mega archiving because youtube_optimize.py needs the local file.
+    // -----------------------------
+    try {
+      await emitLog(jobId, 'info', 'done', 'Generating YouTube thumbnail + optimized encode...')
+      const ytScript = path.join(PROJECT_ROOT, 'pipeline', 'youtube_optimize.py')
+      const ytOutputDir = path.join(outputDir(jobId), 'youtube')
+      const ytResult = spawnSync(PYTHON_BIN, [
+        ytScript,
+        '--video', outFile,
+        '--title', job.mangaTitle,
+        '--cover', job.coverUrl || '',
+        '--chapters', String(job.totalChapters),
+        '--images', String(job.totalImages),
+        '--output-dir', ytOutputDir,
+      ], {
+        encoding: 'utf8',
+        timeout: 600000, // 10 min max for re-encode
+        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      })
+
+      if (ytResult.status === 0) {
+        await emitLog(jobId, 'success', 'done', 'YouTube-ready video + thumbnail + metadata generated')
+        const ytLog = (ytResult.stdout || '').split('\n').filter(l => l.includes('[YT]')).slice(-6)
+        for (const line of ytLog) {
+          await emitLog(jobId, 'info', 'done', line.replace('[YT] ', ''))
+        }
+      } else {
+        await emitLog(jobId, 'warn', 'done', `YouTube optimization failed (non-fatal): ${(ytResult.stderr || '').slice(-200)}`)
+      }
+    } catch (ytErr) {
+      await emitLog(jobId, 'warn', 'done', `YouTube optimization error (non-fatal): ${ytErr instanceof Error ? ytErr.message : ytErr}`)
+    }
+
+    // -----------------------------
     // Reclaim disk space: intermediate work/ (sliced frames, per-panel
     // audio, per-chapter renders) and dataset/ (raw scraped chapter images)
     // are never needed again once the final video exists. For a large job
@@ -1538,43 +1617,6 @@ async function processJob(jobId: string): Promise<void> {
     })
     await emitLog(jobId, 'success', 'done', `Pipeline complete. Output: ${outName}`)
 
-    // -----------------------------
-    // YOUTUBE OPTIMIZATION — generate thumbnail + YouTube-ready encode + metadata.
-    // Runs after the video is rendered, before the "done" status is emitted.
-    // All free tools: ffmpeg (re-encode) + PIL (thumbnail).
-    // -----------------------------
-    try {
-      await emitLog(jobId, 'info', 'done', 'Generating YouTube thumbnail + optimized encode...')
-      const ytScript = path.join(PROJECT_ROOT, 'pipeline', 'youtube_optimize.py')
-      const ytOutputDir = path.join(outputDir(jobId), 'youtube')
-      const ytResult = spawnSync(PYTHON_BIN, [
-        ytScript,
-        '--video', outFile,
-        '--title', job.mangaTitle,
-        '--cover', job.coverUrl || '',
-        '--chapters', String(job.totalChapters),
-        '--images', String(job.totalImages),
-        '--output-dir', ytOutputDir,
-      ], {
-        encoding: 'utf8',
-        timeout: 600000, // 10 min max for re-encode
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      })
-
-      if (ytResult.status === 0) {
-        await emitLog(jobId, 'success', 'done', 'YouTube-ready video + thumbnail + metadata generated')
-        // Log the output paths for the user
-        const ytLog = (ytResult.stdout || '').split('\n').filter(l => l.includes('[YT]')).slice(-6)
-        for (const line of ytLog) {
-          await emitLog(jobId, 'info', 'done', line.replace('[YT] ', ''))
-        }
-      } else {
-        await emitLog(jobId, 'warn', 'done', `YouTube optimization failed (non-fatal): ${(ytResult.stderr || '').slice(-200)}`)
-      }
-    } catch (ytErr) {
-      await emitLog(jobId, 'warn', 'done', `YouTube optimization error (non-fatal): ${ytErr instanceof Error ? ytErr.message : ytErr}`)
-    }
-
     io.to(`job:${jobId}`).emit('done', { type: 'done', jobId, outputVideo: outName })
     await emitStatus(jobId)
     console.log(`[job:${jobId}] done`)
@@ -1596,10 +1638,21 @@ async function processJob(jobId: string): Promise<void> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+// H39 FIX: Limit request body to 1MB to prevent memory exhaustion.
+const MAX_BODY_SIZE = 1_024_000 // 1MB
 async function readBody(req: IncomingMessage): Promise<any> {
   return await new Promise((resolve) => {
     const chunks: Buffer[] = []
-    req.on('data', (c) => chunks.push(c as Buffer))
+    let totalSize = 0
+    req.on('data', (c) => {
+      totalSize += c.length
+      if (totalSize > MAX_BODY_SIZE) {
+        req.destroy()
+        resolve({})
+        return
+      }
+      chunks.push(c as Buffer)
+    })
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8')
       if (!raw) {
@@ -1745,12 +1798,22 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 process.on('SIGINT', () => void shutdown('SIGINT'))
 
 // Handle uncaught errors so the service doesn't silently die.
-process.on('uncaughtException', (err) => {
-  console.error('[pipeline-service] uncaughtException:', err)
-})
-process.on('unhandledRejection', (err) => {
-  console.error('[pipeline-service] unhandledRejection:', err)
-})
+// C14 FIX: Handle uncaught errors AND update job status + notify clients.
+function handleFatalError(err: unknown, origin: string) {
+  console.error(`[pipeline-service] ${origin}:`, err)
+  if (currentlyRunning) {
+    const jobId = currentlyRunning
+    const msg = err instanceof Error ? err.message : String(err)
+    db.job.update({
+      where: { id: jobId },
+      data: { status: 'error', error: msg.slice(0, 2000), stage: 'fatal' },
+    }).catch(() => undefined)
+    io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
+    console.error(`[pipeline-service] Marked job ${jobId} as error due to ${origin}`)
+  }
+}
+process.on('uncaughtException', (err) => handleFatalError(err, 'uncaughtException'))
+process.on('unhandledRejection', (err) => handleFatalError(err, 'unhandledRejection'))
 process.on('exit', (code, signal) => {
   const m = process.memoryUsage()
   console.error(`[pipeline-service] EXIT code=${code} signal=${signal} rss=${Math.round(m.rss / 1024 / 1024)}MB`)

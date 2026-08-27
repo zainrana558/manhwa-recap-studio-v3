@@ -62,10 +62,10 @@ if (process.env.NODE_ENV !== 'production') globalForPrisma.pipelinePrisma = db
 
 export const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
-  : '/home/z/my-project/data'
+  : path.join(process.cwd(), 'data')
 // Pipeline script lives next to the parent app; resolve via PROJECT_ROOT if set,
-// otherwise fall back to the known sandbox location.
-const PROJECT_ROOT = process.env.PROJECT_ROOT || '/home/z/my-project'
+// otherwise fall back to process.cwd().
+const PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd()
 export { PROJECT_ROOT }
 export const PIPELINE_SCRIPT = path.join(PROJECT_ROOT, 'pipeline', 'master_pipeline.py')
 export const PYTHON_BIN = process.env.PYTHON_BIN || 'python3'
