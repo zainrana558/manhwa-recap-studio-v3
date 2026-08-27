@@ -190,13 +190,58 @@ class PipelineConfig:
             pass
 
 
+class OcrStatus:
+    SUCCESS = "SUCCESS"
+    UNCERTAIN = "UNCERTAIN"
+    FAILED = "FAILED"
+    NO_TEXT = "NO_TEXT"
+
+
+def parse_narration_item(raw_item: object) -> dict:
+    """Parse narration item into a structured dict with text, status, and confidence.
+    Backward-compatible with string values, legacy list dicts, and richer upstream formats.
+    """
+    if raw_item is None:
+        return {"text": "", "status": OcrStatus.NO_TEXT, "confidence": 0.0}
+
+    if isinstance(raw_item, str):
+        text = raw_item.strip()
+        if text == "[transcription unavailable]":
+            return {"text": "", "status": OcrStatus.FAILED, "confidence": 0.0}
+        status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+        return {"text": text, "status": status, "confidence": 1.0 if text else 0.0}
+
+    if isinstance(raw_item, dict):
+        text = str(raw_item.get("text") or "").strip()
+        if text == "[transcription unavailable]":
+            return {"text": "", "status": OcrStatus.FAILED, "confidence": 0.0}
+
+        raw_status = raw_item.get("status")
+        if raw_status:
+            status = str(raw_status).upper()
+            if status not in (OcrStatus.SUCCESS, OcrStatus.UNCERTAIN, OcrStatus.FAILED, OcrStatus.NO_TEXT):
+                status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+        else:
+            status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+
+        conf = raw_item.get("confidence")
+        try:
+            confidence = float(conf) if conf is not None else (1.0 if status == OcrStatus.SUCCESS else 0.0)
+        except (ValueError, TypeError):
+            confidence = 1.0 if status == OcrStatus.SUCCESS else 0.0
+
+        return {"text": text, "status": status, "confidence": confidence}
+
+    return {"text": "", "status": OcrStatus.NO_TEXT, "confidence": 0.0}
+
+
 @dataclass
 class Chapter:
     index: int
     name: str
     folder: Path
     panel_paths: List[Path] = field(default_factory=list)
-    image_narrations: dict = field(default_factory=dict)  # filename -> narration text (from narration.json)
+    image_narrations: dict = field(default_factory=dict)  # filename -> narration entry (from narration.json)
 
     @property
     def tag(self) -> str:
@@ -244,9 +289,12 @@ def discover_chapters(cfg: PipelineConfig) -> List[Chapter]:
                 narr_data = json.loads(narration_file.read_text(encoding="utf-8"))
                 if isinstance(narr_data, list):
                     for item in narr_data:
-                        if isinstance(item, dict) and "image" in item and "text" in item:
-                            image_narrations[item["image"]] = item["text"]
-                    log.info("[%s] loaded %d per-image narrations from narration.json", d.name, len(image_narrations))
+                        if isinstance(item, dict) and "image" in item:
+                            image_narrations[item["image"]] = item
+                elif isinstance(narr_data, dict):
+                    for k, v in narr_data.items():
+                        image_narrations[k] = v
+                log.info("[%s] loaded %d per-image narrations from narration.json", d.name, len(image_narrations))
             except Exception as e:
                 log.warning("[%s] failed to parse narration.json: %s", d.name, e)
         else:
@@ -1930,7 +1978,11 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
             provider = "none"
 
     if provider == "none":
-        log.info("[%s] narration provider=none — using text verbatim", cache_tag)
+        log.warning(
+            "[%s] [RAW/VERBATIM MODE ACTIVE] narration provider=none — using raw text verbatim without recap narration. "
+            "If production recap narration is required, configure an upstream LLM provider.",
+            cache_tag,
+        )
         narration = _strip_forbidden(text)
         out_path.write_text(narration, encoding="utf-8")
         return narration
@@ -2338,12 +2390,12 @@ def build_chapter_audio_track(
 # 4b. FRAME TIMING (proportional word-count split)
 # ---------------------------------------------------------------------------
 
-def split_frame_timings(text: str, positions: List[int], duration: float) -> dict:
+def split_frame_timings(text: str, positions: List[int], duration: float, is_silent: bool = False) -> dict:
     """Proportionally split a segment's TTS duration across its frames by
-    word count. Ensures each frame gets at least MIN_FRAME_DURATION seconds
-    so panels never flash by too fast, PLUS adds FRAME_HOLD_PADDING (0.5s)
-    to each frame so the image stays on screen a beat after the voice ends
-    — giving the viewer time to read the panel text."""
+    word count. For narrated frames, ensures each frame gets at least MIN_FRAME_DURATION
+    seconds and adds FRAME_HOLD_PADDING (0.5s) to the last frame.
+    For silent (NO_TEXT or FAILED textless) frames, avoids MIN_FRAME_DURATION and
+    FRAME_HOLD_PADDING to maintain appropriate short pacing."""
     frame_texts = split_into_segments(text, len(positions))
     word_counts = [len(t.split()) for t in frame_texts]
     total_words = sum(word_counts)
@@ -2364,27 +2416,34 @@ def split_frame_timings(text: str, positions: List[int], duration: float) -> dic
             timings[pos] = (cursor, cursor + span)
             cursor += span
 
-    # Enforce MIN_FRAME_DURATION: stretch any short frame and push later ones out.
-    # Walk forward, adjusting each frame's end to be at least MIN_FRAME_DURATION
-    # from its start, then shifting subsequent starts.
-    prev_end = 0.0
-    for pos in positions:
-        start, end = timings[pos]
-        start = max(start, prev_end)  # ensure no overlap
-        if end - start < MIN_FRAME_DURATION:
-            end = start + MIN_FRAME_DURATION
-        timings[pos] = (start, end)
-        prev_end = end
+    if not is_silent:
+        # Enforce MIN_FRAME_DURATION: stretch any short frame and push later ones out.
+        # Walk forward, adjusting each frame's end to be at least MIN_FRAME_DURATION
+        # from its start, then shifting subsequent starts.
+        prev_end = 0.0
+        for pos in positions:
+            start, end = timings[pos]
+            start = max(start, prev_end)  # ensure no overlap
+            if end - start < MIN_FRAME_DURATION:
+                end = start + MIN_FRAME_DURATION
+            timings[pos] = (start, end)
+            prev_end = end
 
-    # Add FRAME_HOLD_PADDING only to the LAST frame in the segment, not every
-    # frame. Adding padding between every frame creates silence gaps that make
-    # the narration sound chopped/cut. Instead, the image holds for 0.5s after
-    # the LAST frame's audio ends, giving the viewer a moment before the next
-    # segment starts.
-    if positions:
-        last_pos = positions[-1]
-        start, end = timings[last_pos]
-        timings[last_pos] = (start, end + FRAME_HOLD_PADDING)
+        # Add FRAME_HOLD_PADDING only to the LAST frame in the segment.
+        if positions:
+            last_pos = positions[-1]
+            start, end = timings[last_pos]
+            timings[last_pos] = (start, end + FRAME_HOLD_PADDING)
+    else:
+        # For silent frames, enforce non-overlapping boundaries without MIN_FRAME_DURATION padding.
+        prev_end = 0.0
+        for pos in positions:
+            start, end = timings[pos]
+            start = max(start, prev_end)
+            if end <= start:
+                end = start + 1.0
+            timings[pos] = (start, end)
+            prev_end = end
 
     return timings
 
@@ -2863,26 +2922,57 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                              chapter.tag, len(frame_paths))
                     # One segment per frame — narration perfectly synced to each panel.
                     for pos, fp in enumerate(frame_paths):
-                        raw_text = chapter.image_narrations.get(fp.name, "")
+                        parsed = parse_narration_item(chapter.image_narrations.get(fp.name))
+                        raw_text, ocr_status = parsed["text"], parsed["status"]
                         img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
-                        translated = translate_text(cfg, raw_text, img_tag)
-                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                        if rephrased:
-                            prev_tail = last_sentences(rephrased)
-                        segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
+
+                        if ocr_status == OcrStatus.FAILED:
+                            log.warning("[%s] [%s] OCR FAILED for frame %s — retaining FAILED status, producing silent frame", chapter.tag, img_tag, fp.name)
+                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.FAILED))
+                        elif ocr_status == OcrStatus.NO_TEXT:
+                            log.info("[%s] [%s] NO_TEXT confirmed for frame %s", chapter.tag, img_tag, fp.name)
+                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.NO_TEXT))
+                        elif ocr_status == OcrStatus.UNCERTAIN:
+                            log.warning("[%s] [%s] OCR UNCERTAIN for frame %s (confidence=%.2f) — using available text", chapter.tag, img_tag, fp.name, parsed["confidence"])
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.UNCERTAIN))
+                        else:  # SUCCESS
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.SUCCESS))
                 else:
                     log.info("[%s] per-image narration mode: %d source images, %d frames",
                              chapter.tag, len(chapter.panel_paths), len(frame_paths))
                     # Legacy: translate + rephrase each source image's narration.
-                    panel_narrations: dict = {}  # panel_index -> narration text
+                    panel_narrations: dict = {}  # panel_index -> (rephrased_text, status)
                     for idx, panel_path in enumerate(chapter.panel_paths):
-                        raw_text = chapter.image_narrations.get(panel_path.name, "")
+                        parsed = parse_narration_item(chapter.image_narrations.get(panel_path.name))
+                        raw_text, ocr_status = parsed["text"], parsed["status"]
                         img_tag = f"{chapter.tag}_img{idx + 1:03d}"
-                        translated = translate_text(cfg, raw_text, img_tag)
-                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                        panel_narrations[idx] = rephrased
-                        if rephrased:
-                            prev_tail = last_sentences(rephrased)
+
+                        if ocr_status == OcrStatus.FAILED:
+                            log.warning("[%s] [%s] OCR FAILED for source panel %s", chapter.tag, img_tag, panel_path.name)
+                            panel_narrations[idx] = ("", OcrStatus.FAILED)
+                        elif ocr_status == OcrStatus.NO_TEXT:
+                            panel_narrations[idx] = ("", OcrStatus.NO_TEXT)
+                        elif ocr_status == OcrStatus.UNCERTAIN:
+                            log.warning("[%s] [%s] OCR UNCERTAIN for source panel %s (confidence=%.2f)", chapter.tag, img_tag, panel_path.name, parsed["confidence"])
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            panel_narrations[idx] = (rephrased, OcrStatus.UNCERTAIN)
+                        else:
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            panel_narrations[idx] = (rephrased, OcrStatus.SUCCESS)
 
                     # Group frame positions by source panel (preserving timeline order).
                     from collections import defaultdict as _dd
@@ -2891,13 +2981,13 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                         panel_frame_positions[si].append(pos)
 
                     for si, positions in panel_frame_positions.items():
-                        narr = panel_narrations.get(si, "")
-                        segments.append((f"img{si + 1:03d}", narr, positions))
+                        narr, st = panel_narrations.get(si, ("", OcrStatus.NO_TEXT))
+                        segments.append((f"img{si + 1:03d}", narr, positions, st))
             else:
                 # No narration.json — all frames are silent (no text to narrate).
                 log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
                 for pos in range(len(frame_paths)):
-                    segments.append((f"frm{pos + 1:04d}", "", [pos]))
+                    segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.NO_TEXT))
 
             # Synthesize one continuous clip per segment and derive per-frame timing.
             # No whisper transcription — timing is derived purely from proportional
@@ -2908,24 +2998,42 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
             tts_failed = 0      # of those, how many fell back to silence due to a real failure
 
-            for seg_idx, (tag, text, positions) in enumerate(segments):
+            consecutive_silent = 0
+            for seg_idx, seg_item in enumerate(segments):
+                tag, text, positions = seg_item[0], seg_item[1], seg_item[2]
+                ocr_st = seg_item[3] if len(seg_item) > 3 else (OcrStatus.SUCCESS if text.strip() else OcrStatus.NO_TEXT)
+
                 cfg.write_progress("render", chapter.index - 1, total,
                                    f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
-                if text.strip():
+
+                is_silent_segment = not text.strip() or ocr_st in (OcrStatus.NO_TEXT, OcrStatus.FAILED)
+                if not is_silent_segment:
+                    consecutive_silent = 0
                     tts_attempted += 1
+                else:
+                    consecutive_silent += 1
+
                 audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
-                if seg_tts_failed:
+                if not is_silent_segment and seg_tts_failed:
                     tts_failed += 1
+
                 duration = get_audio_duration(audio_path_seg)
 
-                # Ensure the segment audio is at least long enough for all its
-                # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
-                min_total = len(positions) * MIN_FRAME_DURATION
-                if duration < min_total:
-                    audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
-                    duration = min_total
+                if is_silent_segment:
+                    # Pacing safeguard: apply shortened duration for silent frames, and compress if consecutive > 2
+                    base_silent_dur = 1.0 if consecutive_silent > 2 else SILENT_FRAME_DURATION
+                    target_dur = max(0.5, len(positions) * base_silent_dur)
+                    if abs(duration - target_dur) > 0.05:
+                        audio_path_seg = cfg.temp_audio_dir / chapter.tag / f"{tag}_silent_paced.wav"
+                        _generate_silence(audio_path_seg, target_dur)
+                        duration = target_dur
+                else:
+                    min_total = len(positions) * MIN_FRAME_DURATION
+                    if duration < min_total:
+                        audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
+                        duration = min_total
 
-                timings = split_frame_timings(text, positions, duration)
+                timings = split_frame_timings(text, positions, duration, is_silent=is_silent_segment)
                 for pos in positions:
                     frame_timing[pos] = timings[pos]
                 # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
