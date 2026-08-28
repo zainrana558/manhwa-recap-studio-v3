@@ -17,24 +17,28 @@ export const dynamic = "force-dynamic";
 //   tunnel URL (e.g. https://your-laptop.trycloudflare.com)
 const PIPELINE_SERVICE_URL = process.env.PIPELINE_SERVICE_URL || "http://localhost:3001";
 
-/** Fire-and-forget POST to the pipeline service with a short timeout. */
+/**
+ * POST to the pipeline service with a short timeout.
+ * Returns true if the pipeline accepted the request, false if unreachable.
+ */
 async function notifyPipeline(
   path: string,
   body: Record<string, unknown>
-): Promise<void> {
+): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    await fetch(`${PIPELINE_SERVICE_URL}${path}`, {
+    const res = await fetch(`${PIPELINE_SERVICE_URL}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-  } catch {
-    // Pipeline service is allowed to be down; job remains in DB and can be started later.
-  } finally {
     clearTimeout(timeout);
+    return res.ok;
+  } catch {
+    clearTimeout(timeout);
+    return false;
   }
 }
 
@@ -214,9 +218,28 @@ export async function POST(req: NextRequest) {
       outputDir: outputDir(job.id),
     });
 
-    // 3) Fire-and-forget: tell the pipeline service to start the job.
-    //    Non-blocking — pipeline runs in the background and pushes progress over WS.
-    void notifyPipeline("/internal/start", { jobId: job.id });
+    // 3) Tell the pipeline service to start the job.
+    const pipelineOk = await notifyPipeline("/internal/start", { jobId: job.id });
+
+    if (!pipelineOk) {
+      // Pipeline service is unreachable — update the job to reflect this.
+      await db.job.update({
+        where: { id: job.id },
+        data: {
+          status: "error",
+          error: "Pipeline service is not running. Start it with: bash start-services.sh",
+          message: "Pipeline service unreachable",
+        },
+      });
+      await db.jobLog.create({
+        data: {
+          jobId: job.id,
+          level: "error",
+          stage: "start",
+          message: "Pipeline service is not running. Start it with: bash start-services.sh",
+        },
+      });
+    }
 
     return NextResponse.json({ job: detail }, { status: 201 });
   } catch (err) {
