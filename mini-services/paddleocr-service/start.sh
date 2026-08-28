@@ -7,4 +7,5 @@ if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
 else
     PYTHON_BIN="python3"
 fi
-exec "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port 3002 --workers 1
+# C16 FIX: Bind to localhost only — external access should go through Caddy
+exec "$PYTHON_BIN" -m uvicorn main:app --host 127.0.0.1 --port 3002 --workers 1

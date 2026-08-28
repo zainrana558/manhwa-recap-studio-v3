@@ -114,6 +114,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // M25 FIX: Sort chapters by chapter number before selecting.
+    chapterFeed.sort((a, b) => {
+      const na = parseFloat(a.chapterNum) || 0;
+      const nb = parseFloat(b.chapterNum) || 0;
+      return na - nb;
+    });
+
     // Apply chapter selection: specific IDs take priority, then chapterLimit, then all.
     let selected: typeof chapterFeed;
     if (chapterIds && chapterIds.length > 0) {
@@ -127,7 +134,8 @@ export async function POST(req: NextRequest) {
     if (selected.length === 0) {
       return NextResponse.json(
         {
-          error: `No chapters found for manga "${body.mangaTitle}" on MangaHere.`,
+          // H35 FIX: Use actual source name instead of hardcoded "MangaHere"
+          error: `No chapters found for manga "${body.mangaTitle}" on ${source}.`,
         },
         { status: 400 }
       );

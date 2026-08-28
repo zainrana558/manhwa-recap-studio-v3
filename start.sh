@@ -136,10 +136,15 @@ pkill -f "pipeline-service" 2>/dev/null || true
 pkill -f "index.ts" 2>/dev/null || true
 sleep 2
 
+# C8/C9/C16 FIX: Use dynamic project dir instead of hardcoded path
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$PROJECT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
 # Start paddleocr-service (port 3002)
 echo "▶ Starting paddleocr-service (port 3002)..."
 cd mini-services/paddleocr-service
-nohup bash start.sh > /home/ubuntu/manhwa-recap-studio-v3/paddleocr.log 2>&1 &
+nohup bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 &
 PADDLEOCR_PID=$!
 cd ../..
 sleep 3
@@ -147,13 +152,14 @@ sleep 3
 # Start pipeline-service (port 3001)
 echo "▶ Starting pipeline-service (port 3001)..."
 cd mini-services/pipeline-service
-nohup bun run start > /home/ubuntu/manhwa-recap-studio-v3/pipeline.log 2>&1 &
+nohup bun run start > "$LOG_DIR/pipeline.log" 2>&1 &
 PIPELINE_PID=$!
 cd ../..
 
 # Start Next.js (port 3000)
 echo "▶ Starting Next.js (port 3000)..."
-nohup bun .next/standalone/server.js > /home/ubuntu/manhwa-recap-studio-v3/nextjs.log 2>&1 &
+# H2 FIX: Bind Next.js to localhost only (Caddy proxies externally)
+HOSTNAME=127.0.0.1 nohup bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 &
 NEXT_PID=$!
 
 # Wait for services to start

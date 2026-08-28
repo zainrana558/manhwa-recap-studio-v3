@@ -33,7 +33,7 @@ export function getSocket(): Socket {
         reconnection: true,
         reconnectionDelay: 1000,
         reconnectionDelayMax: 5000,
-        reconnectionAttempts: Infinity,
+        reconnectionAttempts: 50,
         timeout: 10000,
       });
     } else {
@@ -45,7 +45,7 @@ export function getSocket(): Socket {
         reconnection: true,
         reconnectionDelay: 1000,
         reconnectionDelayMax: 5000,
-        reconnectionAttempts: Infinity,
+        reconnectionAttempts: 50,
         timeout: 10000,
       });
     }

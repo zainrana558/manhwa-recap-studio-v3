@@ -199,6 +199,12 @@ export async function POST(
       },
     });
 
+    // C6 FIX: Reset errored chapters so they get re-processed on retry.
+    await db.chapter.updateMany({
+      where: { jobId: id, status: "error" },
+      data: { status: "pending", error: null, transcribed: false, rendered: false },
+    });
+
     await db.jobLog.create({
       data: {
         jobId: id,
