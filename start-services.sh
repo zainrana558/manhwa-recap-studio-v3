@@ -89,6 +89,21 @@ kill_service "server.js"
 kill_port 3000
 echo "[3/3] Starting Next.js on port 3000..."
 cd "$PROJECT_DIR"
+
+# Clear stale .next build cache to fix "Failed to find Server Action" errors.
+# This happens when the production build has a server-action registry that
+# no longer matches the current source (actions added/removed since last build).
+if [ ! -f ".next/standalone/server.js" ]; then
+  echo "  .next/standalone/server.js not found — rebuilding..."
+  rm -rf .next
+  bun run build > "$LOG_DIR/nextjs-build.log" 2>&1
+  if [ $? -ne 0 ]; then
+    echo "  ⚠️  Build failed — check $LOG_DIR/nextjs-build.log"
+  else
+    echo "  ✅ Build succeeded"
+  fi
+fi
+
 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
 # Old check did `head -c 5 | grep -q DOCTYPE`: "<!DOCTYPE html>" truncated to
 # 5 bytes is "<!DOC" -- grep can never find the 7-byte string "DOCTYPE"

@@ -9,14 +9,66 @@ Port: 3002
 """
 
 import os
+import signal
+import sys
+
+# ---------------------------------------------------------------------------
 # Prevent OpenMP and C++ thread collisions & PIR interpreter SIGSEGV
-os.environ["FLAGS_enable_pir_api"] = "0"          # Disable experimental PIR interpreter
+#
+# PaddlePaddle's PIR (Paddle Intermediate Representation) interpreter is
+# known to crash with SIGSEGV during garbage collection on certain CPU-only
+# configurations. Setting a single flag (FLAGS_enable_pir_api=0) is NOT
+# sufficient — the interpreter can still be instantiated by the inference
+# engine. We disable every PIR-related flag to force the legacy executor.
+# ---------------------------------------------------------------------------
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["FLAGS_enable_pir_in_executor"] = "0"
+os.environ["FLAGS_pir_apply_inplace_pass"] = "0"
+os.environ["FLAGS_pir_apply_general_fuse_pass"] = "0"
+os.environ["FLAGS_enable_pir_compatible"] = "0"
+os.environ["FLAGS_enable_pir_debug"] = "0"
+os.environ["FLAGS_pir_print_group_ops"] = "0"
+os.environ["FLAGS_pir_onednn_use_execution_pool"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_mkldnn"] = "0"
 os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"
+os.environ["GLOG_minloglevel"] = "2"  # Suppress noisy Paddle warnings
+
+# Thread count limits — prevents OpenMP/MKL thread explosion on small instances
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
+def _sigsegv_handler(signum, frame):
+    """Log a helpful crash message instead of silently dying.
+
+    The stack trace from a PIR interpreter SIGSEGV is not useful for
+    debugging OCR issues — this handler prints a clear diagnostic and
+    exits with a non-zero code so the process manager can restart it.
+    """
+    # Use stderr directly — logger may not be initialized yet if the
+    # crash happens during early PaddlePaddle import.
+    import traceback
+    sys.stderr.write(
+        "\n=== SIGSEGV (segmentation fault) caught ===\n"
+        "This is a known PaddlePaddle PIR interpreter crash.\n"
+        "The PIR flags have been set to disable the interpreter.\n"
+        "If this persists, try:\n"
+        "  pip install paddlepaddle==3.0.0 paddleocr==3.0.1\n"
+        "  (or downgrade to paddlepaddle==2.6.2 paddleocr==2.9.1)\n"
+        f"PID={os.getpid()}, signal={signum}\n"
+    )
+    traceback.print_stack(frame, file=sys.stderr)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+# Install SIGSEGV handler AFTER setting env vars but BEFORE importing PaddlePaddle,
+# so any early-init segfault is caught with a useful message.
+signal.signal(signal.SIGSEGV, _sigsegv_handler)
 
 import base64
 import io

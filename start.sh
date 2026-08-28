@@ -158,6 +158,19 @@ cd ../..
 
 # Start Next.js (port 3000)
 echo "▶ Starting Next.js (port 3000)..."
+# Clear stale .next build cache to fix "Failed to find Server Action" errors.
+# The production build may contain action IDs from a previous code version;
+# rebuilding ensures the action registry matches current source.
+if [ ! -f ".next/standalone/server.js" ]; then
+    echo "  ⚠️  .next/standalone/server.js missing — rebuilding..."
+    rm -rf .next
+    bun run build > "$LOG_DIR/nextjs-build.log" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "  ❌ Next.js build failed — check $LOG_DIR/nextjs-build.log"
+    else
+        echo "  ✅ Next.js build succeeded"
+    fi
+fi
 # H2 FIX: Bind Next.js to localhost only (Caddy proxies externally)
 HOSTNAME=127.0.0.1 nohup bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 &
 NEXT_PID=$!
