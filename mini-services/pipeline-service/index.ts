@@ -1222,6 +1222,20 @@ async function processJob(jobId: string): Promise<void> {
       await fs.writeFile(narrationFile, JSON.stringify(narrations, null, 2), 'utf8')
       // Per-image transcriptions (narration.json) are sufficient.
 
+      // Distinct from the mid-flow emptyRatio>0.8 check above (which
+      // correctly does NOT treat a mostly-silent chapter as failure — many
+      // manhwa chapters legitimately are). This is the much stronger
+      // signal of EVERY SINGLE panel coming back empty across a whole
+      // chapter — real manhwa chapters essentially always have at least
+      // some dialogue somewhere. Don't change status/DB fields (risks
+      // downstream code that pattern-matches specific status strings) —
+      // just make sure this isn't silently indistinguishable from a
+      // chapter with real, correct narration.
+      if (narrations.length > 3 && narrations.every((n) => !n.text.trim())) {
+        await emitLog(jobId, 'warn', 'transcribe',
+          `Chapter ${ch.index}: ALL ${narrations.length} panels came back with empty narration text — this is unusual for a full chapter and likely indicates a transcription problem, not a legitimately silent chapter`)
+      }
+
       const updated = await db.chapter.update({
         where: { id: ch.id },
         data: { status: 'transcribed', transcribed: true },

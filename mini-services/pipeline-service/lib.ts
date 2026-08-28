@@ -1040,7 +1040,10 @@ async function getOcrCached(key: string): Promise<{ text: string; status: string
     const cacheFile = path.join(OCR_CACHE_DIR, `${key}.json`)
     const stat = await fs.stat(cacheFile)
     const data = JSON.parse(await fs.readFile(cacheFile, 'utf8'))
-    const status = String(data.status || 'SUCCESS').toUpperCase()
+    // Default to FAILED (fail closed), not SUCCESS, if a cached entry is
+    // ever missing its status field (corrupted/legacy cache file) — an
+    // absent status must never be silently trusted as a confident result.
+    const status = String(data.status || 'FAILED').toUpperCase()
     const ttl = status === 'FAILED' ? FAILURE_CACHE_TTL_MS : VLM_CACHE_TTL_MS
     if (Date.now() - stat.mtimeMs > ttl) return null
     return { text: status === 'SUCCESS' ? (data.text ?? '') : '', status }
@@ -1178,7 +1181,11 @@ export async function generateImageNarrationsOCR(
             const cacheKey = ocrCacheKey(imgPath)
             const ocrResult = data.results[bIdx]
 
-            const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
+            // main.py's OCRResult Pydantic model defaults status to "FAILED"
+            // (fail closed) — mirror that here instead of defaulting to
+            // SUCCESS, so a malformed/truncated response can never be
+            // silently trusted as a confident real transcription.
+            const status = String(ocrResult.status || 'FAILED').toUpperCase()
             const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
             const regions = ocrResult.regions || 0
 

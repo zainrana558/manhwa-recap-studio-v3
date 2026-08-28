@@ -797,23 +797,48 @@ export async function getImagesForSource(
 // ---------------------------------------------------------------------------
 
 export async function getMangaDexChapters(mangaId: string): Promise<ScrapedChapter[]> {
-  // Fetch all chapters for this manga (English translated, sorted ascending)
-  const url = `https://api.mangadex.org/manga/${mangaId}/feed?translatedLanguage[]=en&order[chapter]=asc&limit=500&contentRating[]=safe&contentRating[]=suggestive`;
-  const res = await fetchWithTimeout(url, {}, 15000);
-  if (!res.ok) throw new Error(`MangaDex chapters ${res.status}`);
-
-  const data = await res.json() as {
-    data: Array<{
-      id: string;
-      attributes: {
-        chapter?: string;
-        title?: string | null;
-        translatedLanguage?: string;
-        externalUrl?: string | null;
-        pages?: number;
-      };
-    }>;
-  };
+  // MangaDex caps `limit` at 500 per request. A single unpaginated call
+  // silently truncated any manga with more than 500 English chapters
+  // (long-running series aren't rare) with no error and no indication
+  // chapters were missing. Paginate via `offset` until every chapter is
+  // fetched, using the response envelope's `total` field, with a hard
+  // iteration cap as a sanity bound against a malformed/unbounded loop.
+  const allData: Array<{
+    id: string;
+    attributes: {
+      chapter?: string;
+      title?: string | null;
+      translatedLanguage?: string;
+      externalUrl?: string | null;
+      pages?: number;
+    };
+  }> = [];
+  let offset = 0;
+  const pageLimit = 500;
+  const maxPages = 20; // 10,000 chapters — far beyond any real manga
+  for (let page = 0; page < maxPages; page++) {
+    const url = `https://api.mangadex.org/manga/${mangaId}/feed?translatedLanguage[]=en&order[chapter]=asc&limit=${pageLimit}&offset=${offset}&contentRating[]=safe&contentRating[]=suggestive`;
+    const res = await fetchWithTimeout(url, {}, 15000);
+    if (!res.ok) throw new Error(`MangaDex chapters ${res.status}`);
+    const page_data = await res.json() as {
+      data: Array<{
+        id: string;
+        attributes: {
+          chapter?: string;
+          title?: string | null;
+          translatedLanguage?: string;
+          externalUrl?: string | null;
+          pages?: number;
+        };
+      }>;
+      total?: number;
+    };
+    allData.push(...page_data.data);
+    const total = page_data.total ?? allData.length;
+    offset += page_data.data.length;
+    if (page_data.data.length === 0 || offset >= total) break;
+  }
+  const data = { data: allData };
 
   const chapters: ScrapedChapter[] = [];
   for (const ch of data.data) {
