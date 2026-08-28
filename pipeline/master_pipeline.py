@@ -190,17 +190,269 @@ class PipelineConfig:
             pass
 
 
+class OcrStatus:
+    SUCCESS = "SUCCESS"
+    UNCERTAIN = "UNCERTAIN"
+    FAILED = "FAILED"
+    NO_TEXT = "NO_TEXT"
+
+
+def parse_narration_item(raw_item: object) -> dict:
+    """Parse narration item into a structured dict with text, status, and confidence.
+    Backward-compatible with string values, legacy list dicts, and richer upstream formats.
+    """
+    if raw_item is None:
+        return {"text": "", "status": OcrStatus.NO_TEXT, "confidence": 0.0}
+
+    if isinstance(raw_item, str):
+        text = raw_item.strip()
+        if text == "[transcription unavailable]":
+            return {"text": "", "status": OcrStatus.FAILED, "confidence": 0.0}
+        status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+        return {"text": text, "status": status, "confidence": 1.0 if text else 0.0}
+
+    if isinstance(raw_item, dict):
+        text = str(raw_item.get("text") or "").strip()
+        if text == "[transcription unavailable]":
+            return {"text": "", "status": OcrStatus.FAILED, "confidence": 0.0}
+
+        raw_status = raw_item.get("status")
+        if raw_status:
+            status = str(raw_status).upper()
+            if status not in (OcrStatus.SUCCESS, OcrStatus.UNCERTAIN, OcrStatus.FAILED, OcrStatus.NO_TEXT):
+                status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+        else:
+            status = OcrStatus.SUCCESS if text else OcrStatus.NO_TEXT
+
+        conf = raw_item.get("confidence")
+        try:
+            confidence = float(conf) if conf is not None else (1.0 if status == OcrStatus.SUCCESS else 0.0)
+        except (ValueError, TypeError):
+            confidence = 1.0 if status == OcrStatus.SUCCESS else 0.0
+
+        return {"text": text, "status": status, "confidence": confidence}
+
+    return {"text": "", "status": OcrStatus.NO_TEXT, "confidence": 0.0}
+
+
 @dataclass
 class Chapter:
     index: int
     name: str
     folder: Path
     panel_paths: List[Path] = field(default_factory=list)
-    image_narrations: dict = field(default_factory=dict)  # filename -> narration text (from narration.json)
+    image_narrations: dict = field(default_factory=dict)  # filename -> narration entry (from narration.json)
 
     @property
     def tag(self) -> str:
         return f"chap_{self.index:03d}"
+
+
+# ---------------------------------------------------------------------------
+# Canonical Frame Identity & Manifest Data Model (v2.0 Schema)
+# ---------------------------------------------------------------------------
+
+MANIFEST_VERSION = "2.0"
+
+
+@dataclass
+class FrameEntry:
+    frame_id: str
+    filename: str
+    path: str
+    source_page: str
+    source_index: int
+    frame_kind: str = "panel"  # "panel" | "scroll_frame" | "full_page"
+    ocr_status: str = "NONE"
+    ocr_text: str = ""
+    narration_text: str = ""
+    audio_path: Optional[str] = None
+    duration: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "frame_id": self.frame_id,
+            "filename": self.filename,
+            "path": self.path,
+            "source_page": self.source_page,
+            "source_index": self.source_index,
+            "frame_kind": self.frame_kind,
+            "ocr_status": self.ocr_status,
+            "ocr_text": self.ocr_text,
+            "narration_text": self.narration_text,
+            "audio_path": self.audio_path,
+            "duration": self.duration,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, default_chapter_tag: str = "chap_000") -> "FrameEntry":
+        fname = str(data.get("filename") or "")
+        fpath = str(data.get("path") or "")
+        if not fname and fpath:
+            fname = Path(fpath).name
+
+        fid = str(data.get("frame_id") or "")
+        if not fid:
+            if fname:
+                stem = Path(fname).stem
+                fid = f"{default_chapter_tag}_{stem}"
+            else:
+                fid = f"{default_chapter_tag}_frame_00000"
+
+        return cls(
+            frame_id=fid,
+            filename=fname,
+            path=fpath,
+            source_page=str(data.get("source_page") or ""),
+            source_index=int(data.get("source_index", 0)),
+            frame_kind=str(data.get("frame_kind") or "panel"),
+            ocr_status=str(data.get("ocr_status") or "NONE"),
+            ocr_text=str(data.get("ocr_text") or ""),
+            narration_text=str(data.get("narration_text") or ""),
+            audio_path=data.get("audio_path"),
+            duration=float(data["duration"]) if data.get("duration") is not None else None,
+        )
+
+
+@dataclass
+class CanonicalManifest:
+    manifest_version: str
+    job_id: str
+    chapter_tag: str
+    source_pages: List[str]
+    frames: List[FrameEntry]
+
+    def to_dict(self) -> dict:
+        return {
+            "manifest_version": self.manifest_version,
+            "job_id": self.job_id,
+            "chapter_tag": self.chapter_tag,
+            "source_pages": self.source_pages,
+            "frames": [f.to_dict() for f in self.frames],
+            "legacy_frames": [f.path for f in self.frames],
+            "sources": [f.source_index for f in self.frames],
+        }
+
+    def save(self, manifest_path: Path) -> None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp_path.replace(manifest_path)
+
+
+def load_or_migrate_manifest(
+    manifest_path: Path,
+    chapter: Optional[Chapter] = None,
+    job_id: str = "local",
+) -> Optional[CanonicalManifest]:
+    """Load a manifest file. If legacy v1 format, migrate explicitly to v2.0."""
+    if not manifest_path.exists():
+        return None
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Manifest %s is invalid JSON: %s", manifest_path, exc)
+        return None
+
+    chapter_tag = chapter.tag if chapter else str(data.get("chapter_tag") or "chap_000")
+    source_pages = []
+    if "source_pages" in data and isinstance(data["source_pages"], list):
+        source_pages = [str(sp) for sp in data["source_pages"]]
+    elif chapter:
+        source_pages = [p.name for p in chapter.panel_paths]
+
+    raw_frames = data.get("frames")
+    if not isinstance(raw_frames, list):
+        return None
+
+    if data.get("manifest_version") == MANIFEST_VERSION and raw_frames and isinstance(raw_frames[0], dict):
+        entries = [FrameEntry.from_dict(f, chapter_tag) for f in raw_frames]
+        manifest = CanonicalManifest(
+            manifest_version=MANIFEST_VERSION,
+            job_id=str(data.get("job_id") or job_id),
+            chapter_tag=chapter_tag,
+            source_pages=source_pages or [str(sp) for sp in data.get("source_pages", [])],
+            frames=entries,
+        )
+        return manifest
+
+    sources = data.get("sources") or []
+    entries = []
+    for idx, f_item in enumerate(raw_frames):
+        if isinstance(f_item, str):
+            fpath = f_item
+            fname = Path(f_item).name
+            src_idx = sources[idx] if idx < len(sources) and isinstance(sources[idx], int) else 0
+            src_page = source_pages[src_idx] if src_idx < len(source_pages) else f"page_{src_idx:03d}.jpg"
+            frame_id = f"{chapter_tag}_frame_{idx:05d}"
+            entries.append(
+                FrameEntry(
+                    frame_id=frame_id,
+                    filename=fname,
+                    path=fpath,
+                    source_page=src_page,
+                    source_index=src_idx,
+                    frame_kind="panel",
+                )
+            )
+        elif isinstance(f_item, dict):
+            entries.append(FrameEntry.from_dict(f_item, chapter_tag))
+
+    migrated = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=str(data.get("job_id") or job_id),
+        chapter_tag=chapter_tag,
+        source_pages=source_pages,
+        frames=entries,
+    )
+    try:
+        migrated.save(manifest_path)
+        log.info("[%s] Migrated legacy manifest to v2.0 format (%d frames)", chapter_tag, len(entries))
+    except Exception as exc:
+        log.warning("[%s] Failed to save migrated manifest: %s", chapter_tag, exc)
+
+    return migrated
+
+
+def validate_canonical_manifest(
+    manifest_path: Path,
+    chapter: Chapter,
+    job_id: str = "local",
+) -> tuple[bool, Optional[CanonicalManifest], str]:
+    """Strictly validate existing manifest for resume behavior.
+
+    Returns (is_valid, canonical_manifest_obj, reason).
+    Checks:
+    1. Manifest file exists and is valid JSON/schema.
+    2. All expected frame files exist on disk and are non-empty.
+    3. Frame IDs are consistent and unique.
+    4. Source page relationships match the current chapter's panel paths.
+    """
+    manifest = load_or_migrate_manifest(manifest_path, chapter=chapter, job_id=job_id)
+    if not manifest:
+        return False, None, "Manifest missing or unparseable"
+
+    if not manifest.frames:
+        return False, None, "Manifest contains zero frames"
+
+    frame_ids = [f.frame_id for f in manifest.frames]
+    if len(frame_ids) != len(set(frame_ids)):
+        return False, None, "Manifest contains duplicate frame IDs"
+
+    expected_sources = [p.name for p in chapter.panel_paths]
+    if manifest.source_pages and manifest.source_pages != expected_sources:
+        return False, None, f"Source pages mismatch: expected {expected_sources}, manifest has {manifest.source_pages}"
+
+    slice_dir = manifest_path.parent
+    for frame in manifest.frames:
+        target = Path(frame.path)
+        if not target.exists():
+            target = slice_dir / frame.filename
+        if not target.exists() or target.stat().st_size < 100:
+            return False, None, f"Frame file missing or invalid on disk: {frame.filename}"
+
+    return True, manifest, "Valid manifest"
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +496,12 @@ def discover_chapters(cfg: PipelineConfig) -> List[Chapter]:
                 narr_data = json.loads(narration_file.read_text(encoding="utf-8"))
                 if isinstance(narr_data, list):
                     for item in narr_data:
-                        if isinstance(item, dict) and "image" in item and "text" in item:
-                            image_narrations[item["image"]] = item["text"]
-                    log.info("[%s] loaded %d per-image narrations from narration.json", d.name, len(image_narrations))
+                        if isinstance(item, dict) and "image" in item:
+                            image_narrations[item["image"]] = item
+                elif isinstance(narr_data, dict):
+                    for k, v in narr_data.items():
+                        image_narrations[k] = v
+                log.info("[%s] loaded %d per-image narrations from narration.json", d.name, len(image_narrations))
             except Exception as e:
                 log.warning("[%s] failed to parse narration.json: %s", d.name, e)
         else:
@@ -274,38 +529,46 @@ def _fast_prepare_frames(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     duration of its narration TTS, keeping voice and image perfectly in sync.
 
     Returns list of (frame_path, source_panel_index) tuples.
-    Resumable: reuses existing frames from the slices directory."""
+    Resumable: reuses existing frames from the slices directory if valid."""
     out_dir = cfg.temp_slices_dir / chapter.tag
     manifest_path = out_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            data = json.loads(manifest_path.read_text())
-            frames = data["frames"]
-            sources = data.get("sources")
-            if sources and len(sources) == len(frames):
-                log.info("[%s] frames already exist (%d frames) — skipping", chapter.tag, len(frames))
-                return [(Path(f), s) for f, s in zip(frames, sources)]
-        except Exception:
-            pass
+
+    is_valid, manifest, reason = validate_canonical_manifest(manifest_path, chapter, job_id=cfg.job_id)
+    if is_valid and manifest:
+        log.info("[%s] canonical manifest verified (%d frames, %s) — skipping frame prep", chapter.tag, len(manifest.frames), reason)
+        return [(Path(f.path if Path(f.path).exists() else out_dir / f.filename), f.source_index) for f in manifest.frames]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    frame_data: List[tuple] = []
+    frame_entries: List[FrameEntry] = []
 
     for panel_idx, panel_path in enumerate(chapter.panel_paths):
         fp = out_dir / f"frame_{panel_idx:05d}.jpg"
-        if fp.exists():
-            frame_data.append((fp, panel_idx))
-            continue
-        frame = _compose_canvas_from_source(panel_path)
-        frame.save(fp, quality=92)
-        frame_data.append((fp, panel_idx))
+        if not fp.exists():
+            frame = _compose_canvas_from_source(panel_path)
+            frame.save(fp, quality=92)
 
-    manifest_path.write_text(json.dumps({
-        "frames": [str(f) for f, _ in frame_data],
-        "sources": [s for _, s in frame_data],
-    }, indent=2))
-    log.info("[%s] prepared %d frames (one per source panel)", chapter.tag, len(frame_data))
-    return frame_data
+        frame_id = f"{chapter.tag}_frame_{panel_idx:05d}"
+        frame_entries.append(
+            FrameEntry(
+                frame_id=frame_id,
+                filename=fp.name,
+                path=str(fp.resolve()),
+                source_page=panel_path.name,
+                source_index=panel_idx,
+                frame_kind="full_page",
+            )
+        )
+
+    manifest = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=cfg.job_id,
+        chapter_tag=chapter.tag,
+        source_pages=[p.name for p in chapter.panel_paths],
+        frames=frame_entries,
+    )
+    manifest.save(manifest_path)
+    log.info("[%s] prepared %d frames (one per source panel)", chapter.tag, len(frame_entries))
+    return [(Path(f.path), f.source_index) for f in manifest.frames]
 
 
 def _compose_canvas_from_source(panel_path: Path):
@@ -503,6 +766,68 @@ def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
     return [(p[0], p[1], p[2], p[3]) for p in merged if (p[3] - p[1]) >= min_panel_h]
 
 
+def _check_bubble_union(mask, cut_y: int, img_shape: tuple) -> int:
+    """Bubble Union Check:
+    If a horizontal cut line intersects a content blob (speech bubble, text glyph, ascender, descender, or sound effect tail),
+    move the cut line below (or above) the entire speech bubble component to keep dialogue intact in a single frame.
+    """
+    h, w = img_shape[:2]
+    cut_y = max(0, min(h - 1, cut_y))
+    if not np.any(mask[cut_y, :] > 0):
+        return cut_y
+
+    # Label connected components directly on binary mask
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    intersected_bottoms = []
+    intersected_tops = []
+    for i in range(1, n_labels):
+        cy1 = stats[i, cv2.CC_STAT_TOP]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        cy2 = cy1 + ch
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 6:
+            continue
+        if cy1 <= cut_y < cy2:
+            intersected_bottoms.append(cy2)
+            intersected_tops.append(cy1)
+
+    if intersected_bottoms:
+        # Move cut line below the max bottom of intersected speech bubbles
+        target_y = max(intersected_bottoms) + 5
+        if target_y < h:
+            return target_y
+        # If moving below exceeds image height, move above the min top
+        target_y = max(0, min(intersected_tops) - 5)
+        return target_y
+
+    return cut_y
+
+
+def _apply_dynamic_padding(panel_box: tuple, mask, img_shape: tuple, padding_px: int = 30) -> tuple:
+    """Minimum Vertical Padding & Speech Bubble Protection:
+    When a panel slice contains text contours or speech bubbles near its top or bottom borders,
+    automatically expand the slice bounding box by 30 pixels vertically (clamped to image height).
+    """
+    x1, y1, w, h = panel_box
+    img_h, img_w = img_shape[:2]
+    y2 = y1 + h
+
+    # Check top boundary region (y1 to y1 + padding_px)
+    top_region = mask[max(0, y1):min(img_h, y1 + padding_px), max(0, x1):min(img_w, x1 + w)]
+    # Check bottom boundary region (y2 - padding_px to y2)
+    bot_region = mask[max(0, y2 - padding_px):min(img_h, y2), max(0, x1):min(img_w, x1 + w)]
+
+    new_y1 = y1
+    new_y2 = y2
+
+    if np.any(top_region > 0):
+        new_y1 = max(0, y1 - padding_px)
+    if np.any(bot_region > 0):
+        new_y2 = min(img_h, y2 + padding_px)
+
+    return (x1, new_y1, w, new_y2 - new_y1)
+
+
 def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
     """Nudge a candidate horizontal edge to the nearest row that is
     completely clear of content across the full width, within +/- window
@@ -513,10 +838,14 @@ def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
     keep the original box than snap arbitrarily far away)."""
     h = mask.shape[0]
     y = max(0, min(h - 1, y))
+
+    # Perform Bubble Union check if cut intersects speech bubble
+    y = _check_bubble_union(mask, y, (h, mask.shape[1]))
+
     if not np.any(mask[y, :] > 0):
         return y
     for d in range(1, window + 1):
-        for cand in (y - d, y + d):
+        for cand in (y + d, y - d):  # Prefer moving down below text
             if 0 <= cand < h and not np.any(mask[cand, :] > 0):
                 return cand
     return y
@@ -1061,24 +1390,118 @@ def _is_lines_only_crop(arr_gray) -> bool:
     return has_lines and not has_text and not has_art
 
 
+def _calc_image_entropy(arr_gray) -> float:
+    """Calculate Shannon entropy of a grayscale panel slice (0 to 8)."""
+    if arr_gray is None or arr_gray.size == 0:
+        return 0.0
+    hist, _ = np.histogram(arr_gray, bins=256, range=(0, 256))
+    prob = hist / float(arr_gray.size)
+    prob = prob[prob > 0]
+    return float(-np.sum(prob * np.log2(prob)))
+
+
+def _is_featureless_vfx(arr_gray) -> bool:
+    """Check if a panel slice candidate is a featureless background, visual effect,
+    gradient, speed line, ice shard, or light aura region lacking character faces,
+    dialogue bubbles, or structural story focal points.
+
+    Detection criteria:
+    - Structural contour density (Canny edges)
+    - Presence of text glyphs (small bounded edge components) or distinct story focal points
+    """
+    if arr_gray is None or arr_gray.size == 0:
+        return True
+
+    h, w = arr_gray.shape
+    if h < 20 or w < 20:
+        return True
+
+    edges = cv2.Canny(arr_gray, 50, 150)
+    edge_density = float(np.count_nonzero(edges)) / float(arr_gray.size)
+
+    # Analyze connected components of Canny edge contours
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+
+    text_components = 0
+    substantive_contours = 0
+
+    for i in range(1, n_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        if area < 10:
+            continue
+        # Text characters in edge domain are small bounded glyph components (e.g. 5 <= cw, ch <= 60)
+        if 5 <= cw <= 60 and 5 <= ch <= 60 and area >= 15:
+            text_components += 1
+        elif area > 800 and (cw > 80 or ch > 80):
+            substantive_contours += 1
+
+    # Featureless visual effects (ice shards, speed lines, light aura) have < 4 text glyphs and low substantive contours
+    if text_components < 4 and substantive_contours == 0:
+        return True
+    if text_components < 4 and edge_density < 0.02:
+        return True
+
+    return False
+
+
 def _should_skip_panel(arr_gray) -> bool:
     """Determine if a panel should be skipped (not included in the video).
 
     A panel is skipped if:
     1. It's blank (all-white, uniform, no content) — _is_blank_crop
     2. It contains ONLY lines/borders (no text, no art) — _is_lines_only_crop
-
-    Panels that ARE kept:
-    - Panels with text (speech bubbles, captions, narration boxes)
-    - Panels with artwork (characters, backgrounds, action scenes)
-    - Panels with both text and art
-    - Panels with text + border lines (the borders don't disqualify them)
+    3. It is a featureless visual effect frame (speed lines, ice shards, light aura) — _is_featureless_vfx
     """
     if _is_blank_crop(arr_gray):
         return True
     if _is_lines_only_crop(arr_gray):
         return True
+    if _is_featureless_vfx(arr_gray):
+        return True
     return False
+
+
+def _clean_panel_boundary_edges(arr_rgb, arr_gray, max_scan_px: int = 15):
+    """Clean panel boundary edge fragments (dual-panel overlap bug fix).
+
+    Enhances horizontal gutter detection by looking for continuous black/white pixel rows
+    or distinct edge color transitions between adjacent panels. Trims stray top/bottom edge fragments
+    from adjacent panels (such as fire panel top bleed) before finalizing slice output.
+    """
+    h, w = arr_gray.shape
+    if h < 30 or w < 30:
+        return arr_rgb, arr_gray
+
+    # Scan top rows for stray edge fragments from previous panel
+    top_trim = 0
+    for y in range(min(max_scan_px, h // 4)):
+        row = arr_gray[y, :]
+        mean_v = float(np.mean(row))
+        # Continuous black border row (<10) or white gutter row (>245)
+        if mean_v > 245 or mean_v < 10:
+            top_trim = y + 1
+        else:
+            break
+
+    # Scan bottom rows for stray edge fragments from next panel
+    bot_trim = h
+    for y in range(h - 1, max(h - max_scan_px - 1, h - h // 4), -1):
+        row = arr_gray[y, :]
+        mean_v = float(np.mean(row))
+        if mean_v > 245 or mean_v < 10:
+            bot_trim = y
+        else:
+            break
+
+    if top_trim > 0 or bot_trim < h:
+        if (bot_trim - top_trim) >= 20:
+            arr_rgb = arr_rgb[top_trim:bot_trim, :]
+            arr_gray = arr_gray[top_trim:bot_trim, :]
+
+    return arr_rgb, arr_gray
 
 
 def _trim_white_borders(arr_gray, arr_rgb, margin: int = 2):
@@ -1088,10 +1511,10 @@ def _trim_white_borders(arr_gray, arr_rgb, margin: int = 2):
     nearly white (mean > 240, std < 10). Returns (trimmed_rgb, trimmed_gray)
     or the original arrays if no trimming was needed. Always keeps at least
     `margin` pixels of border so we don't clip artwork.
-
-    This makes panels fill the frame better (no wasted white space around
-    the artwork) and improves the VLM's ability to read text.
+    Also applies edge fragment cleaning (_clean_panel_boundary_edges).
     """
+    arr_rgb, arr_gray = _clean_panel_boundary_edges(arr_rgb, arr_gray)
+
     h, w = arr_gray.shape
     if h < 20 or w < 20:
         return arr_rgb, arr_gray
@@ -1396,36 +1819,25 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     Slice each source image into individual panel frames using contour-based,
     gutter-aware panel detection.
 
-    This uses the approach from the comic-manga-narrator project:
-    1. Threshold to binary (inverted: gutters are white, panels are dark)
-    2. Dilate to close small text/art gaps within panels
-    3. Find external contours → bounding rectangles
-    4. Filter by minimum area, reject speech bubbles and slivers
-    5. Safe fallback: if detection covers < 50% of image, use whole page
-
     Each detected panel is composited onto a 1920x1080 canvas with
     blurred background fill (contain-fit).
 
     Returns list of (frame_path, source_panel_index) tuples in order.
-    Resumable: if the chapter's slice folder has a manifest, reuse it.
+    Resumable: if the chapter's slice folder has a valid manifest, reuse it.
     """
     from PIL import Image, ImageFilter
 
     out_dir = cfg.temp_slices_dir / chapter.tag
     manifest_path = out_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            data = json.loads(manifest_path.read_text())
-            frames = data["frames"]
-            sources = data.get("sources")
-            if sources and len(sources) == len(frames):
-                log.info("[%s] frames already exist (%d frames) — skipping", chapter.tag, len(frames))
-                return [(Path(f), s) for f, s in zip(frames, sources)]
-        except Exception:
-            pass
 
+    is_valid, manifest, reason = validate_canonical_manifest(manifest_path, chapter, job_id=cfg.job_id)
+    if is_valid and manifest:
+        log.info("[%s] canonical manifest verified (%d frames, %s) — skipping slicing", chapter.tag, len(manifest.frames), reason)
+        return [(Path(f.path if Path(f.path).exists() else out_dir / f.filename), f.source_index) for f in manifest.frames]
+
+    log.info("[%s] manifest invalid or missing (%s) — slicing source pages into canonical frames", chapter.tag, reason)
     out_dir.mkdir(parents=True, exist_ok=True)
-    frame_data: List[tuple] = []
+    frame_entries: List[FrameEntry] = []
     frame_counter = 0
     total_blank_skipped = 0
 
@@ -1436,16 +1848,12 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 w, h = img.size
                 gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-                # Bubble-safe detection: gutter-aware scan for tall webtoon
-                # strips, YOLO/contour auto-detect for grid-style pages.
                 panels = _detect_panels_for_page(gray)
                 log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
 
-                # Safety net: snap every panel's top/bottom edge to the nearest
-                # fully-clear row within a small window, so a box from ANY
-                # detector can never clip a bubble tail or a text line.
                 content_mask = _build_dilated_content_mask(gray)
 
+                merged_panel_boxes = []
                 for (px, py, pw, ph) in panels:
                     if ph < 50 or pw < 50:
                         continue
@@ -1455,29 +1863,84 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     if safe_bot - safe_top >= 50:
                         py, ph = safe_top, safe_bot - safe_top
 
-                    # Each detected panel = ONE frame. No sub-splitting.
-                    # Tall panels are shown complete using cover-fit (fill the
-                    # 16:9 canvas completely by cropping the excess sides).
-                    # This means a tall character panel stays as ONE image —
-                    # the character might appear smaller but the full panel is
-                    # visible, not chopped into pieces.
+                    px, py, pw, ph = _apply_dynamic_padding((px, py, pw, ph), content_mask, (h, w), padding_px=30)
+
+                    crop_candidate = img.crop((px, py, px + pw, py + ph))
+                    crop_candidate_gray = cv2.cvtColor(np.array(crop_candidate), cv2.COLOR_RGB2GRAY)
+
+                    if _is_blank_crop(crop_candidate_gray) or _is_lines_only_crop(crop_candidate_gray):
+                        total_blank_skipped += 1
+                        continue
+
+                    if _is_featureless_vfx(crop_candidate_gray):
+                        if merged_panel_boxes:
+                            prev_x, prev_y, prev_w, prev_h = merged_panel_boxes[-1]
+                            new_y1 = min(prev_y, py)
+                            new_y2 = max(prev_y + prev_h, py + ph)
+                            new_x1 = min(prev_x, px)
+                            new_x2 = max(prev_x + prev_w, px + pw)
+                            merged_panel_boxes[-1] = (new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1)
+                        else:
+                            merged_panel_boxes.append((px, py, pw, ph))
+                    else:
+                        if merged_panel_boxes and _is_featureless_vfx(
+                            cv2.cvtColor(np.array(img.crop((merged_panel_boxes[-1][0], merged_panel_boxes[-1][1], merged_panel_boxes[-1][0] + merged_panel_boxes[-1][2], merged_panel_boxes[-1][1] + merged_panel_boxes[-1][3]))), cv2.COLOR_RGB2GRAY)
+                        ):
+                            prev_x, prev_y, prev_w, prev_h = merged_panel_boxes.pop()
+                            new_y1 = min(prev_y, py)
+                            new_y2 = max(prev_y + prev_h, py + ph)
+                            new_x1 = min(prev_x, px)
+                            new_x2 = max(prev_x + prev_w, px + pw)
+                            merged_panel_boxes.append((new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1))
+                        else:
+                            merged_panel_boxes.append((px, py, pw, ph))
+
+                for (px, py, pw, ph) in merged_panel_boxes:
                     crop = img.crop((px, py, px + pw, py + ph))
                     crop_arr = np.array(crop)
                     crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
 
-                    # Skip blank panels
                     if _is_blank_crop(crop_gray):
                         total_blank_skipped += 1
                         log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
                         continue
 
-                    # Composite onto 1920x1080 canvas with solid black background
-                    from PIL import Image as PILImage
-                    frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
-                    fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                    frame.save(fp, quality=92)
-                    frame_data.append((fp, panel_idx))
-                    frame_counter += 1
+                    cw, ch = crop.size
+                    if (ch / max(1, cw)) > 1.8:
+                        from PIL import Image as PILImage
+                        scroll_frames = _generate_ui_card_scroll_frames(crop, num_scroll_frames=4)
+                        for s_frame in scroll_frames:
+                            fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                            s_frame.save(fp, quality=92)
+                            frame_id = f"{chapter.tag}_frame_{frame_counter:05d}"
+                            frame_entries.append(
+                                FrameEntry(
+                                    frame_id=frame_id,
+                                    filename=fp.name,
+                                    path=str(fp.resolve()),
+                                    source_page=panel_path.name,
+                                    source_index=panel_idx,
+                                    frame_kind="scroll_frame",
+                                )
+                            )
+                            frame_counter += 1
+                    else:
+                        from PIL import Image as PILImage
+                        frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
+                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                        frame.save(fp, quality=92)
+                        frame_id = f"{chapter.tag}_frame_{frame_counter:05d}"
+                        frame_entries.append(
+                            FrameEntry(
+                                frame_id=frame_id,
+                                filename=fp.name,
+                                path=str(fp.resolve()),
+                                source_page=panel_path.name,
+                                source_index=panel_idx,
+                                frame_kind="panel",
+                            )
+                        )
+                        frame_counter += 1
         except Exception as exc:
             log.warning("[%s] Skipping unreadable/corrupt image %s: %s", chapter.tag, panel_path.name, exc)
             continue
@@ -1485,13 +1948,47 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     if total_blank_skipped > 0:
         log.info("[%s] skipped %d blank panel(s) during slicing", chapter.tag, total_blank_skipped)
 
-    manifest_path.write_text(json.dumps({
-        "frames": [str(f) for f, _ in frame_data],
-        "sources": [s for _, s in frame_data],
-    }, indent=2))
-    log.info("[%s] sliced %d source pages into %d frames (contour-based detection)",
-             chapter.tag, len(chapter.panel_paths), len(frame_data))
-    return frame_data
+    manifest = CanonicalManifest(
+        manifest_version=MANIFEST_VERSION,
+        job_id=cfg.job_id,
+        chapter_tag=chapter.tag,
+        source_pages=[p.name for p in chapter.panel_paths],
+        frames=frame_entries,
+    )
+    manifest.save(manifest_path)
+    log.info("[%s] sliced %d source pages into %d canonical frames (contour-based detection)",
+             chapter.tag, len(chapter.panel_paths), len(frame_entries))
+    return [(Path(f.path), f.source_index) for f in manifest.frames]
+
+
+def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["Image.Image"]:
+    """Generate a sequence of linear vertical scroll sub-frames for tall rectangular system/quest UI cards.
+    Maintains full resolution width and generates vertical panning steps down the UI card rather than squishing or cropping.
+    """
+    from PIL import Image
+
+    cw, ch = crop.size
+    # Visible window height in source space to match 16:9 ratio at full width cw
+    window_h = int(cw * CANVAS_H / CANVAS_W)
+    if window_h >= ch:
+        return [_compose_canvas(crop, None)]
+
+    scroll_frames = []
+    max_top = ch - window_h
+    step = max_top / max(1, num_scroll_frames - 1)
+
+    for i in range(num_scroll_frames):
+        top = int(round(i * step))
+        bot = min(ch, top + window_h)
+        sub_crop = crop.crop((0, top, cw, bot))
+
+        # Scale sub_crop to 1920x1080 canvas preserving aspect ratio
+        canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (0, 0, 0))
+        fg = sub_crop.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+        canvas.paste(fg, (0, 0))
+        scroll_frames.append(canvas)
+
+    return scroll_frames
 
 
 def _compose_canvas(crop, ImageFilter):
@@ -1700,7 +2197,11 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
             provider = "none"
 
     if provider == "none":
-        log.info("[%s] narration provider=none — using text verbatim", cache_tag)
+        log.warning(
+            "[%s] [RAW/VERBATIM MODE ACTIVE] narration provider=none — using raw text verbatim without recap narration. "
+            "If production recap narration is required, configure an upstream LLM provider.",
+            cache_tag,
+        )
         narration = _strip_forbidden(text)
         out_path.write_text(narration, encoding="utf-8")
         return narration
@@ -1874,26 +2375,45 @@ def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
 
 def _synthesize_with_piper(text: str, out_wav: Path) -> None:
     piper = shutil.which("piper")
-    model = os.environ.get("PIPER_VOICE_MODEL")
-    if not piper or not model:
-        raise RuntimeError("piper binary/model unavailable")
+    model = os.environ.get("PIPER_VOICE_MODEL", "en_US-ryan-high.onnx")
+    if not piper:
+        raise RuntimeError("piper binary unavailable")
+    # If model is a relative path or filename, let piper resolve it unless explicitly missing as an absolute path
+    if Path(model).is_absolute() and not Path(model).exists():
+        raise RuntimeError(f"piper voice model unavailable: {model}")
     with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
         _out, err = proc.communicate(text, timeout=120)
         if proc.returncode != 0:
             raise RuntimeError(f"piper failed: {err[-200:]}")
 
 
+def _srt_to_vtt(srt_content: str) -> str:
+    """Convert SRT subtitle content to WebVTT format."""
+    lines = ["WEBVTT", ""]
+    for line in srt_content.splitlines():
+        # Convert comma to dot in timestamps: 00:00:01,234 -> 00:00:01.234
+        if "-->" in line:
+            lines.append(line.replace(",", "."))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
-    """Generate atomic segment audio. Production never uses edge-tts or network TTS."""
+    """Generate atomic segment audio with Edge-TTS (primary), Piper ONNX (fallback), eSpeak NG (tertiary fallback).
+    Also exports matching .vtt / .srt timing markers alongside Edge-TTS audio outputs for caption syncing.
+    """
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
     final_path = seg_audio_dir / f"{tag}.wav"
     text = text.strip()
     if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
         return final_path, False
+
     final_path.unlink(missing_ok=True)
     tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
     tmp_path.unlink(missing_ok=True)
+
     if not text:
         _generate_silence(tmp_path, SILENT_FRAME_DURATION)
         if not _audio_qa(tmp_path, allow_silence=True):
@@ -1901,34 +2421,35 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
             raise RuntimeError(f"silent audio QA failed for {tag}")
         os.replace(tmp_path, final_path)
         return final_path, False
+
     failures = []
-    if getattr(cfg, "production_mode", False):
-        for provider in ("piper", "piper", "espeak"):
-            tmp_path.unlink(missing_ok=True)
-            try:
-                if provider == "piper":
-                    _synthesize_with_piper(text, tmp_path)
-                else:
-                    _synthesize_with_espeak(text, tmp_path)
-                if not _audio_qa(tmp_path, allow_silence=False):
-                    raise RuntimeError(f"{provider} output failed audio QA")
-                os.replace(tmp_path, final_path)
-                return final_path, False
-            except Exception as e:
-                failures.append(f"{provider}: {e}")
-        tmp_path.unlink(missing_ok=True)
-        raise RuntimeError("Production TTS failed; no silent substitution: " + " | ".join(failures))
 
     import asyncio
     import edge_tts
+
+    voice = cfg.voice or "en-US-ChristopherNeural"
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
-    async def _run():
-        communicate = edge_tts.Communicate(text, cfg.voice)
-        await communicate.save(str(raw_path))
+    srt_path = seg_audio_dir / f"{tag}.srt"
+    vtt_path = seg_audio_dir / f"{tag}.vtt"
+
+    async def _run_edge_tts():
+        communicate = edge_tts.Communicate(text, voice, rate="+5%")
+        submaker = edge_tts.SubMaker()
+        with open(raw_path, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                    submaker.feed(chunk)
+        srt_text = submaker.get_srt()
+        if srt_text:
+            srt_path.write_text(srt_text, encoding="utf-8")
+            vtt_path.write_text(_srt_to_vtt(srt_text), encoding="utf-8")
+
     try:
-        asyncio.run(_run())
+        asyncio.run(_run_edge_tts())
         if not raw_path.exists() or raw_path.stat().st_size < 100:
-            raise RuntimeError("edge-tts produced an empty audio file")
+            raise RuntimeError("edge-tts produced empty or invalid audio file")
         raw_dur = get_audio_duration(raw_path)
         fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
         seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
@@ -1938,12 +2459,41 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         os.replace(tmp_path, final_path)
         return final_path, False
     except Exception as e:
-        log.warning("[%s] edge-tts failed for segment %s (%s) — using silence in legacy mode", chapter.tag, tag, e)
-        _generate_silence(tmp_path, SILENT_FRAME_DURATION)
-        os.replace(tmp_path, final_path)
-        return final_path, True
+        failures.append(f"edge-tts: {e}")
+        log.warning("[%s] edge-tts failed for segment %s (%s) — attempting Piper ONNX fallback", chapter.tag, tag, e)
     finally:
         raw_path.unlink(missing_ok=True)
+
+    # Fallback 1: Piper ONNX
+    tmp_path.unlink(missing_ok=True)
+    try:
+        _synthesize_with_piper(text, tmp_path)
+        if _audio_qa(tmp_path, allow_silence=False):
+            os.replace(tmp_path, final_path)
+            log.info("[%s] Piper ONNX fallback succeeded for segment %s", chapter.tag, tag)
+            return final_path, False
+        raise RuntimeError("piper output failed audio QA")
+    except Exception as e:
+        failures.append(f"piper: {e}")
+        log.warning("[%s] Piper ONNX fallback failed for segment %s (%s) — attempting eSpeak NG fallback", chapter.tag, tag, e)
+
+    # Fallback 2: eSpeak NG
+    tmp_path.unlink(missing_ok=True)
+    try:
+        _synthesize_with_espeak(text, tmp_path)
+        if _audio_qa(tmp_path, allow_silence=False):
+            os.replace(tmp_path, final_path)
+            log.info("[%s] eSpeak NG fallback succeeded for segment %s", chapter.tag, tag)
+            return final_path, False
+        raise RuntimeError("espeak output failed audio QA")
+    except Exception as e:
+        failures.append(f"espeak: {e}")
+        log.warning("[%s] All TTS engines failed for segment %s (%s) — using silence fallback", chapter.tag, tag, " | ".join(failures))
+
+    # Ultimate fallback in legacy mode: generate silence
+    _generate_silence(tmp_path, SILENT_FRAME_DURATION)
+    os.replace(tmp_path, final_path)
+    return final_path, True
 
 def build_chapter_audio_track(
     cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path],
@@ -2018,13 +2568,13 @@ def build_chapter_audio_track(
     # into render_chapter's video mux.
     tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
     tmp_path.unlink(missing_ok=True)
-    af = f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11"
+    af = "loudnorm=I=-16:TP=-1.5:LRA=11"
     try:
         run_ffmpeg(
             [
                 "ffmpeg", "-y", "-i", str(raw_path),
                 "-af", af,
-                "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "1",
+                "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE, "-ac", "2",
                 "-f", "mp3",
                 str(tmp_path),
             ]
@@ -2035,7 +2585,7 @@ def build_chapter_audio_track(
             chapter.tag, e,
         )
         tmp_path.unlink(missing_ok=True)
-        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-f", "mp3", str(tmp_path)])
+        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2", "-f", "mp3", str(tmp_path)])
 
     qa = audio_qa(tmp_path, narration_expected=narration_expected)
     if not qa.ok:
@@ -2059,12 +2609,12 @@ def build_chapter_audio_track(
 # 4b. FRAME TIMING (proportional word-count split)
 # ---------------------------------------------------------------------------
 
-def split_frame_timings(text: str, positions: List[int], duration: float) -> dict:
+def split_frame_timings(text: str, positions: List[int], duration: float, is_silent: bool = False) -> dict:
     """Proportionally split a segment's TTS duration across its frames by
-    word count. Ensures each frame gets at least MIN_FRAME_DURATION seconds
-    so panels never flash by too fast, PLUS adds FRAME_HOLD_PADDING (0.5s)
-    to each frame so the image stays on screen a beat after the voice ends
-    — giving the viewer time to read the panel text."""
+    word count. For narrated frames, ensures each frame gets at least MIN_FRAME_DURATION
+    seconds and adds FRAME_HOLD_PADDING (0.5s) to the last frame.
+    For silent (NO_TEXT or FAILED textless) frames, avoids MIN_FRAME_DURATION and
+    FRAME_HOLD_PADDING to maintain appropriate short pacing."""
     frame_texts = split_into_segments(text, len(positions))
     word_counts = [len(t.split()) for t in frame_texts]
     total_words = sum(word_counts)
@@ -2085,27 +2635,34 @@ def split_frame_timings(text: str, positions: List[int], duration: float) -> dic
             timings[pos] = (cursor, cursor + span)
             cursor += span
 
-    # Enforce MIN_FRAME_DURATION: stretch any short frame and push later ones out.
-    # Walk forward, adjusting each frame's end to be at least MIN_FRAME_DURATION
-    # from its start, then shifting subsequent starts.
-    prev_end = 0.0
-    for pos in positions:
-        start, end = timings[pos]
-        start = max(start, prev_end)  # ensure no overlap
-        if end - start < MIN_FRAME_DURATION:
-            end = start + MIN_FRAME_DURATION
-        timings[pos] = (start, end)
-        prev_end = end
+    if not is_silent:
+        # Enforce MIN_FRAME_DURATION: stretch any short frame and push later ones out.
+        # Walk forward, adjusting each frame's end to be at least MIN_FRAME_DURATION
+        # from its start, then shifting subsequent starts.
+        prev_end = 0.0
+        for pos in positions:
+            start, end = timings[pos]
+            start = max(start, prev_end)  # ensure no overlap
+            if end - start < MIN_FRAME_DURATION:
+                end = start + MIN_FRAME_DURATION
+            timings[pos] = (start, end)
+            prev_end = end
 
-    # Add FRAME_HOLD_PADDING only to the LAST frame in the segment, not every
-    # frame. Adding padding between every frame creates silence gaps that make
-    # the narration sound chopped/cut. Instead, the image holds for 0.5s after
-    # the LAST frame's audio ends, giving the viewer a moment before the next
-    # segment starts.
-    if positions:
-        last_pos = positions[-1]
-        start, end = timings[last_pos]
-        timings[last_pos] = (start, end + FRAME_HOLD_PADDING)
+        # Add FRAME_HOLD_PADDING only to the LAST frame in the segment.
+        if positions:
+            last_pos = positions[-1]
+            start, end = timings[last_pos]
+            timings[last_pos] = (start, end + FRAME_HOLD_PADDING)
+    else:
+        # For silent frames, enforce non-overlapping boundaries without MIN_FRAME_DURATION padding.
+        prev_end = 0.0
+        for pos in positions:
+            start, end = timings[pos]
+            start = max(start, prev_end)
+            if end <= start:
+                end = start + 1.0
+            timings[pos] = (start, end)
+            prev_end = end
 
     return timings
 
@@ -2540,70 +3097,105 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
         try:
-            # Slice returns [(frame_path, source_panel_index), ...] so we can map
-            # each frame to its source image's narration for perfect sync.
-            # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
-            # horizontal AND vertical panel boundaries, so each manga panel
-            # gets its own individual 1920x1080 frame.
             cfg.write_progress("slice", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: slicing panels...")
             frame_data = slice_chapter_panels(cfg, chapter)
-            frame_paths = [fp for fp, _ in frame_data]
-            frame_sources = [si for _, si in frame_data]
 
-            log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+            manifest_path = cfg.temp_slices_dir / chapter.tag / "manifest.json"
+            manifest = load_or_migrate_manifest(manifest_path, chapter=chapter, job_id=cfg.job_id)
+            if manifest and manifest.frames:
+                frame_paths = [Path(f.path) if Path(f.path).exists() else cfg.temp_slices_dir / chapter.tag / f.filename for f in manifest.frames]
+                frame_sources = [f.source_index for f in manifest.frames]
+            else:
+                frame_paths = [fp for fp, _ in frame_data]
+                frame_sources = [si for _, si in frame_data]
+
+            log.info("[%s] %d canonical frames from %d source pages", chapter.tag, len(frame_paths), len(chapter.panel_paths))
             cfg.write_progress("slice", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
             # Build an ordered list of (tag, text, frame_positions) "segments" —
             # each one gets exactly ONE continuous edge-tts synthesis call, then
             # real word timestamps from that single clip drive per-frame timing.
-            # This is what eliminates the audible stop-after-every-word chop:
-            # previously every one of these frame positions triggered its own
-            # separate edge-tts call.
             segments: List[tuple] = []  # (tag, text, positions)
 
             if chapter.image_narrations:
-                # PER-PANEL NARRATION MODE (preferred).
-                #
-                # Two narration.json key formats are supported:
-                #  (a) FRAME-KEYED (new, post-slice-first): keys are sliced frame
-                #      filenames like "frame_00000.jpg". Each frame already shows
-                #      ONE individual panel, so the VLM transcription is precise.
-                #      We build one TTS segment per frame.
-                #  (b) SOURCE-KEYED (legacy, pre-slice): keys are source page
-                #      filenames like "001.jpg". The VLM read the whole page, so
-                #      all sliced frames from the same source page share one
-                #      narration. We group frame positions by source panel index.
                 frame_keyed = any(
-                    k.startswith("frame_") for k in chapter.image_narrations.keys()
+                    k.startswith("frame_") or (manifest and k in [f.frame_id for f in manifest.frames])
+                    for k in chapter.image_narrations.keys()
                 )
 
                 if frame_keyed:
-                    log.info("[%s] per-frame narration mode: %d frames (sliced-panel transcriptions)",
+                    log.info("[%s] per-frame narration mode: %d frames (canonical frame transcriptions)",
                              chapter.tag, len(frame_paths))
                     # One segment per frame — narration perfectly synced to each panel.
                     for pos, fp in enumerate(frame_paths):
-                        raw_text = chapter.image_narrations.get(fp.name, "")
+                        f_entry = manifest.frames[pos] if (manifest and pos < len(manifest.frames)) else None
+                        raw_narr_entry = None
+                        if f_entry:
+                            raw_narr_entry = (
+                                chapter.image_narrations.get(f_entry.frame_id)
+                                or chapter.image_narrations.get(f_entry.filename)
+                                or chapter.image_narrations.get(fp.name)
+                            )
+                        else:
+                            raw_narr_entry = chapter.image_narrations.get(fp.name)
+
+                        parsed = parse_narration_item(raw_narr_entry)
+                        raw_text, ocr_status = parsed["text"], parsed["status"]
                         img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
-                        translated = translate_text(cfg, raw_text, img_tag)
-                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                        if rephrased:
-                            prev_tail = last_sentences(rephrased)
-                        segments.append((f"frm{pos + 1:04d}", rephrased, [pos]))
+
+                        if f_entry:
+                            f_entry.ocr_status = ocr_status
+                            f_entry.ocr_text = raw_text
+
+                        if ocr_status == OcrStatus.FAILED:
+                            log.warning("[%s] [%s] OCR FAILED for frame %s — retaining FAILED status, producing silent frame", chapter.tag, img_tag, fp.name)
+                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.FAILED))
+                        elif ocr_status == OcrStatus.NO_TEXT:
+                            log.info("[%s] [%s] NO_TEXT confirmed for frame %s", chapter.tag, img_tag, fp.name)
+                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.NO_TEXT))
+                        elif ocr_status == OcrStatus.UNCERTAIN:
+                            log.warning("[%s] [%s] OCR UNCERTAIN for frame %s (confidence=%.2f) — using available text", chapter.tag, img_tag, fp.name, parsed["confidence"])
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.UNCERTAIN))
+                        else:  # SUCCESS
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.SUCCESS))
                 else:
                     log.info("[%s] per-image narration mode: %d source images, %d frames",
                              chapter.tag, len(chapter.panel_paths), len(frame_paths))
                     # Legacy: translate + rephrase each source image's narration.
-                    panel_narrations: dict = {}  # panel_index -> narration text
+                    panel_narrations: dict = {}  # panel_index -> (rephrased_text, status)
                     for idx, panel_path in enumerate(chapter.panel_paths):
-                        raw_text = chapter.image_narrations.get(panel_path.name, "")
+                        parsed = parse_narration_item(chapter.image_narrations.get(panel_path.name))
+                        raw_text, ocr_status = parsed["text"], parsed["status"]
                         img_tag = f"{chapter.tag}_img{idx + 1:03d}"
-                        translated = translate_text(cfg, raw_text, img_tag)
-                        rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                        panel_narrations[idx] = rephrased
-                        if rephrased:
-                            prev_tail = last_sentences(rephrased)
+
+                        if ocr_status == OcrStatus.FAILED:
+                            log.warning("[%s] [%s] OCR FAILED for source panel %s", chapter.tag, img_tag, panel_path.name)
+                            panel_narrations[idx] = ("", OcrStatus.FAILED)
+                        elif ocr_status == OcrStatus.NO_TEXT:
+                            panel_narrations[idx] = ("", OcrStatus.NO_TEXT)
+                        elif ocr_status == OcrStatus.UNCERTAIN:
+                            log.warning("[%s] [%s] OCR UNCERTAIN for source panel %s (confidence=%.2f)", chapter.tag, img_tag, panel_path.name, parsed["confidence"])
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            panel_narrations[idx] = (rephrased, OcrStatus.UNCERTAIN)
+                        else:
+                            translated = translate_text(cfg, raw_text, img_tag)
+                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
+                            if rephrased:
+                                prev_tail = last_sentences(rephrased)
+                            panel_narrations[idx] = (rephrased, OcrStatus.SUCCESS)
 
                     # Group frame positions by source panel (preserving timeline order).
                     from collections import defaultdict as _dd
@@ -2612,13 +3204,13 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                         panel_frame_positions[si].append(pos)
 
                     for si, positions in panel_frame_positions.items():
-                        narr = panel_narrations.get(si, "")
-                        segments.append((f"img{si + 1:03d}", narr, positions))
+                        narr, st = panel_narrations.get(si, ("", OcrStatus.NO_TEXT))
+                        segments.append((f"img{si + 1:03d}", narr, positions, st))
             else:
                 # No narration.json — all frames are silent (no text to narrate).
                 log.warning("[%s] no narration.json — producing silent video for this chapter", chapter.tag)
                 for pos in range(len(frame_paths)):
-                    segments.append((f"frm{pos + 1:04d}", "", [pos]))
+                    segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.NO_TEXT))
 
             # Synthesize one continuous clip per segment and derive per-frame timing.
             # No whisper transcription — timing is derived purely from proportional
@@ -2629,24 +3221,42 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             tts_attempted = 0   # segments that HAD text (i.e. were supposed to produce real speech)
             tts_failed = 0      # of those, how many fell back to silence due to a real failure
 
-            for seg_idx, (tag, text, positions) in enumerate(segments):
+            consecutive_silent = 0
+            for seg_idx, seg_item in enumerate(segments):
+                tag, text, positions = seg_item[0], seg_item[1], seg_item[2]
+                ocr_st = seg_item[3] if len(seg_item) > 3 else (OcrStatus.SUCCESS if text.strip() else OcrStatus.NO_TEXT)
+
                 cfg.write_progress("render", chapter.index - 1, total,
                                    f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
-                if text.strip():
+
+                is_silent_segment = not text.strip() or ocr_st in (OcrStatus.NO_TEXT, OcrStatus.FAILED)
+                if not is_silent_segment:
+                    consecutive_silent = 0
                     tts_attempted += 1
+                else:
+                    consecutive_silent += 1
+
                 audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
-                if seg_tts_failed:
+                if not is_silent_segment and seg_tts_failed:
                     tts_failed += 1
+
                 duration = get_audio_duration(audio_path_seg)
 
-                # Ensure the segment audio is at least long enough for all its
-                # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
-                min_total = len(positions) * MIN_FRAME_DURATION
-                if duration < min_total:
-                    audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
-                    duration = min_total
+                if is_silent_segment:
+                    # Pacing safeguard: apply shortened duration for silent frames, and compress if consecutive > 2
+                    base_silent_dur = 1.0 if consecutive_silent > 2 else SILENT_FRAME_DURATION
+                    target_dur = max(0.5, len(positions) * base_silent_dur)
+                    if abs(duration - target_dur) > 0.05:
+                        audio_path_seg = cfg.temp_audio_dir / chapter.tag / f"{tag}_silent_paced.wav"
+                        _generate_silence(audio_path_seg, target_dur)
+                        duration = target_dur
+                else:
+                    min_total = len(positions) * MIN_FRAME_DURATION
+                    if duration < min_total:
+                        audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
+                        duration = min_total
 
-                timings = split_frame_timings(text, positions, duration)
+                timings = split_frame_timings(text, positions, duration, is_silent=is_silent_segment)
                 for pos in positions:
                     frame_timing[pos] = timings[pos]
                 # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
@@ -2698,6 +3308,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 else:
                     frame_durations.append(MIN_FRAME_DURATION)
                     log.warning("[%s] frame_timing had None entry — using MIN_FRAME_DURATION (%.1fs)", chapter.tag, MIN_FRAME_DURATION)
+
+            if manifest and manifest.frames:
+                for pos, f_entry in enumerate(manifest.frames):
+                    if pos < len(frame_durations):
+                        f_entry.duration = frame_durations[pos]
+                    if pos < len(segments) and len(segments[pos]) > 1:
+                        f_entry.narration_text = segments[pos][1]
+                manifest.save(manifest_path)
 
             cfg.write_progress("render", chapter.index - 1, total,
                                f"Chapter {chapter.index}/{total}: building audio track")

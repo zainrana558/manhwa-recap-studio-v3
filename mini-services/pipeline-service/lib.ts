@@ -1070,9 +1070,12 @@ async function setOcrCached(key: string, text: string, status = 'SUCCESS'): Prom
  * text extraction. Unlike VLM, OCR runs entirely on-device with no API keys
  * or network latency.
  *
- * The function sends images in batches of 20 to the PaddleOCR service's
- * `/ocr/batch` endpoint. Results are cached per-image (same cache key as VLM)
- * so re-runs are instant.
+ * The function sends images in chunks of BATCH_SIZE to the PaddleOCR service's
+ * `/ocr/batch` endpoint, one HTTP call at a time. Results are cached per-image
+ * (same cache key as VLM) so re-runs are instant. The server processes a batch
+ * with up to OCR_CONCURRENCY inferences in flight (see paddleocr-service);
+ * chunking here only bounds request/response payload size, it does not by
+ * itself add parallelism — that's controlled server-side.
  *
  * @param imagePaths - Absolute paths to panel/page images
  * @param onProgress - Optional callback (done, total) for progress tracking
@@ -1103,7 +1106,13 @@ export async function generateImageNarrationsOCR(
   let successCount = 0
   let failureCount = 0
 
-  // Single-Panel Sequential Processing: loop through imagePaths 1 panel at a time
+  // Process imagePaths in chunks of exactly 3 images per HTTP request (batchSize = 3)
+  const BATCH_SIZE = 3
+  const uncachedBatches: Array<{ indices: number[]; paths: string[] }> = []
+
+  let currentBatchIndices: number[] = []
+  let currentBatchPaths: string[] = []
+
   for (let i = 0; i < imagePaths.length; i++) {
     const imgPath = imagePaths[i]
     const cacheKey = ocrCacheKey(imgPath)
@@ -1119,11 +1128,24 @@ export async function generateImageNarrationsOCR(
       }
       completedCount++
       onProgress?.(completedCount, imagePaths.length)
-      continue
+    } else {
+      currentBatchIndices.push(i)
+      currentBatchPaths.push(imgPath)
+      if (currentBatchPaths.length === BATCH_SIZE) {
+        uncachedBatches.push({ indices: [...currentBatchIndices], paths: [...currentBatchPaths] })
+        currentBatchIndices = []
+        currentBatchPaths = []
+      }
     }
+  }
 
-    // Send exactly 1 sliced image panel per HTTP POST request with 120,000 ms timeout
-    let singleSuccess = false
+  if (currentBatchPaths.length > 0) {
+    uncachedBatches.push({ indices: currentBatchIndices, paths: currentBatchPaths })
+  }
+
+  // Execute chunked HTTP requests sequentially (max 3 images per chunk)
+  for (const batch of uncachedBatches) {
+    let batchSuccess = false
     const MAX_OCR_RETRIES = 3
 
     for (let attempt = 1; attempt <= MAX_OCR_RETRIES; attempt++) {
@@ -1132,7 +1154,7 @@ export async function generateImageNarrationsOCR(
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            images: [imgPath],
+            images: batch.paths,
             options: { det_db_unclip_ratio: 2.4 },
           }),
           signal: AbortSignal.timeout(OCR_REQUEST_TIMEOUT_MS),
@@ -1149,53 +1171,65 @@ export async function generateImageNarrationsOCR(
           processing_time_ms: number
         }
 
-        const ocrResult = data.results[0]
-        if (ocrResult) {
-          const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
-          const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
-          const regions = ocrResult.regions || 0
+        if (data.results && data.results.length === batch.paths.length) {
+          for (let bIdx = 0; bIdx < batch.paths.length; bIdx++) {
+            const origIdx = batch.indices[bIdx]
+            const imgPath = batch.paths[bIdx]
+            const cacheKey = ocrCacheKey(imgPath)
+            const ocrResult = data.results[bIdx]
 
-          totalRegionsDetected += regions
-          freshlyProcessed++
+            const status = String(ocrResult.status || 'SUCCESS').toUpperCase()
+            const text = status === 'SUCCESS' ? (ocrResult.text || '').trim() : ''
+            const regions = ocrResult.regions || 0
 
-          if (regions > 0 && status !== 'SUCCESS') {
-            uncertainWithRegions++
+            totalRegionsDetected += regions
+            freshlyProcessed++
+
+            if (regions > 0 && status !== 'SUCCESS') {
+              uncertainWithRegions++
+            }
+
+            if (text && status === 'SUCCESS') {
+              void setOcrCached(cacheKey, text, status)
+              void setVlmCached(vlmCacheKey(imgPath), text, status)
+              successCount++
+            } else {
+              void setOcrCached(cacheKey, '', 'FAILED')
+              void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+              failureCount++
+            }
+
+            results[origIdx] = { image: path.basename(imgPath), text }
+            completedCount++
           }
 
-          if (text && status === 'SUCCESS') {
-            void setOcrCached(cacheKey, text, status)
-            void setVlmCached(vlmCacheKey(imgPath), text, status)
-            successCount++
-          } else {
-            void setOcrCached(cacheKey, '', 'FAILED')
-            void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
-            failureCount++
-          }
-
-          results[i] = { image: path.basename(imgPath), text }
-          completedCount++
-          singleSuccess = true
+          batchSuccess = true
+          onProgress?.(completedCount, imagePaths.length)
           break
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        console.warn(`[OCR] Panel ${i + 1}/${imagePaths.length} (${path.basename(imgPath)}) attempt ${attempt}/${MAX_OCR_RETRIES} failed: ${msg.slice(0, 200)}`)
+        console.warn(`[OCR] Batch chunk (${batch.paths.map(p => path.basename(p)).join(', ')}) attempt ${attempt}/${MAX_OCR_RETRIES} failed: ${msg.slice(0, 200)}`)
         if (attempt < MAX_OCR_RETRIES) {
           await sleep(1000 * Math.pow(2, attempt - 1))
         }
       }
     }
 
-    if (!singleSuccess) {
+    if (!batchSuccess) {
       batchCallFailures++
-      failureCount++
-      void setOcrCached(cacheKey, '', 'FAILED')
-      void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
-      results[i] = { image: path.basename(imgPath), text: '' }
-      completedCount++
+      for (let bIdx = 0; bIdx < batch.paths.length; bIdx++) {
+        const origIdx = batch.indices[bIdx]
+        const imgPath = batch.paths[bIdx]
+        const cacheKey = ocrCacheKey(imgPath)
+        failureCount++
+        void setOcrCached(cacheKey, '', 'FAILED')
+        void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
+        results[origIdx] = { image: path.basename(imgPath), text: '' }
+        completedCount++
+      }
+      onProgress?.(completedCount, imagePaths.length)
     }
-
-    onProgress?.(completedCount, imagePaths.length)
   }
 
   const totalDurationMs = Date.now() - startTime

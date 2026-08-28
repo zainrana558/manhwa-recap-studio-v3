@@ -77,3 +77,15 @@ def test_clean_ocr_text_with_sfx():
     fragments = "I am a warrior xz q1 q2 to the end"
     cleaned_frag = clean_ocr_text_with_sfx(fragments)
     assert cleaned_frag == "I am a warrior to the end"
+
+    # 4. Sentence boundary punctuation cleanup, character substitutions, and end cards
+    mangled = "The monster is good-curdling dash. HO0 HO O B to be continued..."
+    cleaned_mangled = clean_ocr_text_with_sfx(mangled)
+    assert "blood-curdling" in cleaned_mangled
+    assert "HOO HOO" in cleaned_mangled
+    assert "To Be Continued..." in cleaned_mangled
+
+    # 5. Spoken symbol conversions at sentence boundary
+    boundary = "He ran away underscore"
+    cleaned_boundary = clean_ocr_text_with_sfx(boundary)
+    assert cleaned_boundary.endswith("...")
