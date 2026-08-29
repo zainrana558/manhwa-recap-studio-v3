@@ -99,8 +99,11 @@ SEGMENT_FADE_OUT = 0.040
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 MAX_FRAMES_PER_PANEL = 4  # Cap frames per source panel (prevents overslicing tall splash panels)
 
-# Phase 3: Audio post-processing targets (YouTube standard)
-TARGET_LOUDNESS_LUFS = -14  # YouTube's standard loudness target
+# Phase 3: Audio post-processing targets.
+# -16 LUFS (not YouTube's -14 "loud" ceiling) — narration-heavy recaps read
+# more comfortably a bit quieter than music/entertainment content, and it
+# leaves more true-peak headroom before YouTube's own normalization kicks in.
+TARGET_LOUDNESS_LUFS = -16
 BGM_DUCK_DB = -18  # BGM sidechain-ducked by 18dB when voice is active
 
 logging.basicConfig(
@@ -987,137 +990,6 @@ def _detect_vertical_gutters(img_gray) -> List[int]:
     return cuts
 
 
-def _detect_panels_connected_components(img_gray) -> List[tuple]:
-    """Detect panels by finding GUTTER BANDS (horizontal white gaps) between panels.
-
-    This is the PRIMARY panel detection method. Instead of trying to detect
-    panel content (which fails on light/zoomed panels with sparse content),
-    it detects the GUTTERS between panels — bands of rows that are nearly all
-    white. Everything between two gutter bands is a panel, regardless of how
-    much content it has.
-
-    This approach is far more robust than content-based detection because:
-    - It catches panels with light/white backgrounds and sparse content
-      (e.g. a character on white background) that content-thresholding misses
-    - It doesn't over-segment dense artwork (a splash panel stays as one panel)
-    - It naturally handles zoomed panels, text-only panels, and mixed layouts
-
-    Algorithm:
-      1. For each row, compute the percentage of "white" pixels (>240)
-      2. A row is "gutter-like" if >85% of its pixels are white
-      3. Smooth the signal to avoid single-row noise
-      4. Find gutter BANDS = consecutive runs of gutter-like rows (min height)
-      5. Panels = regions between gutter band midpoints
-      6. Filter: skip regions that are too small or have no content (all white)
-      7. Merge: merge adjacent small panels if the gutter between them is weak
-
-    Returns list of (x1, y1, x2, y2) tuples sorted by y position.
-    """
-    h, w = img_gray.shape
-    if h < 10 or w < 10:
-        return [(0, 0, w, h)]
-
-    # Step 1: compute dark pixel percentage per row.
-    # A real gutter row has almost NO dark pixels (< 0.5% of width).
-    # Text rows have dark character pixels (typically 2-10% dark).
-    # This is far more reliable than white% because text on white background
-    # can have >95% white pixels but still has dark character pixels that
-    # distinguish it from a real gutter.
-    dark_pct_per_row = np.sum(img_gray < 180, axis=1) / w * 100
-
-    # Step 2: classify gutter rows (< 0.5% dark pixels = almost no content)
-    is_gutter_row = dark_pct_per_row < 0.5
-
-    # Step 3: smooth to avoid single-row noise
-    kernel = max(3, min(7, h // 300))
-    is_gutter_row = cv2.blur(is_gutter_row.astype(np.float32).reshape(-1, 1), (kernel, 1)).flatten() > 0.5
-
-    # Step 4: find gutter bands (consecutive gutter rows).
-    # Require min height of 15px — real panel gutters are 15+px tall.
-    # Thin white lines (1-10px) inside panels are NOT real gutters.
-    gutter_bands = []  # (start, end, strength, height)
-    run_start = None
-    min_band_h = max(15, h // 300)
-    for i, g in enumerate(is_gutter_row):
-        if g and run_start is None:
-            run_start = i
-        elif not g and run_start is not None:
-            if i - run_start >= min_band_h:
-                band_region = dark_pct_per_row[run_start:i]
-                strength = float(np.max(band_region))  # max dark% in band (lower = whiter)
-                gutter_bands.append((run_start, i, strength, i - run_start))
-            run_start = None
-    if run_start is not None and h - run_start >= min_band_h:
-        band_region = dark_pct_per_row[run_start:h]
-        strength = float(np.max(band_region))
-        gutter_bands.append((run_start, h, strength, h - run_start))
-
-    # Step 5: place cut points at the row with MINIMUM dark pixels within
-    # each band, plus a 3px safety margin toward the center of the band.
-    # This ensures the cut is at the absolute safest position AND has a
-    # small buffer of pure white rows so anti-aliased text pixels from
-    # adjacent panels don't bleed into the cut edge.
-    cut_points = []
-    for s, e, _, _ in gutter_bands:
-        band_dark = dark_pct_per_row[s:e]
-        min_idx = int(np.argmin(band_dark))
-        # Push 3px toward the center of the band for a safety margin
-        band_mid = (e - s) // 2
-        if min_idx < band_mid:
-            min_idx = min(min_idx + 3, e - s - 1)
-        else:
-            min_idx = max(min_idx - 3, 0)
-        cut_points.append(s + min_idx)
-    boundaries = [0] + cut_points + [h]
-    raw_panels = []
-    min_panel_h = max(30, h // 100)
-    for i in range(len(boundaries) - 1):
-        top, bot = boundaries[i], boundaries[i + 1]
-        if bot - top >= min_panel_h:
-            raw_panels.append((0, top, w, bot))
-
-    # Step 6: filter out all-white regions (no content)
-    content_panels = []
-    for (x1, y1, x2, y2) in raw_panels:
-        region = img_gray[y1:y2, x1:x2]
-        if float(np.std(region)) > 8:  # has real content
-            content_panels.append((x1, y1, x2, y2))
-
-    # Step 7: merge adjacent small panels if the gutter between them is weak
-    # (high dark% = not a strong separator). This merges text-line fragments
-    # that were split by thin white lines within a single panel.
-    # Note: strength is now max dark% in the band (lower = whiter = stronger).
-    merged = []
-    for i, (x1, y1, x2, y2) in enumerate(content_panels):
-        if i == 0:
-            merged.append([x1, y1, x2, y2])
-            continue
-        prev = merged[-1]
-        prev_h = prev[3] - prev[1]
-        this_h = y2 - y1
-        # Merge if BOTH panels are small AND the gutter between them is weak
-        if this_h < 150 and prev_h < 200:
-            # Find the gutter band between prev and this
-            for (gs, ge, gstr, gh) in gutter_bands:
-                gmid = (gs + ge) // 2
-                if prev[1] < gmid < y1 and gstr > 0.3:
-                    # Weak gutter (dark% > 0.3 = has some content) — merge
-                    prev[2] = x2
-                    prev[3] = y2
-                    break
-            else:
-                merged.append([x1, y1, x2, y2])
-        else:
-            merged.append([x1, y1, x2, y2])
-
-    panels = [(p[0], p[1], p[2], p[3]) for p in merged if (p[3] - p[1]) >= min_panel_h]
-
-    if not panels:
-        return [(0, 0, w, h)]
-
-    return panels
-
-
 def _subsplit_tall_panel(img_gray, x1, y1, x2, y2) -> List[tuple]:
     """Sub-split a very tall panel (aspect > 2.5) into smaller frames using
     row-scan gutter detection within the sub-region.
@@ -1178,86 +1050,6 @@ def _subsplit_tall_panel(img_gray, x1, y1, x2, y2) -> List[tuple]:
         if sub_h >= 50:
             subs.append((x1, y1 + boundaries[j], x2, y1 + boundaries[j + 1]))
     return subs if subs else [(x1, y1, x2, y2)]
-
-
-def _split_into_panel_segments(img_gray, max_segment_height: int) -> List[tuple]:
-    """Return a list of (top, bottom) panel boundaries for a webtoon strip.
-
-    DEPRECATED — kept for backward compat. The new slice_chapter_panels uses
-    _detect_panels_connected_components directly, which returns full (x1,y1,x2,y2)
-    bounding boxes instead of just (top, bottom) row bands.
-    """
-    h, w = img_gray.shape
-    gutter_cuts = _detect_panel_gutters(img_gray)
-    boundaries = [0] + gutter_cuts + [h]
-    segments = []
-    for i in range(len(boundaries) - 1):
-        top, bot = boundaries[i], boundaries[i + 1]
-        if bot - top < 50:
-            continue
-        segments.append((top, bot))
-    if not segments:
-        segments = [(0, h)]
-
-    refined = _refine_segments(img_gray, segments, max_segment_height, depth=0)
-    return refined
-
-
-def _refine_segments(img_gray, segments: List[tuple], max_height: int, depth: int) -> List[tuple]:
-    """Re-scan oversized segments with progressively relaxed thresholds."""
-
-    if depth >= 2:  # Max 2 re-scan passes
-        return segments
-
-    refined: List[tuple] = []
-    for top, bot in segments:
-        seg_h = bot - top
-        if seg_h <= max_height * 1.5:
-            refined.append((top, bot))
-            continue
-
-        # Re-scan this sub-region with relaxed thresholds.
-        sub = img_gray[top:bot, :]
-        sub_stds = np.std(sub, axis=1).astype(np.float32)
-        sub_means = np.mean(sub, axis=1).astype(np.float32)
-
-        kernel = max(3, min(7, seg_h // 300))
-        sub_stds = cv2.blur(sub_stds.reshape(-1, 1), (kernel, 1)).flatten()
-        sub_means = cv2.blur(sub_means.reshape(-1, 1), (kernel, 1)).flatten()
-
-        # Progressively relax the thresholds with each pass.
-        if depth == 0:
-            std_thresh = float(min(18.0, max(8.0, np.percentile(sub_stds, 25))))
-        else:
-            std_thresh = float(min(25.0, max(12.0, np.percentile(sub_stds, 35))))
-
-        is_gutter = sub_stds < std_thresh
-        sub_cuts: List[int] = []
-        run_start = None
-        min_h = max(2, seg_h // 600)
-        for i, g in enumerate(is_gutter):
-            if g and run_start is None:
-                run_start = i
-            elif not g and run_start is not None:
-                if i - run_start >= min_h:
-                    sub_cuts.append((run_start + i) // 2)
-                run_start = None
-        if run_start is not None and seg_h - run_start >= min_h:
-            sub_cuts.append((run_start + seg_h) // 2)
-
-        if sub_cuts:
-            sub_boundaries = [0] + sub_cuts + [seg_h]
-            new_segs = []
-            for j in range(len(sub_boundaries) - 1):
-                st, sb = sub_boundaries[j], sub_boundaries[j + 1]
-                if sb - st >= 50:
-                    new_segs.append((top + st, top + sb))
-            if new_segs:
-                refined.extend(_refine_segments(img_gray, new_segs, max_height, depth + 1))
-                continue
-        refined.append((top, bot))
-
-    return refined
 
 
 def _inpaint_bubbles(img) -> "object":
@@ -2549,7 +2341,7 @@ def build_chapter_audio_track(
     # eliminates click artifacts at clip boundaries, so all we need here is
     # smooth loudness normalization to keep volume consistent across chapters.
     #
-    # loudnorm: EBU R128 normalization to -14 LUFS (YouTube standard).
+    # loudnorm: EBU R128 normalization to TARGET_LOUDNESS_LUFS.
     #
     # NOTE: if a chapter has no narration at all (every segment fell back to
     # silence — narration.json entries all empty, or narrative rewrite
@@ -2568,7 +2360,7 @@ def build_chapter_audio_track(
     # into render_chapter's video mux.
     tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
     tmp_path.unlink(missing_ok=True)
-    af = "loudnorm=I=-16:TP=-1.5:LRA=11"
+    af = f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11"
     try:
         run_ffmpeg(
             [
@@ -2732,7 +2524,7 @@ def render_chapter(
             "-i", str(audio_path),
             "-vf", video_filters,
             "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "faster", "-crf", "20", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-r", str(FPS),
             "-shortest",
@@ -2751,7 +2543,7 @@ def render_chapter(
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-vf", video_filters,
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "faster", "-crf", "20", "-pix_fmt", "yuv420p",
             "-r", str(FPS),
             "-f", "mp4",
             str(tmp_path),
@@ -2963,24 +2755,58 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
 
 
 def finalize_output(cfg: PipelineConfig, merged_path: Path) -> Path:
-    """Copy the merged video to the final output path.
+    """Copy the merged video to the final output path, mixing in background
+    music (sidechain-ducked under narration) when cfg.bgm_path is set.
 
-    BGM overlay has been removed — the output is pure narration audio over
-    the panel video. This keeps the video focused on the story content without
-    any background music distraction.
+    `merged_path` was already QA-validated by merge_chapters, but the tmp
+    path + re-check + atomic rename dance below still applies either way: a
+    crash or a full disk mid-copy/mid-encode can leave a truncated file
+    sitting at cfg.output_path — the one path anything downstream (upload,
+    YouTube metadata step, the person opening the file) actually trusts as
+    "the finished video." That path must never be observably partial.
     """
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Copying merged video to final output (no BGM overlay)...")
-
-    # `merged_path` was already QA-validated by merge_chapters, but copy
-    # through a tmp path and re-check before the atomic rename anyway: a
-    # crash or a full disk mid-copy can leave a truncated file sitting at
-    # cfg.output_path — the one path anything downstream (upload, YouTube
-    # metadata step, the person opening the file) actually trusts as "the
-    # finished video." That path must never be observably partial.
     tmp_path = cfg.output_path.with_suffix(cfg.output_path.suffix + ".tmp")
     tmp_path.unlink(missing_ok=True)
-    shutil.copy2(merged_path, tmp_path)
+
+    if cfg.bgm_path and cfg.bgm_path.exists():
+        log.info("Mixing background music (%s) into final output...", cfg.bgm_path.name)
+        try:
+            # -stream_loop -1 loops the BGM indefinitely; `-shortest` on the
+            # output then trims everything to the (unchanged) video length,
+            # so this works regardless of whether the track is shorter or
+            # longer than the recap. sidechaincompress ducks the BGM
+            # whenever narration is present, keyed off the narration track
+            # itself; amix folds the ducked BGM back under the voice.
+            # Video stream is copied untouched — only audio is re-encoded.
+            duck_ratio = 8  # higher = more aggressive ducking under voice
+            filter_complex = (
+                f"[1:a]volume=0.35[bgm];"
+                f"[bgm][0:a]sidechaincompress=threshold=0.05:ratio={duck_ratio}:"
+                f"attack=20:release=400:makeup=1[ducked];"
+                f"[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=2:weights=1 1[aout]"
+            )
+            run_ffmpeg([
+                "ffmpeg", "-y",
+                "-i", str(merged_path),
+                "-stream_loop", "-1", "-i", str(cfg.bgm_path),
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
+                "-shortest",
+                "-f", "mp4",
+                str(tmp_path),
+            ])
+        except RuntimeError as e:
+            # BGM mixing is a nice-to-have, not worth failing a multi-hour
+            # unattended job over — fall back to the clean narration-only cut.
+            log.error("BGM mix failed (%s) — falling back to narration-only output", e)
+            tmp_path.unlink(missing_ok=True)
+            shutil.copy2(merged_path, tmp_path)
+    else:
+        log.info("Copying merged video to final output (no BGM configured)...")
+        shutil.copy2(merged_path, tmp_path)
 
     qa = video_qa(tmp_path, audio_expected=True)
     if not qa.ok:
