@@ -1317,16 +1317,45 @@ async function getZai() {
 
 const OCR_CACHE_DIR = path.join(DATA_DIR, 'cache', 'ocr')
 
-/** Check if the PaddleOCR service is reachable and ready. */
-export async function isPaddleOCRAvailable(): Promise<boolean> {
-  try {
-    const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
-    const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5000) })
-    if (!res.ok) return false
-    const data = (await res.json()) as { ready?: boolean }
-    return data.ready === true
-  } catch {
-    return false
+/**
+ * Check if the PaddleOCR service is reachable and ready, retrying for a
+ * bounded window instead of judging on a single snapshot.
+ *
+ * Root cause this fixes: a real job log showed the transcribe phase
+ * hitting a single isPaddleOCRAvailable() check moments after the service
+ * had been (re)started, catching it mid model-load (or even before it had
+ * bound its port yet) — cold init can legitimately take up to ~2 minutes
+ * on CPU (see start-services.sh's own 60x2s readiness poll). The caller
+ * only checks ONCE and then uses whichever engine that single check picked
+ * for the ENTIRE job, so one unlucky bit of timing silently downgraded a
+ * whole job to VLM (which, with no API key configured, produced almost no
+ * real transcription at all — "NO_TEXT confirmed" and raw/verbatim
+ * narration throughout).
+ *
+ * Retries on any not-ready outcome (explicit FAILED/UNAVAILABLE state,
+ * unhealthy HTTP response, or connection refused because the process
+ * hasn't started listening yet) up to maxWaitMs, so a genuinely absent
+ * service costs one bounded wait per job rather than corrupting every
+ * chapter's transcription.
+ */
+export async function isPaddleOCRAvailable(maxWaitMs = 45000): Promise<boolean> {
+  const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
+  const pollIntervalMs = 3000
+  const deadline = Date.now() + maxWaitMs
+
+  while (true) {
+    try {
+      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5000) })
+      if (res.ok) {
+        const data = (await res.json()) as { ready?: boolean }
+        if (data.ready === true) return true
+      }
+    } catch {
+      // Connection refused/timeout — service may not have started
+      // listening yet; keep polling until the deadline.
+    }
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
   }
 }
 
@@ -1600,11 +1629,23 @@ export async function generateImageNarrationsOCR(
   console.log(
     `\n==================================================\n` +
     `[OCR RUN SUMMARY]\n` +
-    `Total Panels Processed: ${totalPanels}\n` +
-    `Success Count:          ${successCount}\n` +
-    `Failure/Uncertain Count:${failureCount}\n` +
-    `Total Duration:         ${(totalDurationMs / 1000).toFixed(2)}s\n` +
-    `Avg Time Per Panel:     ${avgTimePerPanelMs.toFixed(2)}ms\n` +
+    `Total Panels Processed:  ${totalPanels}\n` +
+    `Success Count:           ${successCount}\n` +
+    // "Failure/Uncertain Count" used to lump together two very different
+    // outcomes as one scary-looking number: a panel where PaddleOCR
+    // detected zero text regions at all (a normal, expected result — the
+    // pipeline's own comments note manhwa chapters are frequently 80%+
+    // silent/action panels with no dialogue, and master_pipeline.py's
+    // renderer already correctly treats these as NO_TEXT/silent frames,
+    // not failures) versus a panel where it DID detect text but couldn't
+    // read it confidently (a real recognition miss). Break them out using
+    // the region-count stats already gathered above instead of collapsing
+    // them, so this log reflects actual OCR quality.
+    `No Text Detected (silent/no-dialogue panel): ${Math.max(0, failureCount - uncertainWithRegions)}\n` +
+    `Real Recognition Misses (regions found, unreadable): ${uncertainWithRegions}\n` +
+    `Batch Call Failures (network/timeout, chunk-level): ${batchCallFailures}\n` +
+    `Total Duration:          ${(totalDurationMs / 1000).toFixed(2)}s\n` +
+    `Avg Time Per Panel:      ${avgTimePerPanelMs.toFixed(2)}ms\n` +
     `==================================================\n`
   )
 
