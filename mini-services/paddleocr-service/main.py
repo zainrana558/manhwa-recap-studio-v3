@@ -905,6 +905,10 @@ def _ocr_with_cascade(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
     """Run PaddleOCR pass (standard + preprocessing variants) and, if still
     UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
+    Skips the expensive preprocessing/Tesseract cascade entirely when the
+    detector found zero text regions at all (see the zero-region check
+    below) — no amount of pixel-level preprocessing recovers text that
+    was never localized as a region in the first place.
     """
     try:
         opts = options or OCROptions()
@@ -925,6 +929,19 @@ def _ocr_with_cascade(img, options=None):
 
         if status == "SUCCESS":
             return best_tuple
+
+        # Detector found ZERO candidate text regions in the original image —
+        # this is the common case for action/establishing panels (manhwa
+        # chapters are frequently 80%+ silent panels with no bubbles at
+        # all). Upscaling/contrast/inversion tweak pixel values; they don't
+        # manufacture text regions the detector never localized a bounding
+        # box for in the first place, so running 3 more full inference
+        # passes plus a 3-pass Tesseract fallback here is pure wasted
+        # compute — it was making every quiet chapter (the majority of most
+        # chapters) several times slower for no quality benefit.
+        if region_count == 0:
+            return (merged_text, avg_conf, region_count, status, quality_score,
+                    candidates, f"skipped_cascade_zero_regions_detected:{reason}")
 
         preprocessing_passes = [
             ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),

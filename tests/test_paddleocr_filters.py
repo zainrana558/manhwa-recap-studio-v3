@@ -3,6 +3,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
+
 os.environ["SKIP_OCR_INIT"] = "1"
 
 # Load the real filter/merge functions dynamically from
@@ -58,3 +60,34 @@ def test_paddleocr_filters():
     ]
     merged, avg_conf, count = _merge_regions(regions, is_ui_box=True)
     assert merged == "Line 1: Push-ups 100/100 Line 2: Sit-ups 100/100"
+
+
+def test_ocr_cascade_skips_expensive_passes_when_zero_regions_detected(monkeypatch):
+    """A blank/silent panel (detector finds zero text regions) must return
+    immediately instead of running the 3 preprocessing variants + Tesseract
+    fallback cascade. Manhwa chapters are frequently 80%+ silent panels, so
+    running that full cascade on every one of them was the single biggest
+    driver of pipeline slowness — this is a regression guard for the fix.
+    """
+    call_count = {"ocr": 0, "tesseract": 0}
+
+    def fake_run_ocr_on_image(img, options=None):
+        call_count["ocr"] += 1
+        return []  # zero detected regions, every call
+
+    def fake_run_tesseract_ocr(img):
+        call_count["tesseract"] += 1
+        return "", 0.0
+
+    monkeypatch.setattr(paddleocr_main, "_run_ocr_on_image", fake_run_ocr_on_image)
+    monkeypatch.setattr(paddleocr_main, "_run_tesseract_ocr", fake_run_tesseract_ocr)
+    monkeypatch.setattr(paddleocr_main, "_detect_ui_card_or_borders", lambda img: False)
+
+    blank_img = np.zeros((100, 100, 3), dtype=np.uint8)
+    text, conf, regions, status, quality, candidates, reason = paddleocr_main._ocr_with_cascade(blank_img)
+
+    assert call_count["ocr"] == 1, "expected exactly one OCR pass (standard only) for a zero-region panel"
+    assert call_count["tesseract"] == 0, "Tesseract fallback should not run when the detector found zero regions"
+    assert regions == 0
+    assert text == ""
+    assert "skipped_cascade_zero_regions_detected" in reason
