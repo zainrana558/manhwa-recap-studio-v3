@@ -41,6 +41,12 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_WAIT_POLICY"] = "passive"  # threads sleep instead of spin-waiting between requests
+os.environ["PADDLE_CPP_LOG_LEVEL"] = "3"   # suppress noisy Paddle C++ init logging
+# No-op on the CPU-only `paddlepaddle` wheel pinned in requirements.txt (no
+# GPU code is even compiled in) — kept as a harmless safeguard in case this
+# ever runs against a `paddlepaddle-gpu` build instead.
+os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = "0"
 
 
 def _sigsegv_handler(signum, frame):
