@@ -705,62 +705,47 @@ CPFEEOF
 fi
 
 if command -v systemctl &>/dev/null; then
-    # Resolve absolute paths at write-time (heredocs expand variables immediately)
-    ABS_BUN="$BUN_PATH"
-
-    # ── Next.js App Service ──
-    # FIX #5: Use -H 0.0.0.0 so Next.js listens on all interfaces
-    # FIX #5b: Remove `tee dev.log` from systemd — it prevents crash detection
-    # because systemd tracks the `tee` process PID, not the `next` PID.
-    # Logs go to journal instead: journalctl -u manhwa-web -f
-    sudo tee /etc/systemd/system/manhwa-web.service >/dev/null << EOF
-[Unit]
-Description=Manhwa Recap Studio - Next.js Web App
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$PROJECT_DIR
-ExecStart=$ABS_BUN --bun next dev -p $PORT_WEB -H 0.0.0.0
-Restart=always
-RestartSec=5
-EnvironmentFile=$PROJECT_DIR/.env
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # ── Pipeline Service ──
-    sudo tee /etc/systemd/system/manhwa-pipeline.service >/dev/null << EOF
-[Unit]
-Description=Manhwa Recap Studio - Pipeline Service (Socket.IO)
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$PROJECT_DIR/mini-services/pipeline-service
-ExecStart=$ABS_BUN --hot index.ts
-Restart=always
-RestartSec=5
-Environment=PORT=$PORT_PIPELINE
-EnvironmentFile=$PROJECT_DIR/.env
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # ── Single wrapper service running start.sh (not separate raw
+    # systemd units for web/pipeline) ──
+    #
+    # This section used to create manhwa-web.service running `next dev`
+    # directly (a DEV server, not a production build) and
+    # manhwa-pipeline.service running `bun --hot index.ts` directly —
+    # completely bypassing start.sh. That meant systemd-managed
+    # deployments never started paddleocr-service at all (no unit for it
+    # existed anywhere in this file), never got watchdog.sh's crash
+    # supervision, never got the flock guard against overlapping starts,
+    # and never got the venv PATH wiring start.sh sets up for
+    # mini-services/paddleocr-service's own start.sh and
+    # pipeline-service's spawned python3 calls. Confirmed directly: a
+    # systemd-managed install via this old path would silently run with
+    # no OCR at all, falling back to VLM (which, with no API key
+    # configured, produces almost no real transcription) for every job.
+    #
+    # install-systemd.sh already creates exactly the right single
+    # wrapper unit (calls start.sh, which starts all 3 services +
+    # watchdog together) — reuse it here instead of duplicating that
+    # unit definition in a second place where it could drift out of sync
+    # again.
+    log_info "Installing systemd unit via install-systemd.sh (runs start.sh: PaddleOCR + pipeline-service + Next.js + watchdog)..."
+    if sudo bash "$PROJECT_DIR/install-systemd.sh"; then
+        log_info "manhwa-recap-studio.service installed, enabled, and started"
+    else
+        log_error "install-systemd.sh failed — see output above"
+        exit 1
+    fi
 
     # ── Caddy Service (only if Caddy was installed) ──
+    # Caddy is a separate, independent, rarely-crashing reverse proxy —
+    # kept as its own unit rather than folded into start.sh, which is
+    # specifically for the 3 services that DO need coordinated
+    # start/kill/watchdog treatment (their ports and process lifecycles
+    # are intertwined; Caddy's is not).
     if [[ -n "$CADDY_BIN" && -x "$CADDY_BIN" ]]; then
         sudo tee /etc/systemd/system/manhwa-caddy.service >/dev/null << EOF
 [Unit]
 Description=Manhwa Recap Studio - Caddy Reverse Proxy
-After=network.target manhwa-web.service manhwa-pipeline.service
+After=network.target manhwa-recap-studio.service
 
 [Service]
 Type=simple
@@ -772,17 +757,13 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    fi
-
-    # Reload systemd and enable services
-    sudo systemctl daemon-reload
-    sudo systemctl enable manhwa-web manhwa-pipeline 2>/dev/null
-    if [[ -n "$CADDY_BIN" && -x "$CADDY_BIN" ]]; then
+        sudo systemctl daemon-reload
         sudo systemctl enable manhwa-caddy 2>/dev/null || log_warn "Could not enable Caddy service"
+        sudo systemctl restart manhwa-caddy 2>/dev/null || log_warn "Could not start Caddy service"
+        log_info "Caddy systemd service installed and enabled"
     fi
-    log_info "Systemd services installed and enabled"
 else
-    log_warn "systemd not available — services will run in tmux sessions"
+    log_warn "systemd not available — falling back to running start.sh directly (still gets watchdog.sh supervision internally, just not reboot survival)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -826,29 +807,24 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 10: Start Everything
 # ═══════════════════════════════════════════════════════════════════════════════
-log_step 10 "Starting all services..."
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 10: Verify Everything Is Actually Running
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 8 above already started everything: install-systemd.sh's own
+# `systemctl restart manhwa-recap-studio` runs start.sh, which starts
+# PaddleOCR + pipeline-service + Next.js + watchdog.sh together (or, on
+# the non-systemd path below, start.sh is run directly and does the same
+# thing without reboot survival). This step is purely verification —
+# nothing here should re-trigger a start, since start.sh itself already
+# has its own flock guard, robust process killing, and readiness polling
+# for all 3 services internally.
+log_step 10 "Verifying all services..."
 
 mkdir -p logs data
 
-if command -v systemctl &>/dev/null; then
-    sudo systemctl stop manhwa-web manhwa-pipeline manhwa-caddy 2>/dev/null || true
-    sudo systemctl start manhwa-web
-    sleep 3
-    sudo systemctl start manhwa-pipeline
-    sleep 2
-    if [[ -n "$CADDY_BIN" && -x "$CADDY_BIN" ]]; then
-        sudo systemctl start manhwa-caddy 2>/dev/null || true
-    fi
-    log_info "Services started via systemd"
-else
-    # Fallback: use tmux sessions
-    tmux kill-session -t manhwa-web 2>/dev/null || true
-    tmux kill-session -t manhwa-pipeline 2>/dev/null || true
-    # FIX #5: Use -H 0.0.0.0 for direct access without Caddy
-    tmux new-session -d -s manhwa-web   "cd $PROJECT_DIR && $BUN_PATH --bun next dev -p $PORT_WEB -H 0.0.0.0 2>&1 | tee logs/web.log"
-    sleep 3
-    tmux new-session -d -s manhwa-pipeline "cd $PROJECT_DIR/mini-services/pipeline-service && PORT=$PORT_PIPELINE $BUN_PATH --hot index.ts 2>&1 | tee logs/pipeline.log"
-    log_info "Services started in tmux sessions (attach: tmux attach -t manhwa-web)"
+if ! command -v systemctl &>/dev/null; then
+    log_info "Running start.sh directly (systemd unavailable — no reboot survival, but full startup/watchdog behavior is identical)"
+    bash "$PROJECT_DIR/start.sh"
 fi
 
 # Wait for services to come up
@@ -867,6 +843,17 @@ if curl -sf "http://localhost:$PORT_PIPELINE/internal/health" >/dev/null 2>&1; t
     log_info "Pipeline service healthy"
 else
     log_warn "Pipeline service not responding yet (may need a moment)"
+fi
+
+# Verify OCR (RapidOCR primary / PaddleOCR fallback) — this was never
+# checked at all before, matching the fact that nothing in this script's
+# old systemd path started it either. A quiet failure here means every
+# job silently falls back to VLM (which, with no API key configured,
+# produces almost no real transcription).
+if curl -sf http://localhost:3002/health 2>/dev/null | grep -q '"ready":[[:space:]]*true'; then
+    log_info "OCR service healthy (RapidOCR/PaddleOCR)"
+else
+    log_warn "OCR service not responding yet — model init can take up to ~2 minutes on first run; check logs/paddleocr.log if it doesn't come up"
 fi
 
 # Verify Caddy
@@ -897,6 +884,7 @@ else
     echo -e "    Web App (direct):     ${GREEN}http://<your-ip>:$PORT_WEB${NC}"
 fi
 echo -e "    Pipeline (internal):  localhost:$PORT_PIPELINE"
+echo -e "    OCR (internal):       localhost:3002 (RapidOCR PP-OCRv6 primary, PaddleOCR PP-OCRv4 fallback)"
 echo -e "    Ollama API:           localhost:11434"
 echo ""
 echo -e "  ${BOLD}Local LLMs (Ollama):${NC}"
@@ -909,21 +897,19 @@ echo -e "    Binary:               ${CYAN}${PYTHON_BIN}${NC}"
 echo ""
 echo -e "  ${BOLD}Useful commands:${NC}"
 if command -v systemctl &>/dev/null; then
-    echo -e "    View web logs:        ${CYAN}journalctl -u manhwa-web -f${NC}"
-    echo -e "    View pipeline logs:   ${CYAN}journalctl -u manhwa-pipeline -f${NC}"
+    echo -e "    View all-services logs: ${CYAN}sudo journalctl -u manhwa-recap-studio -f${NC}"
+    echo -e "    View OCR/pipeline/web:  ${CYAN}tail -f logs/paddleocr.log logs/pipeline.log logs/nextjs.log logs/watchdog.log${NC}"
     if [[ "$CADDY_ENABLED" == "true" ]]; then
         echo -e "    View Caddy logs:       ${CYAN}journalctl -u manhwa-caddy -f${NC}"
         echo -e "    Restart Caddy:        ${CYAN}sudo systemctl restart manhwa-caddy${NC}"
-        echo -e "    Stop all:             ${CYAN}sudo systemctl stop manhwa-web manhwa-pipeline manhwa-caddy${NC}"
+        echo -e "    Stop all:             ${CYAN}sudo systemctl stop manhwa-recap-studio manhwa-caddy${NC}"
     else
-        echo -e "    Stop all:             ${CYAN}sudo systemctl stop manhwa-web manhwa-pipeline${NC}"
+        echo -e "    Stop all:             ${CYAN}sudo systemctl stop manhwa-recap-studio${NC}"
     fi
-    echo -e "    Restart web:          ${CYAN}sudo systemctl restart manhwa-web${NC}"
-    echo -e "    Restart pipeline:      ${CYAN}sudo systemctl restart manhwa-pipeline${NC}"
+    echo -e "    Restart everything:    ${CYAN}sudo systemctl restart manhwa-recap-studio${NC}"
 else
-    echo -e "    View web logs:        ${CYAN}tmux attach -t manhwa-web${NC}"
-    echo -e "    View pipeline logs:   ${CYAN}tmux attach -t manhwa-pipeline${NC}"
-    echo -e "    Stop all:             ${CYAN}tmux kill-session -t manhwa-web; tmux kill-session -t manhwa-pipeline${NC}"
+    echo -e "    View logs:            ${CYAN}tail -f logs/paddleocr.log logs/pipeline.log logs/nextjs.log logs/watchdog.log${NC}"
+    echo -e "    Restart everything:    ${CYAN}bash start.sh${NC}"
 fi
 echo -e "    Ollama status:         ${CYAN}ollama list${NC}"
 echo -e "    Pull another model:   ${CYAN}ollama pull llama3.1:8b${NC}"
