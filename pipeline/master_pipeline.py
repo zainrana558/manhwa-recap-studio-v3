@@ -2551,8 +2551,19 @@ def render_chapter(
 
     # Write a concat demuxer input file with per-image durations.
     # This lets a SINGLE ffmpeg call produce the whole slideshow video.
-    # Note: Do NOT add a trailing file entry at the end, as that duplicates
-    # the last frame and adds extra duration to the output video.
+    #
+    # ffmpeg's concat demuxer computes each entry's on-screen time from the
+    # gap between consecutive `file` directives — the `duration` on the
+    # FINAL entry has nothing after it to measure against, so ffmpeg drops
+    # it and instead holds that last frame for exactly one output frame
+    # (1/FPS s). Verified directly: a 2-entry list with durations 3.0/4.0s
+    # renders as 3.04s, not 7.0s. Because render_chapter muxes audio with
+    # `-shortest`, that truncated video length then cuts the tail off the
+    # chapter's real narration audio too — every chapter's final segment
+    # was losing its narration and getting frozen on ~1 frame. The
+    # documented fix is to repeat the last file path once more with no
+    # `duration` line, giving the demuxer an end marker for that segment
+    # without adding a new one (it does not add an extra displayed frame).
     concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
     with concat_list.open("w", encoding="utf-8") as f:
         for i, (fp, d) in enumerate(zip(frame_paths, frame_durations)):
@@ -2560,6 +2571,8 @@ def render_chapter(
             abs_fp = fp.resolve().as_posix()
             f.write(f"file '{abs_fp}'\n")
             f.write(f"duration {d:.3f}\n")
+        if frame_paths:
+            f.write(f"file '{frame_paths[-1].resolve().as_posix()}'\n")
 
     log.info("[%s] rendering %d frames with concat demuxer", chapter.tag, len(frame_paths))
 
@@ -2567,6 +2580,18 @@ def render_chapter(
     # Frames are already 1920x1080 from _compose_canvas, but ensure exact size.
     video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2"
 
+    # NOTE on -vsync vfr (not "-r FPS"): forcing a constant output frame
+    # rate makes ffmpeg duplicate frames to fill each image's declared
+    # `duration`, and that duplication math compounds across multiple
+    # concat-demuxer duration entries — verified directly: a 3-segment
+    # (3.0/4.0/5.0s) concat list rendered as ~16.0s instead of 12.0s under
+    # "-r 24", a ~33% overshoot. With has_audio + "-shortest" this overshoot
+    # was silently absorbed (the real video track got clipped down to the
+    # correct audio length), which is why it stayed hidden — but the
+    # no-audio path has no "-shortest" to hide behind and shipped the
+    # inflated-duration video as-is. "-vsync vfr" keeps each image's own
+    # declared duration exactly (no forced duplication), which is also the
+    # semantically correct representation for a static-panel slideshow.
     has_audio = bool(audio_path and audio_path.exists())
     if has_audio:
         cmd = [
@@ -2577,8 +2602,8 @@ def render_chapter(
             "-vf", video_filters,
             "-map", "0:v", "-map", "1:a",
             "-c:v", "libx264", "-preset", "faster", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-vsync", "vfr",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
-            "-r", str(FPS),
             "-shortest",
             # Force the output muxer explicitly rather than letting ffmpeg
             # guess it from the output filename's extension. tmp_path ends
@@ -2596,7 +2621,7 @@ def render_chapter(
             "-i", str(concat_list),
             "-vf", video_filters,
             "-c:v", "libx264", "-preset", "faster", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-r", str(FPS),
+            "-vsync", "vfr",
             "-f", "mp4",
             str(tmp_path),
         ]
@@ -3351,8 +3376,6 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         state_store.record(cfg.job_id, Stage.JOB, State.FAILED, error_code="FINAL_QA_FAILED")
         raise
 
-    cleanup_temp(cfg)
-
     elapsed = time.time() - start
     # A placeholder chapter pads chapter_videos up to `total`, so
     # dropped_chapters alone would read as 0 for a run that actually has a
@@ -3366,6 +3389,16 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                             "chapters_dropped": dropped_chapters,
                             "chapters_placeholder": len(placeholder_chapters),
                         })
+
+    # cleanup_temp() deletes cfg.work_dir, which is also where
+    # pipeline_state.sqlite3 lives (see `state_store` above) — it must run
+    # LAST, after every state_store.record() call, or the final JOB-COMPLETE
+    # write above hits "unable to open database file" on its own now-deleted
+    # directory and the process exits as if a fully successful render had
+    # crashed (cfg.output_path itself lives outside work_dir and is already
+    # safely written by this point either way).
+    cleanup_temp(cfg)
+
     cfg.write_progress("done", total, total, f"Pipeline complete in {elapsed/60:.1f} min", status="done")
     log.info("PIPELINE COMPLETE in %.1f minutes. Output: %s", elapsed / 60, cfg.output_path)
     if dropped_chapters > 0 or placeholder_chapters:
