@@ -127,16 +127,24 @@ const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent
 const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes TTL for failure cache
 
 // Bump this whenever OCR tuning parameters (det_db_unclip_ratio, model
-// version, etc.) change in a way that could produce different text for the
-// same image. The 1-year TTL above means a stale cached EMPTY result from
-// before a detector fix would otherwise never get re-checked — confirmed
-// as a real cause of permanently-silent panels: an early run cached "no
-// text detected" for a panel, and no later code fix (including this one)
-// would ever re-process that panel without a version bump here, since the
-// cache key was previously derived from the image path alone.
+// version, etc.) OR the text-reconstruction logic in paddleocr-service's
+// _merge_regions() change in a way that could produce different text for
+// the same image. The 1-year TTL above means a stale cached EMPTY (or
+// wrong) result from before a fix would otherwise never get re-checked —
+// confirmed as a real cause of permanently-silent panels: an early run
+// cached "no text detected" for a panel, and no later code fix (including
+// this one) would ever re-process that panel without a version bump here,
+// since the cache key was previously derived from the image path alone.
 // v2: raised det_db_unclip_ratio from PaddleOCR's document-tuned default
 // (1.8) to 2.4 for manhwa/manhua's bolder, hand-lettered speech-bubble text.
-const OCR_TUNING_VERSION = 'v3-status-aware'
+// v4: _merge_regions() changed from an unconditional space-join to a
+// gap-aware join. Bold, wide-tracked comic lettering can make the DB
+// detector emit one box per glyph instead of one per word; joining every
+// region with a space then spelled words out letter by letter ("HUNTER"
+// -> "H U N T E R"), which a v3-tagged cache entry would have baked in
+// verbatim and, without this bump, kept serving forever regardless of the
+// fix.
+const OCR_TUNING_VERSION = 'v4-glyph-merge-fix'
 
 function vlmCacheKey(imagePath: string): string {
   return crypto.createHash('sha256').update(imagePath).digest('hex').slice(0, 16)

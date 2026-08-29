@@ -190,22 +190,21 @@ def _init_ocr() -> None:
                     "lang": "en",
                     "use_angle_cls": True,
                     "det_db_thresh": 0.3,
-                    # Default (~1.5) is tuned for regular printed/document
-                    # text with normal letter spacing. Bold, wide-tracked
-                    # comic/webtoon lettering (dialogue and SFX fonts) has
-                    # much bigger gaps between glyphs than body text, which
-                    # makes the DB detector's post-processing treat each
-                    # letter as its own separate box instead of one word —
-                    # confirmed directly: a real job's narration came back
-                    # as "H U N T E R" (see _merge_regions' gap-aware join,
-                    # the downstream safety net for when this still
-                    # happens). A larger unclip ratio expands each
-                    # detected box further before finalizing it, making
-                    # adjacent glyphs far more likely to merge into one
-                    # region at detection time — the correct place to fix
-                    # this, rather than only reassembling it after the
-                    # fact.
-                    "det_db_unclip_ratio": 2.0,
+                    # Only takes effect as a fallback if _run_ocr_on_image's
+                    # per-call text_det_unclip_ratio kwarg is ever rejected
+                    # (predict() TypeError -> falls back to a bare
+                    # ocr.predict(img) with no kwargs at all) — the normal
+                    # path is controlled by OCROptions.det_db_unclip_ratio
+                    # (see that field) and by pipeline-service/lib.ts, which
+                    # already deliberately sends 2.4 for manhwa/manhua's
+                    # bold, wide-tracked hand-lettered text (see
+                    # OCR_TUNING_VERSION comment there). Matching that same
+                    # value here instead of guessing an independent number
+                    # keeps the rare fallback path consistent with the
+                    # already-validated primary path rather than silently
+                    # reverting to PaddleOCR's generic document-tuned
+                    # default (~1.5) if the kwargs path ever breaks.
+                    "det_db_unclip_ratio": 2.4,
                     "det_limit_side_len": 1216,
                     "cpu_threads": 1,
                     "enable_mkldnn": False,
@@ -657,6 +656,35 @@ def _merge_regions(regions, is_ui_box=False):
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
 
 
+def _get_field(obj, name):
+    """Safely fetch `name` from a PaddleX/PaddleOCR result object via
+    attribute or dict-key access, without ever evaluating the truthiness
+    of the returned value.
+
+    The obvious `getattr(obj, name, None) or obj.get(name, default)`
+    fallback chain forces Python's `or` to evaluate `bool()` on whatever
+    getattr() returns first — but real PaddleOCR/PaddleX results
+    routinely hand back rec_scores and rec_boxes as multi-element numpy
+    arrays (confirmed directly against PaddleOCR's own documented output
+    samples, e.g. `'rec_scores': array([0.984..., 0.980...])` and
+    `'rec_boxes': array([[3, 10, 82, 33], ...])`), and `bool()` on any
+    numpy array with more than one element raises "The truth value of an
+    array with more than one element is ambiguous" — turning a perfectly
+    good detection into an uncaught exception that _ocr_with_cascade's
+    outer try/except quietly converts to a FAILED result with empty text.
+    Reproduced directly with a synthetic Result object carrying real
+    numpy-array fields. Checking `is not None` instead never touches the
+    array's contents, so it works identically whether the underlying
+    value is a numpy array, a plain list, empty, or absent.
+    """
+    val = getattr(obj, name, None)
+    if val is not None:
+        return val
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return None
+
+
 def parse_ocr_results(result):
     extracted_lines = []
     if not result:
@@ -665,9 +693,14 @@ def parse_ocr_results(result):
     page_res = result[0] if isinstance(result, list) and len(result) > 0 else result
 
     if hasattr(page_res, 'rec_texts') or (isinstance(page_res, dict) and 'rec_texts' in page_res):
-        rec_texts = getattr(page_res, 'rec_texts', None) or page_res.get('rec_texts', [])
-        rec_scores = getattr(page_res, 'rec_scores', None) or page_res.get('rec_scores', [])
-        rec_boxes = getattr(page_res, 'rec_boxes', None) or getattr(page_res, 'dt_polys', None) or page_res.get('rec_boxes', [])
+        rec_texts = _get_field(page_res, 'rec_texts')
+        rec_texts = [] if rec_texts is None else rec_texts
+        rec_scores = _get_field(page_res, 'rec_scores')
+        rec_scores = [] if rec_scores is None else rec_scores
+        rec_boxes = _get_field(page_res, 'rec_boxes')
+        if rec_boxes is None:
+            rec_boxes = _get_field(page_res, 'dt_polys')
+        rec_boxes = [] if rec_boxes is None else rec_boxes
 
         for text, score, box in zip(rec_texts, rec_scores, rec_boxes):
             extracted_lines.append({
@@ -753,8 +786,26 @@ def _run_ocr_on_image(img, options=None):
             continue
 
         try:
-            xs = [float(pt[0]) for pt in box]
-            ys = [float(pt[1]) for pt in box]
+            if len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
+                # Flat [xmin, ymin, xmax, ymax] format — this is exactly
+                # what real PaddleOCR/PaddleX results use for 'rec_boxes'
+                # (confirmed against PaddleOCR's own documented output,
+                # e.g. 'rec_boxes': array([[3, 10, 82, 33], ...])), as
+                # opposed to the 4-corner-point format 'dt_polys'/
+                # 'rec_polys' use. The old code assumed every box was a
+                # list of (x, y) points and did `pt[0] for pt in box`,
+                # which on a flat box iterates over 4 bare numbers and
+                # raises TypeError on the very first one ('int' object is
+                # not subscriptable) — silently caught below and dropping
+                # the region entirely. Reproduced directly: a real-shaped
+                # rec_boxes detection came back with regions=0 despite
+                # valid text and confidence.
+                xs = [float(box[0]), float(box[2])]
+                ys = [float(box[1]), float(box[3])]
+            else:
+                # Corner-point format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                xs = [float(pt[0]) for pt in box]
+                ys = [float(pt[1]) for pt in box]
         except (TypeError, ValueError, IndexError):
             continue
 
