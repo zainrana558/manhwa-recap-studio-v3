@@ -48,11 +48,17 @@ kill_port() {
 echo "=== Starting Manhwa Recap Studio services ==="
 
 # 1. PaddleOCR (port 3002)
+kill_service "uvicorn main:app"
 kill_service "python3 main.py"
 kill_port 3002
 echo "[1/3] Starting PaddleOCR on port 3002..."
 cd "$PROJECT_DIR/mini-services/paddleocr-service"
-setsid python3 main.py > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
+# Go through this service's own start.sh, not `python3 main.py` directly —
+# that nested start.sh binds uvicorn to 127.0.0.1 only ("C16 FIX": external
+# access should go through Caddy). Calling main.py directly binds 0.0.0.0
+# (see its own `if __name__ == "__main__"` block), exposing OCR publicly
+# with no auth.
+setsid bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
 # Poll for real readiness instead of a fixed sleep + a substring grep that
 # matches "ready":false as happily as "ready":true. Model init (with the
 # self-healing kwarg retries, or a cold model download) can legitimately
@@ -149,7 +155,7 @@ fi
 # Restart it in place (it self-restarts if already running) so OCR — and
 # the other two services — recover automatically within seconds.
 pkill -f "watchdog.sh" 2>/dev/null
-setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
+WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
 echo "  ✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
 
 echo ""

@@ -160,15 +160,29 @@ cd ../..
 echo "▶ Starting Next.js (port 3000)..."
 # Clear stale .next build cache to fix "Failed to find Server Action" errors.
 # The production build may contain action IDs from a previous code version;
-# rebuilding ensures the action registry matches current source.
+# rebuilding ensures the action registry matches current source. Checking
+# only "does server.js exist at all" misses the common case here — a
+# `git pull` that changed source without rebuilding — so compare against
+# the checked-out commit instead: any commit change means the build must
+# be regenerated, not just "does a build exist at all".
+CURRENT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
+BUILD_STAMP_FILE=".next/standalone/.build-commit"
+NEED_BUILD=0
 if [ ! -f ".next/standalone/server.js" ]; then
-    echo "  ⚠️  .next/standalone/server.js missing — rebuilding..."
+    NEED_BUILD=1
+    echo "  ⚠️  .next/standalone/server.js missing — building..."
+elif [ -n "$CURRENT_COMMIT" ] && [ "$(cat "$BUILD_STAMP_FILE" 2>/dev/null)" != "$CURRENT_COMMIT" ]; then
+    NEED_BUILD=1
+    echo "  ⚠️  .next build is stale (source changed since last build) — rebuilding..."
+fi
+if [ "$NEED_BUILD" = "1" ]; then
     rm -rf .next
     bun run build > "$LOG_DIR/nextjs-build.log" 2>&1
     if [ $? -ne 0 ]; then
         echo "  ❌ Next.js build failed — check $LOG_DIR/nextjs-build.log"
     else
         echo "  ✅ Next.js build succeeded"
+        [ -n "$CURRENT_COMMIT" ] && mkdir -p "$(dirname "$BUILD_STAMP_FILE")" && echo "$CURRENT_COMMIT" > "$BUILD_STAMP_FILE"
     fi
 fi
 # H2 FIX: Bind Next.js to localhost only (Caddy proxies externally)
@@ -207,9 +221,19 @@ echo ""
 echo "  🌐 Website:  http://$PUBLIC_IP"
 echo "  📊 API:      http://$PUBLIC_IP/api/stats"
 echo "  🔧 Pipeline: http://$PUBLIC_IP:3001/internal/health"
+# Watchdog: everything above only starts each service once — nothing was
+# watching them afterward, so a native crash (the PaddleOCR PIR-interpreter
+# SIGSEGV in particular — see mini-services/paddleocr-service/main.py) took
+# OCR down permanently until someone noticed and reran this script by hand.
+# Restart it in place so OCR — and the other two services — recover
+# automatically within seconds instead.
+pkill -f "watchdog.sh" 2>/dev/null
+WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
+echo "✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
+
 echo ""
-echo "  To stop:     fuser -k 3000/tcp; pkill -f 'index.ts'"
+echo "  To stop:     fuser -k 3000/tcp; pkill -f 'index.ts'; pkill -f 'watchdog.sh'"
 echo "  To restart:  bash start.sh"
-echo "  Logs:        tail -f nextjs.log pipeline.log paddleocr.log"
+echo "  Logs:        tail -f $LOG_DIR/nextjs.log $LOG_DIR/pipeline.log $LOG_DIR/paddleocr.log"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

@@ -17,7 +17,11 @@
 
 set -u
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="/tmp"
+# LOG_DIR can be overridden by whichever launcher starts this (start.sh uses
+# "$PROJECT_DIR/logs"; start-services.sh uses "/tmp") so restarted services'
+# logs land in the same place the rest of that launcher's logs already do.
+LOG_DIR="${WATCHDOG_LOG_DIR:-$PROJECT_DIR/logs}"
+mkdir -p "$LOG_DIR" 2>/dev/null
 CHECK_INTERVAL_SEC=15
 MIN_BACKOFF_SEC=15
 MAX_BACKOFF_SEC=300
@@ -31,9 +35,16 @@ log() {
 
 restart_paddleocr() {
   log "PaddleOCR (port 3002) is down — restarting"
+  # Always go through mini-services/paddleocr-service/start.sh, never
+  # `python3 main.py` directly — that nested start.sh binds uvicorn to
+  # 127.0.0.1 only ("C16 FIX": external access must go through Caddy).
+  # Calling main.py directly binds 0.0.0.0 instead (see its own
+  # `if __name__ == "__main__"` block), exposing the OCR service publicly
+  # with no auth — a real regression, not just a style choice.
+  pkill -9 -f "uvicorn main:app" 2>/dev/null
   pkill -9 -f "python3 main.py" 2>/dev/null
   sleep 1
-  (cd "$PROJECT_DIR/mini-services/paddleocr-service" && setsid python3 main.py > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &)
+  (cd "$PROJECT_DIR/mini-services/paddleocr-service" && setsid bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &)
 }
 
 restart_pipeline() {
@@ -47,7 +58,10 @@ restart_nextjs() {
   log "Next.js (port 3000) is down — restarting"
   pkill -9 -f "server.js" 2>/dev/null
   sleep 1
-  (cd "$PROJECT_DIR" && setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &)
+  # HOSTNAME=127.0.0.1 matches start.sh's "H2 FIX" (bind Next.js to
+  # localhost only; Caddy proxies externally) — harmless if the launcher
+  # that originally started this doesn't rely on it.
+  (cd "$PROJECT_DIR" && HOSTNAME=127.0.0.1 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &)
 }
 
 port_open() {
