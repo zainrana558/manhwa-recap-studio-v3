@@ -37,6 +37,9 @@ yarn-error.log*
 # never be committed, one is generated per-deployment on first run
 .pipeline-secret
 
+# lock file for start-services.sh's flock guard against overlapping runs
+.start-services.lock
+
 # vercel
 .vercel
 

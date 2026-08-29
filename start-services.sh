@@ -5,6 +5,26 @@
 PROJECT_DIR="$HOME/manhwa-recap-studio-v3"
 LOG_DIR="/tmp"
 
+# Guard against two overlapping invocations of this script racing each
+# other. Real-world trigger seen in production: a user rapid-clicking
+# "retry" on a stuck job while services were still coming up — each click
+# can independently trigger a service-start attempt, and two copies of
+# this script running at once both call kill_port on the same port right
+# as the other's freshly-started process binds it, leaving one instance's
+# process orphaned/zombied and bound to the port while the other believes
+# it owns that port. That's exactly the "address already in use" seen
+# fighting a stale process in production logs. flock serializes the whole
+# script body: a second invocation waits for the first to finish instead
+# of interleaving kill/start calls with it. Bounded wait (not indefinite)
+# so a genuinely wedged first instance doesn't hang every later caller
+# forever.
+LOCK_FILE="$PROJECT_DIR/.start-services.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -w 180 200; then
+  echo "❌ Another start-services.sh is already running and didn't finish within 180s — aborting to avoid racing it. Check for a wedged process, or just wait and retry." >&2
+  exit 1
+fi
+
 # See the matching block in start.sh for why this exists: pipeline-service's
 # /internal/* endpoints and its socket.io connection both require
 # PIPELINE_SECRET (checkAuth in mini-services/pipeline-service/index.ts).

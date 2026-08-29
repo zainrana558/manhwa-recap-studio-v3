@@ -190,6 +190,22 @@ def _init_ocr() -> None:
                     "lang": "en",
                     "use_angle_cls": True,
                     "det_db_thresh": 0.3,
+                    # Default (~1.5) is tuned for regular printed/document
+                    # text with normal letter spacing. Bold, wide-tracked
+                    # comic/webtoon lettering (dialogue and SFX fonts) has
+                    # much bigger gaps between glyphs than body text, which
+                    # makes the DB detector's post-processing treat each
+                    # letter as its own separate box instead of one word —
+                    # confirmed directly: a real job's narration came back
+                    # as "H U N T E R" (see _merge_regions' gap-aware join,
+                    # the downstream safety net for when this still
+                    # happens). A larger unclip ratio expands each
+                    # detected box further before finalizing it, making
+                    # adjacent glyphs far more likely to merge into one
+                    # region at detection time — the correct place to fix
+                    # this, rather than only reassembling it after the
+                    # fact.
+                    "det_db_unclip_ratio": 2.0,
                     "det_limit_side_len": 1216,
                     "cpu_threads": 1,
                     "enable_mkldnn": False,
