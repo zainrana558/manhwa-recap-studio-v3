@@ -141,6 +141,30 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SHARED PIPELINE_SECRET
+#
+# pipeline-service's /internal/* endpoints and its socket.io connection both
+# require a PIPELINE_SECRET (see mini-services/pipeline-service/index.ts,
+# checkAuth). If unset, pipeline-service generates a random one at startup
+# that nothing else knows — the Next.js API routes (jobs POST/cancel) and
+# the browser's socket.io client both need the SAME value or every request
+# is silently rejected with 401 (which the Next.js side then reported as
+# "Pipeline service is not running", even though the service was up).
+# Generate once and persist so it's stable across restarts, and export it
+# for every process this script launches from here on: PIPELINE_SECRET for
+# the two Node/Python server processes, and NEXT_PUBLIC_PIPELINE_SECRET
+# (same value) so it gets baked into the browser bundle at build time below.
+# ═══════════════════════════════════════════════════════════════════════════
+SECRET_FILE="$PROJECT_DIR/.pipeline-secret"
+if [ ! -s "$SECRET_FILE" ]; then
+    echo "🔑 Generating pipeline secret (first run)..."
+    head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+fi
+export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
+export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
+
 # Start paddleocr-service (port 3002)
 echo "▶ Starting paddleocr-service (port 3002)..."
 cd mini-services/paddleocr-service

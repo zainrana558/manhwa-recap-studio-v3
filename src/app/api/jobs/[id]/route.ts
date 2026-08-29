@@ -9,6 +9,11 @@ export const dynamic = "force-dynamic";
 // - Vercel / production: set PIPELINE_SERVICE_URL to your laptop's public
 //   tunnel URL (e.g. https://your-laptop.trycloudflare.com)
 const PIPELINE_SERVICE_URL = process.env.PIPELINE_SERVICE_URL || "http://localhost:3001";
+// pipeline-service's /internal/* endpoints require this (checkAuth in
+// index.ts) — without it every call here gets a 401 and is silently
+// swallowed by the catch below, which looked identical to the pipeline
+// service being down entirely.
+const PIPELINE_SECRET = process.env.PIPELINE_SECRET || "";
 
 async function notifyPipeline(
   path: string,
@@ -19,7 +24,10 @@ async function notifyPipeline(
   try {
     await fetch(`${PIPELINE_SERVICE_URL}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(PIPELINE_SECRET ? { authorization: `Bearer ${PIPELINE_SECRET}` } : {}),
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     });

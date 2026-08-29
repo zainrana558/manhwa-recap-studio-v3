@@ -33,6 +33,10 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# generated shared secret for pipeline-service auth (see start.sh) — must
+# never be committed, one is generated per-deployment on first run
+.pipeline-secret
+
 # vercel
 .vercel
 

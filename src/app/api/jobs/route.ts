@@ -16,10 +16,17 @@ export const dynamic = "force-dynamic";
 // - Vercel / production: set PIPELINE_SERVICE_URL to your laptop's public
 //   tunnel URL (e.g. https://your-laptop.trycloudflare.com)
 const PIPELINE_SERVICE_URL = process.env.PIPELINE_SERVICE_URL || "http://localhost:3001";
+// pipeline-service's /internal/* endpoints require this (checkAuth in
+// index.ts, added by a security-hardening pass that never wired the
+// Next.js side to send it). Without it every call here got a 401,
+// notifyPipeline returned false, and the job was reported as "Pipeline
+// service is not running" even when the service was up and healthy.
+const PIPELINE_SECRET = process.env.PIPELINE_SECRET || "";
 
 /**
  * POST to the pipeline service with a short timeout.
- * Returns true if the pipeline accepted the request, false if unreachable.
+ * Returns true if the pipeline accepted the request, false if unreachable
+ * or rejected (auth failure, bad request, etc. — see server logs for why).
  */
 async function notifyPipeline(
   path: string,
@@ -30,14 +37,22 @@ async function notifyPipeline(
   try {
     const res = await fetch(`${PIPELINE_SERVICE_URL}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(PIPELINE_SECRET ? { authorization: `Bearer ${PIPELINE_SECRET}` } : {}),
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
     clearTimeout(timeout);
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.warn(`[notifyPipeline] ${path} -> HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+    }
     return res.ok;
-  } catch {
+  } catch (err) {
     clearTimeout(timeout);
+    console.warn(`[notifyPipeline] ${path} unreachable: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
@@ -222,12 +237,19 @@ export async function POST(req: NextRequest) {
     const pipelineOk = await notifyPipeline("/internal/start", { jobId: job.id });
 
     if (!pipelineOk) {
-      // Pipeline service is unreachable — update the job to reflect this.
+      // Pipeline service call failed — could genuinely be down, OR up but
+      // rejecting the request (e.g. PIPELINE_SECRET mismatch/unset — see
+      // the [notifyPipeline] warning logged just above with the real HTTP
+      // status/error). "not running" was misleading callers into
+      // restarting a service that was actually fine. Also: this repo's
+      // launcher is start.sh, not start-services.sh — check
+      // logs/pipeline.log either way before assuming a restart is needed.
+      const hint = "Pipeline service call failed — check logs/pipeline.log (server not running, or PIPELINE_SECRET misconfigured between it and the web app). Restart with: bash start.sh";
       await db.job.update({
         where: { id: job.id },
         data: {
           status: "error",
-          error: "Pipeline service is not running. Start it with: bash start-services.sh",
+          error: hint,
           message: "Pipeline service unreachable",
         },
       });
@@ -236,7 +258,7 @@ export async function POST(req: NextRequest) {
           jobId: job.id,
           level: "error",
           stage: "start",
-          message: "Pipeline service is not running. Start it with: bash start-services.sh",
+          message: hint,
         },
       });
     }

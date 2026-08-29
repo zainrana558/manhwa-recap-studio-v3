@@ -5,6 +5,21 @@
 PROJECT_DIR="$HOME/manhwa-recap-studio-v3"
 LOG_DIR="/tmp"
 
+# See the matching block in start.sh for why this exists: pipeline-service's
+# /internal/* endpoints and its socket.io connection both require
+# PIPELINE_SECRET (checkAuth in mini-services/pipeline-service/index.ts).
+# Generate once and persist so the Next.js API routes and browser socket
+# client (NEXT_PUBLIC_PIPELINE_SECRET, baked in at build time below) agree
+# with pipeline-service on the same value across restarts.
+SECRET_FILE="$PROJECT_DIR/.pipeline-secret"
+if [ ! -s "$SECRET_FILE" ]; then
+  echo "🔑 Generating pipeline secret (first run)..."
+  head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$SECRET_FILE"
+  chmod 600 "$SECRET_FILE"
+fi
+export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
+export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
+
 kill_service() {
   # Plain `sleep 1` after pkill isn't reliable: uvicorn installs a SIGTERM
   # handler for graceful shutdown, so a process mid-request (or mid-init,
