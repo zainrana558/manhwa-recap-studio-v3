@@ -96,7 +96,19 @@ const DEMO_JOBS = [
   },
 ];
 
+// Demo-data seeding/wiping endpoint — for local development only. Unguarded,
+// DELETE below wipes every job (and all its chapters/logs) with no auth, so
+// this must never be reachable in a real deployment.
+function devOnlyGuard(): NextResponse | null {
+  if (process.env.NODE_ENV === "production") {
+    return NextResponse.json({ error: "Not available in production." }, { status: 403 });
+  }
+  return null;
+}
+
 export async function POST() {
+  const blocked = devOnlyGuard();
+  if (blocked) return blocked;
   try {
     const existing = await db.job.count();
     if (existing > 0) {
@@ -117,6 +129,8 @@ export async function POST() {
 }
 
 export async function DELETE() {
+  const blocked = devOnlyGuard();
+  if (blocked) return blocked;
   try {
     const { count } = await db.job.deleteMany();
     await db.chapter.deleteMany();

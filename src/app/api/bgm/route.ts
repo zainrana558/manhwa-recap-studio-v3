@@ -2,10 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
+import { DATA_DIR } from "@/lib/paths";
 
 export const dynamic = "force-dynamic";
 
-const BGM_DIR = path.join(process.cwd(), "data", "bgm");
+// Was hardcoded to process.cwd()/data/bgm, which silently diverged from
+// DATA_DIR whenever the DATA_DIR env var pointed elsewhere (e.g. an external
+// volume) — uploads would land somewhere the pipeline-service never looks.
+const BGM_DIR = path.join(DATA_DIR, "bgm");
 
 /** GET /api/bgm — list all available BGM tracks. */
 export async function GET() {

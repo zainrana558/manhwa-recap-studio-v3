@@ -3,7 +3,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { db } from "@/lib/db";
 import { outputVideoPath, fileExists } from "@/lib/paths";
-import { archiveVideo } from "@/lib/archive";
+import { archiveVideo, isArchiveConfigured } from "@/lib/archive";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300; // 5 min — large uploads can take a while
@@ -11,8 +11,8 @@ export const maxDuration = 300; // 5 min — large uploads can take a while
 /**
  * POST /api/jobs/{id}/archive
  *
- * Manually upload a completed job's video to cloud storage (Google Drive →
- * Mega fallback) and delete the local file to free disk space.
+ * Manually upload a completed job's video to cloud storage (Mega) and
+ * delete the local file to free disk space.
  *
  * If the job is already archived, returns the existing archive info.
  * If the local file is already gone (archived + deleted), returns 409.
@@ -42,6 +42,13 @@ export async function POST(
 
     if (!job) {
       return NextResponse.json({ error: "Job not found." }, { status: 404 });
+    }
+
+    if (!isArchiveConfigured()) {
+      return NextResponse.json(
+        { error: "Mega is not configured. Set MEGA_EMAIL and MEGA_PASSWORD env vars." },
+        { status: 400 }
+      );
     }
 
     if (job.status !== "done") {

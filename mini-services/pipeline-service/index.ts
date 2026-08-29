@@ -1339,7 +1339,19 @@ async function processJob(jobId: string): Promise<void> {
   if (!job.translate) {
     args.push('--no-translate')
   }
-  // BGM overlay has been removed — the output is pure narration audio.
+  // BGM: job.bgmPath is just a filename inside data/bgm/ (see
+  // src/app/api/bgm/route.ts) — resolve it to an absolute path and only
+  // pass --bgm if the file actually exists, so a stale/deleted track name
+  // can't crash the whole render (master_pipeline.py also validates
+  // --bgm's existence, but failing here logs a clearer, job-specific reason).
+  if (job.useBgm !== false && job.bgmPath) {
+    const bgmFile = path.join(DATA_DIR, 'bgm', job.bgmPath)
+    if (await fileExists(bgmFile)) {
+      args.push('--bgm', bgmFile)
+    } else {
+      await emitLog(jobId, 'warn', 'render', `BGM track "${job.bgmPath}" not found — rendering without background music`)
+    }
+  }
 
   // Log the command but redact API keys so they never appear in the UI log.
   const redactedArgs = args.map((a) => {
@@ -1863,3 +1875,35 @@ setInterval(() => {
   const m = process.memoryUsage()
   console.log(`[mem] rss=${Math.round(m.rss/1024/1024)}MB heap=${Math.round(m.heapUsed/1024/1024)}/${Math.round(m.heapTotal/1024/1024)}MB`)
 }, 30_000)
+
+// Prune data/cache/restore/ (temp files written by the web app's archive
+// restore endpoint when serving an archived video back from Mega — see
+// src/lib/archive.ts, whose own TTL/path this mirrors). That directory was
+// never being cleaned anywhere, so on a small Oracle free-tier disk it would
+// grow unbounded every time an archived video got viewed. Runs here since
+// this is the long-lived process; the web app itself is request-scoped.
+const RESTORE_CACHE_DIR = path.join(DATA_DIR, 'cache', 'restore')
+const RESTORE_CACHE_TTL_MS = 60 * 60 * 1000 // 1 hour, matches src/lib/archive.ts
+async function cleanupRestoreCache(): Promise<void> {
+  try {
+    const files = await fs.readdir(RESTORE_CACHE_DIR)
+    let deleted = 0
+    for (const f of files) {
+      const p = path.join(RESTORE_CACHE_DIR, f)
+      try {
+        const stat = await fs.stat(p)
+        if (Date.now() - stat.mtimeMs > RESTORE_CACHE_TTL_MS) {
+          await fs.unlink(p)
+          deleted++
+        }
+      } catch {
+        // ignore individual file errors
+      }
+    }
+    if (deleted > 0) console.log(`[pipeline-service] restore cache: pruned ${deleted} stale file(s)`)
+  } catch {
+    // directory may not exist yet — nothing to prune
+  }
+}
+setInterval(() => void cleanupRestoreCache(), 15 * 60 * 1000) // every 15 min
+void cleanupRestoreCache() // also run once on startup
