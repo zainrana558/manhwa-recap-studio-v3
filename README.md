@@ -11,9 +11,11 @@ pinned: false
 # Manhwa Recap Studio
 
 Auto-scrape manhwa/manga/webtoon chapters, transcribe panel text with
-**PaddleOCR PP-OCRv4** (primary, no API keys needed, VLM fallback),
-translate to English, and render a narrated recap video with text-to-speech
-audio. All in one Docker container — runs free on Hugging Face Spaces.
+**RapidOCR (PP-OCRv6, ONNXRuntime)** as the primary transcriptor (no API
+keys, no PaddlePaddle framework dependency) with **PaddleOCR PP-OCRv4** as
+a fallback tier and VLM as a last resort, translate to English, and render
+a narrated recap video with text-to-speech audio. All in one Docker
+container — runs free on Hugging Face Spaces.
 
 ## Quick Deploy (5 steps, ~15 min)
 
@@ -35,7 +37,7 @@ No environment variables required to start. Add `MEGA_EMAIL` / `MEGA_PASSWORD`
 |---|---|---|
 | Next.js (standalone) | 3000 | Frontend + API routes |
 | Pipeline-service | 3001 | Job queue + VLM fallback + socket.io |
-| PaddleOCR service | 3002 | PP-OCRv4 OCR engine (primary transcriptor) |
+| PaddleOCR service | 3002 | RapidOCR PP-OCRv6 (primary) + PaddleOCR PP-OCRv4 (fallback) OCR engine |
 | Caddy | 7860 | Reverse proxy (HF Spaces entry point) |
 
 ## Optional env vars (Settings → Repository secrets)
@@ -67,8 +69,8 @@ Production mode is local-first and does **not** require edge-tts, OpenAI, or any
 source /opt/manhwa-recap-studio/.venv/bin/activate
 python --version  # Python 3.10.4
 pip install -r pipeline/requirements.txt
-pip install -r mini-services/paddleocr-service/requirements.txt \
-  -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+pip install -r mini-services/paddleocr-service/requirements.txt
+pip install --no-deps rapidocr==3.9.2
 ```
 
 Required local binaries for production are `ffmpeg`, `ffprobe`, `piper`, and `espeak-ng` (or `espeak`). Set a small CPU-friendly English Piper voice with `PIPER_VOICE_MODEL=/opt/piper/voices/en_US-lessac-medium.onnx` (or `PIPER_VOICE`). The production TTS cascade is Piper, Piper retry, then eSpeak NG; non-empty narration is never converted to successful silence.

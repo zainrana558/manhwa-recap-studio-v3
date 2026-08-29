@@ -1,4 +1,50 @@
 # Production target: Python 3.10.4, Oracle Cloud Free Tier CPU-only.
+#
+# PRIMARY OCR ENGINE: RapidOCR (PP-OCRv6, ONNXRuntime backend). No
+# PaddlePaddle framework involved at all, which sidesteps the CPU-only
+# inference crash history documented against paddlepaddle>=3.0 (see the
+# comment on the PaddleOCR pins below) — PP-OCRv5/v6 don't exist natively
+# on the pinned paddleocr 2.x line, so RapidOCR is the only way to get
+# their accuracy without that risk. Verified directly against the actual
+# production failure mode: a wide-tracked bold word ("HUNTER") that
+# PP-OCRv4's detector split into six single-letter boxes is correctly
+# merged into one box by RapidOCR's bundled PP-OCRv6 model.
+#
+# rapidocr==3.9.2 ITSELF IS NOT LISTED BELOW — it must be installed
+# separately with `pip install --no-deps rapidocr==3.9.2` (see setup.sh,
+# which does this automatically). Reason: rapidocr's declared dependency
+# is `opencv_python` (non-headless), not `opencv-python-headless` (pinned
+# below, for the PaddleOCR fallback tier). These are two different named
+# PyPI packages that both provide the `cv2` import — confirmed directly
+# that a normal (non---no-deps) install of rapidocr, even resolved
+# together with everything else in one pip command, installs a SECOND
+# `opencv-python` package alongside `opencv-python-headless`. Both land
+# in the same site-packages/cv2/ directory, so whichever gets installed
+# last silently overwrites the other's files — happened to still work in
+# one test, but that's undocumented, install-order-dependent behavior,
+# and the non-headless build pulls in GUI shared libraries (libGL etc.)
+# that may not even load on a headless server. rapidocr's actual runtime
+# need is just `import cv2`, which opencv-python-headless already
+# provides — so the four packages below are rapidocr's OTHER real
+# dependencies (verified via `importlib.metadata.requires('rapidocr')`
+# and by successfully running real inference with exactly this set),
+# letting a --no-deps install of rapidocr itself skip opencv entirely.
+#
+# Separately, note that paddleocr==2.9.1 ITSELF already directly declares
+# both `opencv-python` and `opencv-contrib-python` as its own
+# dependencies (confirmed via `importlib.metadata.requires('paddleocr')`)
+# — so multiple opencv-family packages coexisting in this venv predates
+# any change here and isn't something the RapidOCR integration
+# introduces. Production has run against this exact paddleocr pin for a
+# long time without an opencv-related crash, so that pre-existing
+# situation is left alone rather than restructured; the --no-deps
+# treatment above is scoped specifically to not make it worse by adding
+# a second `opencv-python` on top for RapidOCR's sake too.
+onnxruntime==1.29.0
+omegaconf==2.3.1
+colorlog==6.12.0
+pyclipper==1.4.0
+
 # Pinned to the pre-PIR 2.x line. paddlepaddle>=3.0's PIR interpreter has a
 # known, still-open upstream SIGSEGV during garbage collection on CPU-only
 # inference (paddle::framework::PirInterpreter::CheckGC — see
@@ -8,7 +54,7 @@
 # constructor kwargs (cpu_threads, enable_mkldnn, use_gpu, det_db_thresh,
 # use_angle_cls) match what main.py already passes — no "Unknown argument"
 # stripping needed. Use binary wheels; do not build PaddlePaddle from source
-# on OCI.
+# on OCI. Kept as the FALLBACK tier — see RapidOCR above for the primary.
 paddleocr==2.9.1
 paddlepaddle==2.6.2
 fastapi==0.115.6
@@ -17,11 +63,19 @@ python-multipart==0.0.18
 Pillow>=10.4.0,<12.0.0
 numpy>=1.24.4,<2.0.0
 opencv-python-headless>=4.10.0,<4.11.0
+# Shapely is also a rapidocr dependency (see the --no-deps note above),
+# but paddleocr/paddlepaddle have no opinion on it, so it can be resolved
+# together with everything else here rather than in the separate
+# --no-deps step alongside onnxruntime/omegaconf/colorlog/pyclipper —
+# those four needed to be listed above specifically because they have no
+# other reason to be pulled in, whereas Shapely being present in this
+# main resolve doesn't create the opencv-style double-package problem.
+Shapely==2.1.2
 
 # Optional last-resort OCR fallback tier: this service shells out to the
 # `tesseract` CLI binary directly (no pytesseract wrapper needed), only for
-# panels where PaddleOCR comes back UNCERTAIN/FAILED. Not a pip package —
-# install the system binary if you want this tier active:
+# panels where neither RapidOCR nor PaddleOCR come back confidently. Not a
+# pip package — install the system binary if you want this tier active:
 #   sudo apt-get install -y tesseract-ocr
 # If it's not installed, the service detects that at runtime and simply
 # skips this fallback tier (logged once at startup) rather than failing.

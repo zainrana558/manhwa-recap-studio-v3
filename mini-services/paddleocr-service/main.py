@@ -130,6 +130,23 @@ MODEL_READY = False  # type: bool
 SERVICE_STATE = ServiceState.INITIALIZING  # type: str
 INIT_ERROR = None  # type: Optional[str]
 
+# RapidOCR (PP-OCRv6 via ONNXRuntime) — PRIMARY engine as of this session.
+# Runs through ONNXRuntime with no PaddlePaddle framework involved at all,
+# which sidesteps the CPU-only inference crash history (SIGSEGV, and a
+# documented ~43GB OOM regression as recent as April 2026) that keeps the
+# PaddleOCR engine below pinned to paddleocr==2.9.1/paddlepaddle==2.6.2 —
+# PP-OCRv5/v6 are unavailable on that line natively. Verified directly
+# against the actual production failure mode: a wide-tracked bold word
+# ("HUNTER") that PP-OCRv4's detector split into six single-letter boxes
+# (narrated "H U N T E R") is correctly merged into one box by RapidOCR's
+# bundled PP-OCRv6 model. PaddleOCR PP-OCRv4 (below) is kept as a fallback
+# tier, not removed, since RapidOCR hasn't yet been validated against a
+# large volume of real manhwa panels — only the specific diagnosed bug.
+RAPIDOCR_MODEL_NAME = "RapidOCR-PPOCRv6"
+rapidocr_engine = None  # type: Any
+RAPIDOCR_READY = False  # type: bool
+RAPIDOCR_ERROR = None  # type: Optional[str]
+
 
 def _run_warmup(ocr_obj: Any) -> bool:
     """Perform a lightweight real inference warmup on a dummy image tensor.
@@ -160,10 +177,42 @@ def _run_warmup(ocr_obj: Any) -> bool:
         return False
 
 
+def _init_rapidocr() -> None:
+    """Initialize RapidOCR (PP-OCRv6, ONNXRuntime backend) — the PRIMARY
+    OCR engine. Mirrors _init_ocr()'s structure (init lock, real-inference
+    warmup before trusting the engine) but has no retry/backoff loop of
+    its own here: it's covered by the same _background_retry_loop as
+    PaddleOCR, at module scope below.
+    """
+    global rapidocr_engine, RAPIDOCR_READY, RAPIDOCR_ERROR
+
+    with _init_lock:
+        RAPIDOCR_READY = False
+        RAPIDOCR_ERROR = None
+        try:
+            from rapidocr import RapidOCR
+            engine = RapidOCR()
+            # Real inference warmup, not just "the constructor didn't
+            # raise" — same reasoning as _run_warmup below.
+            dummy_img = np.zeros((32, 32, 3), dtype=np.uint8)
+            with _inference_lock:
+                engine(dummy_img)
+            rapidocr_engine = engine
+            RAPIDOCR_READY = True
+            logger.info("RapidOCR (PP-OCRv6, ONNXRuntime) initialized and warmed up successfully")
+        except Exception as exc:
+            rapidocr_engine = None
+            RAPIDOCR_READY = False
+            RAPIDOCR_ERROR = str(exc)
+            logger.error("RapidOCR initialization failed: %s", exc, exc_info=True)
+
+
 def _init_ocr() -> None:
-    """Attempt to initialise PaddleOCR PP-OCRv4 (the flagship model on the
-    pinned paddleocr==2.9.1 / paddlepaddle==2.6.2 line — see requirements.txt
-    for why; PP-OCRv5 does not exist on this line, so it is not attempted).
+    """Attempt to initialise PaddleOCR PP-OCRv4 — now the FALLBACK tier
+    (see RapidOCR/_init_rapidocr() above for the primary engine), kept on
+    the pinned paddleocr==2.9.1 / paddlepaddle==2.6.2 line — see
+    requirements.txt for why; PP-OCRv5/v6 do not exist on this line
+    natively, so they are not attempted here.
 
     Runs under _init_lock to prevent race conditions during model initialization.
     Validates model with _run_warmup before marking the service READY.
@@ -267,11 +316,43 @@ def _init_ocr() -> None:
             logger.error("PaddleOCR state transition: %s -> FAILED (%s)", ServiceState.INITIALIZING, INIT_ERROR)
 
 
-# Run initialisation at module load so the model is ready before requests arrive.
-if os.environ.get("SKIP_OCR_INIT") != "1":
-    _init_ocr()
+# Run initialisation at module load so a model is ready before requests
+# arrive. Both engines are attempted independently — the service overall
+# is READY as long as AT LEAST ONE works, since either alone can serve
+# requests (see _ocr_with_cascade, which tries RapidOCR first and falls
+# through to PaddleOCR PP-OCRv4 only if RapidOCR is unavailable or
+# uncertain).
+def _active_model_name() -> str:
+    """Name of whichever engine would actually serve the next request:
+    RapidOCR (primary) if ready, else PaddleOCR (fallback) if ready, else
+    'unknown'. Used everywhere a response reports which model is active,
+    so it never falls back to reporting the PaddleOCR-only MODEL_NAME
+    even when RapidOCR is the one actually serving requests.
+    """
+    if RAPIDOCR_READY:
+        return RAPIDOCR_MODEL_NAME
+    if MODEL_READY:
+        return MODEL_NAME
+    return "unknown"
 
-# If startup init failed outright, run background retry loop.
+
+def _recompute_service_state() -> None:
+    global SERVICE_STATE, INIT_ERROR
+    if RAPIDOCR_READY or MODEL_READY:
+        SERVICE_STATE = ServiceState.READY
+        INIT_ERROR = None
+    else:
+        SERVICE_STATE = ServiceState.FAILED
+        INIT_ERROR = f"rapidocr: {RAPIDOCR_ERROR}; paddleocr: {INIT_ERROR}"
+
+
+if os.environ.get("SKIP_OCR_INIT") != "1":
+    _init_rapidocr()
+    _init_ocr()  # _init_ocr() sets SERVICE_STATE itself; reconcile below
+    _recompute_service_state()
+
+# If startup init failed outright for BOTH engines, run background retry
+# loop until at least one comes up.
 if SERVICE_STATE != ServiceState.READY:
     def _background_retry_loop():
         # type: () -> None
@@ -279,22 +360,26 @@ if SERVICE_STATE != ServiceState.READY:
         max_backoff_sec = 600
         while SERVICE_STATE != ServiceState.READY:
             time.sleep(backoff_sec)
-            logger.info("Retrying PaddleOCR initialisation in background (current state: %s)...", SERVICE_STATE)
-            _init_ocr()
+            logger.info("Retrying OCR engine initialisation in background (current state: %s)...", SERVICE_STATE)
+            if not RAPIDOCR_READY:
+                _init_rapidocr()
+            if not MODEL_READY:
+                _init_ocr()
+            _recompute_service_state()
             if SERVICE_STATE != ServiceState.READY:
                 backoff_sec = min(backoff_sec * 2, max_backoff_sec)
 
     threading.Thread(target=_background_retry_loop, daemon=True).start()
-    logger.warning("PaddleOCR not ready at startup (state: %s) — background retry loop started", SERVICE_STATE)
+    logger.warning("No OCR engine ready at startup (state: %s) — background retry loop started", SERVICE_STATE)
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="PaddleOCR Service",
-    description="OCR engine for manhwa/manga recap pipeline using PaddleOCR PP-OCRv4",
-    version="1.0.0",
+    title="OCR Service",
+    description="OCR engine for manhwa/manga recap pipeline. Primary: RapidOCR (PP-OCRv6, ONNXRuntime). Fallback: PaddleOCR PP-OCRv4.",
+    version="2.0.0",
 )
 
 
@@ -323,13 +408,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
-
-class OCRErrorInfo(BaseModel):
-    """Per-image error details when a single image in a batch fails."""
-    index: int = 0
-    path: str = ""
-    error: str = ""
 
 
 class OCRResult(BaseModel):
@@ -431,6 +509,8 @@ class HealthResponse(BaseModel):
     ready: bool
     state: str = Field(default=ServiceState.INITIALIZING, description="Service readiness state")
     error: Optional[str] = Field(default=None, description="Initialization error if any")
+    rapidocr_ready: bool = Field(default=False, description="Whether the primary RapidOCR (PP-OCRv6) engine is ready")
+    paddleocr_ready: bool = Field(default=False, description="Whether the fallback PaddleOCR (PP-OCRv4) engine is ready")
 
 
 class ReadyResponse(BaseModel):
@@ -722,6 +802,49 @@ def parse_ocr_results(result):
     return extracted_lines
 
 
+def _run_rapidocr_on_image(img, options=None):
+    # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
+    """Run RapidOCR (PP-OCRv6, ONNXRuntime) on a numpy image array.
+
+    Mirrors _run_ocr_on_image's contract (same _TextRegion return shape)
+    so the existing _merge_regions/_quality_status pipeline — including
+    the gap-aware word-join fix for over-segmented bold lettering — works
+    unchanged regardless of which engine produced the regions.
+    """
+    global rapidocr_engine
+    if rapidocr_engine is None:
+        raise RuntimeError("RapidOCR engine is not initialized")
+
+    opts = options or OCROptions()
+    with _inference_lock:
+        result = rapidocr_engine(
+            img,
+            box_thresh=opts.det_db_box_thresh,
+            unclip_ratio=opts.det_db_unclip_ratio,
+        )
+
+    regions = []  # type: List[_TextRegion]
+    # RapidOCR returns boxes/txts/scores as None (not empty sequences) when
+    # nothing is detected — verified directly against a blank test image.
+    if result is None or result.boxes is None or result.txts is None:
+        return regions
+
+    scores = result.scores if result.scores is not None else [0.0] * len(result.boxes)
+    for box, text, score in zip(result.boxes, result.txts, scores):
+        if not text or not str(text).strip():
+            continue
+        try:
+            xs = [float(pt[0]) for pt in box]
+            ys = [float(pt[1]) for pt in box]
+        except (TypeError, ValueError, IndexError):
+            continue
+        regions.append(_TextRegion(
+            text=str(text), confidence=float(score),
+            x_min=min(xs), y_min=min(ys), y_max=max(ys), x_max=max(xs),
+        ))
+    return regions
+
+
 def _run_ocr_on_image(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
     """Run PaddleOCR on a numpy image array under _inference_lock."""
@@ -995,12 +1118,21 @@ def _run_tesseract_ocr(img):
 
 def _ocr_with_cascade(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
-    """Run PaddleOCR pass (standard + preprocessing variants) and, if still
-    UNCERTAIN/FAILED, fall back to Tesseract as an independent candidate.
-    Skips the expensive preprocessing/Tesseract cascade entirely when the
-    detector found zero text regions at all (see the zero-region check
-    below) — no amount of pixel-level preprocessing recovers text that
-    was never localized as a region in the first place.
+    """Run OCR through an engine cascade: RapidOCR (PP-OCRv6, PRIMARY) ->
+    PaddleOCR PP-OCRv4 standard + preprocessing variants (FALLBACK) ->
+    Tesseract (LAST RESORT). Every stage's non-empty candidate is tracked
+    so the single best-quality result across ALL engines tried wins, even
+    if none individually reached the SUCCESS confidence threshold — the
+    same "keep the best candidate seen so far" contract the PaddleOCR
+    preprocessing-variant loop already used, extended across engines
+    rather than only across one engine's variants.
+
+    Skips all further stages entirely the moment a stage finds ZERO text
+    regions — no amount of a different engine or pixel-level
+    preprocessing manufactures text regions that were never localized as
+    a candidate bounding box in the first place, and this is the common
+    case (manhwa chapters are frequently 80%+ silent/action panels with
+    no dialogue at all).
     """
     try:
         opts = options or OCROptions()
@@ -1008,67 +1140,104 @@ def _ocr_with_cascade(img, options=None):
         if is_ui_box and opts.det_limit_side_len < 1216:
             opts = opts.copy(update={"det_limit_side_len": 1216})
 
-        regions = _run_ocr_on_image(img, opts)
-        merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
-        status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
+        candidates = []  # type: List[dict]
+        best_tuple = None  # type: Optional[Tuple[str, float, int, str, float, List[dict], str]]
 
-        candidates = [{
-            "text": merged_text, "confidence": avg_conf, "regions": region_count,
-            "provider": "paddleocr", "model": MODEL_NAME, "variant": "standard",
-        }]
+        # --- PRIMARY: RapidOCR (PP-OCRv6, ONNXRuntime) ---
+        if rapidocr_engine is not None:
+            try:
+                rapid_regions = _run_rapidocr_on_image(img, opts)
+                rapid_text, rapid_conf, rapid_count = _merge_regions(rapid_regions, is_ui_box=is_ui_box)
+                rapid_status, rapid_quality, rapid_reason = _quality_status(rapid_text, rapid_conf, rapid_count)
 
-        best_tuple = (merged_text, avg_conf, region_count, status, quality_score, candidates, reason)
+                candidates.append({
+                    "text": rapid_text, "confidence": rapid_conf, "regions": rapid_count,
+                    "provider": "rapidocr", "model": RAPIDOCR_MODEL_NAME, "variant": "standard",
+                })
+                best_tuple = (rapid_text, rapid_conf, rapid_count, rapid_status, rapid_quality,
+                              list(candidates), rapid_reason)
 
-        if status == "SUCCESS":
-            return best_tuple
+                if rapid_status == "SUCCESS":
+                    return best_tuple
+                if rapid_count == 0:
+                    return (rapid_text, rapid_conf, rapid_count, rapid_status, rapid_quality,
+                            list(candidates), f"skipped_fallback_zero_regions_detected:{rapid_reason}")
+            except Exception as exc:
+                logger.warning("RapidOCR pass failed (%s) — falling back to PaddleOCR PP-OCRv4", exc)
 
-        # Detector found ZERO candidate text regions in the original image —
-        # this is the common case for action/establishing panels (manhwa
-        # chapters are frequently 80%+ silent panels with no bubbles at
-        # all). Upscaling/contrast/inversion tweak pixel values; they don't
-        # manufacture text regions the detector never localized a bounding
-        # box for in the first place, so running 3 more full inference
-        # passes plus a 3-pass Tesseract fallback here is pure wasted
-        # compute — it was making every quiet chapter (the majority of most
-        # chapters) several times slower for no quality benefit.
-        if region_count == 0:
-            return (merged_text, avg_conf, region_count, status, quality_score,
-                    candidates, f"skipped_cascade_zero_regions_detected:{reason}")
-
-        preprocessing_passes = [
-            ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),
-            ("contrast_clahe", _preprocess_contrast),
-            ("color_inverted", _preprocess_invert),
-        ]
-
-        for variant_name, prep_fn in preprocessing_passes:
-            prep_img = prep_fn(img)
-            # Use `opts` (carries the UI-box det_limit_side_len bump) and
-            # pass is_ui_box through to _merge_regions, same as the standard
-            # pass above — using the original `options` here silently
-            # reverted every fallback variant to non-UI-box thresholds,
-            # which defeats the UI-box handling exactly when it's needed
-            # most (the standard pass already failed to reach SUCCESS).
-            var_regions = _run_ocr_on_image(prep_img, opts)
-            var_text, var_conf, var_count = _merge_regions(var_regions, is_ui_box=is_ui_box)
-            var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
+        # --- FALLBACK: PaddleOCR PP-OCRv4 (reached only if RapidOCR was
+        # unavailable, errored, or came back UNCERTAIN with some text
+        # found but not confidently). Wrapped in try/except (mirroring the
+        # RapidOCR block above) rather than pre-checking `ocr is None`, so
+        # a real "not initialized" failure here can't wipe out an
+        # already-gathered RapidOCR candidate — it just falls through to
+        # Tesseract with whatever best_tuple exists so far.
+        try:
+            regions = _run_ocr_on_image(img, opts)
+            merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
+            status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
 
             candidates.append({
-                "text": var_text, "confidence": var_conf, "regions": var_count,
-                "provider": "paddleocr", "model": MODEL_NAME, "variant": variant_name,
+                "text": merged_text, "confidence": avg_conf, "regions": region_count,
+                "provider": "paddleocr", "model": MODEL_NAME, "variant": "standard",
             })
 
-            if var_status == "SUCCESS" and var_quality > best_tuple[4]:
-                best_tuple = (
-                    var_text, var_conf, var_count, var_status, var_quality,
-                    candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
-                )
+            fallback_tuple = (merged_text, avg_conf, region_count, status, quality_score, list(candidates), reason)
+            if best_tuple is None or quality_score > best_tuple[4]:
+                best_tuple = fallback_tuple
+
+            if status == "SUCCESS":
                 return best_tuple
-            elif var_quality > best_tuple[4]:
-                best_tuple = (
-                    var_text, var_conf, var_count, var_status, var_quality,
-                    candidates, f"paddleocr_variant_{variant_name}:{var_reason}",
-                )
+
+            # Detector found ZERO candidate text regions in the original image —
+            # this is the common case for action/establishing panels (manhwa
+            # chapters are frequently 80%+ silent panels with no bubbles at
+            # all). Upscaling/contrast/inversion tweak pixel values; they don't
+            # manufacture text regions the detector never localized a bounding
+            # box for in the first place, so running 3 more full inference
+            # passes plus a 3-pass Tesseract fallback here is pure wasted
+            # compute — it was making every quiet chapter (the majority of most
+            # chapters) several times slower for no quality benefit.
+            if region_count == 0:
+                return (merged_text, avg_conf, region_count, status, quality_score,
+                        list(candidates), f"skipped_cascade_zero_regions_detected:{reason}")
+
+            preprocessing_passes = [
+                ("upscale_1.5x", lambda i: _preprocess_upscale(i, 1.5)),
+                ("contrast_clahe", _preprocess_contrast),
+                ("color_inverted", _preprocess_invert),
+            ]
+
+            for variant_name, prep_fn in preprocessing_passes:
+                prep_img = prep_fn(img)
+                # Use `opts` (carries the UI-box det_limit_side_len bump) and
+                # pass is_ui_box through to _merge_regions, same as the standard
+                # pass above — using the original `options` here silently
+                # reverted every fallback variant to non-UI-box thresholds,
+                # which defeats the UI-box handling exactly when it's needed
+                # most (the standard pass already failed to reach SUCCESS).
+                var_regions = _run_ocr_on_image(prep_img, opts)
+                var_text, var_conf, var_count = _merge_regions(var_regions, is_ui_box=is_ui_box)
+                var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
+
+                candidates.append({
+                    "text": var_text, "confidence": var_conf, "regions": var_count,
+                    "provider": "paddleocr", "model": MODEL_NAME, "variant": variant_name,
+                })
+
+                if var_status == "SUCCESS" and var_quality > best_tuple[4]:
+                    best_tuple = (
+                        var_text, var_conf, var_count, var_status, var_quality,
+                        list(candidates), f"paddleocr_variant_{variant_name}:{var_reason}",
+                    )
+                    return best_tuple
+                elif var_quality > best_tuple[4]:
+                    best_tuple = (
+                        var_text, var_conf, var_count, var_status, var_quality,
+                        list(candidates), f"paddleocr_variant_{variant_name}:{var_reason}",
+                    )
+        except Exception as exc:
+            logger.warning("PaddleOCR fallback pass failed (%s)", exc)
 
         try:
             tess_passes = [
@@ -1092,7 +1261,7 @@ def _ocr_with_cascade(img, options=None):
                 if tess_status == "SUCCESS" and tess_quality > best_tuple[4]:
                     return (
                         tess_text, tess_conf, tess_regions, tess_status, tess_quality,
-                        candidates, f"tesseract_{tess_variant}_fallback_beat_paddleocr:{tess_reason}",
+                        list(candidates), f"tesseract_{tess_variant}_fallback_beat_prior_engines:{tess_reason}",
                     )
         except Exception as tess_err:
             logger.warning("Tesseract fallback cascade failed gracefully: %s", tess_err)
@@ -1119,13 +1288,22 @@ def _quality_status(text, confidence, regions):
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Return service health and model readiness status."""
+    """Return service health and model readiness status.
+
+    `model` reports the active PRIMARY engine (RapidOCR) when it's ready,
+    falling back to reporting the PaddleOCR fallback tier's name if only
+    that one is up — `rapidocr_ready`/`paddleocr_ready` give the caller
+    the precise per-engine picture either way.
+    """
+    active_model = _active_model_name()
     return HealthResponse(
         status="ok" if SERVICE_STATE == ServiceState.READY else ("initializing" if SERVICE_STATE == ServiceState.INITIALIZING else "degraded"),
-        model=MODEL_NAME,
-        ready=MODEL_READY,
+        model=active_model,
+        ready=(RAPIDOCR_READY or MODEL_READY),
         state=SERVICE_STATE,
         error=INIT_ERROR,
+        rapidocr_ready=RAPIDOCR_READY,
+        paddleocr_ready=MODEL_READY,
     )
 
 
@@ -1135,7 +1313,7 @@ async def ready_check():
     if SERVICE_STATE == ServiceState.READY:
         return ReadyResponse(
             status="ready",
-            model=MODEL_NAME,
+            model=_active_model_name(),
             ready=True,
             state=SERVICE_STATE,
         )
@@ -1143,7 +1321,7 @@ async def ready_check():
         status_code=503,
         detail={
             "status": "not_ready",
-            "model": MODEL_NAME,
+            "model": _active_model_name(),
             "ready": False,
             "state": SERVICE_STATE,
             "error": INIT_ERROR,
@@ -1153,15 +1331,21 @@ async def ready_check():
 
 @app.post("/reload")
 async def reload_model():
-    """Force a synchronous re-attempt at model initialisation."""
+    """Force a synchronous re-attempt at initialising both engines."""
     logger.info("Manual reload triggered on /reload endpoint")
-    _init_ocr()
+    if not RAPIDOCR_READY:
+        _init_rapidocr()
+    if not MODEL_READY:
+        _init_ocr()
+    _recompute_service_state()
+    active_model = _active_model_name()
     if SERVICE_STATE != ServiceState.READY:
         raise HTTPException(
             status_code=503,
-            detail={"ready": False, "model": MODEL_NAME, "state": SERVICE_STATE, "error": INIT_ERROR},
+            detail={"ready": False, "model": active_model, "state": SERVICE_STATE, "error": INIT_ERROR},
         )
-    return {"ready": MODEL_READY, "model": MODEL_NAME, "state": SERVICE_STATE}
+    return {"ready": True, "model": active_model, "state": SERVICE_STATE,
+            "rapidocr_ready": RAPIDOCR_READY, "paddleocr_ready": MODEL_READY}
 
 
 OCR_CONCURRENCY = max(1, int(os.environ.get("OCR_CONCURRENCY", "1")))
@@ -1215,7 +1399,7 @@ async def ocr_batch(request: BatchOCRRequest):
     Accepts a list of absolute file paths to images.
     Returns an array of {index, text, confidence, regions} objects.
     """
-    if SERVICE_STATE != ServiceState.READY or ocr is None:
+    if SERVICE_STATE != ServiceState.READY:
         logger.warning("[Batch OCR] Request rejected: service state is %s", SERVICE_STATE)
         raise HTTPException(
             status_code=503,
@@ -1236,12 +1420,12 @@ async def ocr_batch(request: BatchOCRRequest):
         "[Batch OCR] Batch completed: %d images in %.1f ms (%s)",
         total,
         elapsed_ms,
-        MODEL_NAME,
+        _active_model_name(),
     )
 
     return BatchOCRResponse(
         results=results,
-        model=MODEL_NAME,
+        model=_active_model_name(),
         processing_time_ms=elapsed_ms,
     )
 
@@ -1251,7 +1435,7 @@ async def ocr_base64(request: Base64OCRRequest):
     """
     Accepts a single base64-encoded image and returns OCR transcription.
     """
-    if SERVICE_STATE != ServiceState.READY or ocr is None:
+    if SERVICE_STATE != ServiceState.READY:
         logger.warning("[Base64 OCR] Request rejected: service state is %s", SERVICE_STATE)
         raise HTTPException(
             status_code=503,
@@ -1279,7 +1463,7 @@ async def ocr_base64(request: Base64OCRRequest):
         region_count,
         elapsed_ms,
         status,
-        MODEL_NAME,
+        _active_model_name(),
     )
 
     return Base64OCRResponse(
@@ -1290,7 +1474,7 @@ async def ocr_base64(request: Base64OCRRequest):
         quality_score=quality_score,
         candidates=candidates,
         selection_reason=reason,
-        model=MODEL_NAME,
+        model=_active_model_name(),
         processing_time_ms=elapsed_ms,
     )
 
@@ -1300,7 +1484,7 @@ async def ocr_single(request: Base64OCRRequest):
     """
     Legacy single-image OCR endpoint.
     """
-    if SERVICE_STATE != ServiceState.READY or ocr is None:
+    if SERVICE_STATE != ServiceState.READY:
         logger.warning("[Single OCR] Request rejected: service state is %s", SERVICE_STATE)
         raise HTTPException(
             status_code=503,
@@ -1328,7 +1512,7 @@ async def ocr_single(request: Base64OCRRequest):
         region_count,
         elapsed_ms,
         status,
-        MODEL_NAME,
+        _active_model_name(),
     )
 
     return SingleOCRResponse(
@@ -1339,7 +1523,7 @@ async def ocr_single(request: Base64OCRRequest):
         quality_score=quality_score,
         candidates=candidates,
         selection_reason=reason,
-        model=MODEL_NAME,
+        model=_active_model_name(),
         processing_time_ms=elapsed_ms,
     )
 

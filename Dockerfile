@@ -35,7 +35,8 @@ COPY pipeline/requirements.txt ./pipeline/requirements.txt
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r pipeline/requirements.txt && \
-    pip install --no-cache-dir -r mini-services/paddleocr-service/requirements.txt
+    pip install --no-cache-dir -r mini-services/paddleocr-service/requirements.txt && \
+    pip install --no-cache-dir --no-deps rapidocr==3.9.2
 
 RUN bun install
 RUN cd mini-services/pipeline-service && bun install

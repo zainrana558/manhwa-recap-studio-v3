@@ -283,10 +283,11 @@ source /opt/manhwa-recap-studio/.venv/bin/activate
 python --version  # must be Python 3.10.4 for the pinned production target
 pip install --upgrade pip setuptools wheel
 pip install -r pipeline/requirements.txt
-pip install -r mini-services/paddleocr-service/requirements.txt \
-  -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-python -c "import paddle; print(paddle.__version__)"      # expected 3.1.1
-python -c "import paddleocr; print(paddleocr.__version__)" # expected 3.7.0
+pip install -r mini-services/paddleocr-service/requirements.txt
+pip install --no-deps rapidocr==3.9.2
+python -c "import rapidocr; print(rapidocr.__version__)"    # expected 3.9.2 (primary OCR engine)
+python -c "import paddle; print(paddle.__version__)"        # expected 2.6.2 (fallback tier)
+python -c "import paddleocr; print(paddleocr.__version__)"  # expected 2.9.1 (fallback tier)
 ```
 
 Install local media/OCR/TTS runtime components:

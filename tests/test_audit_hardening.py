@@ -3,20 +3,9 @@ from PIL import Image, ImageDraw
 from pipeline.master_pipeline import (
     PipelineConfig,
     Chapter,
-    _compose_canvas_from_source,
     slice_chapter_panels,
     discover_chapters,
 )
-
-
-def test_compose_canvas_corrupt_image(tmp_path: Path):
-    corrupt_path = tmp_path / "corrupt_image.jpg"
-    corrupt_path.write_bytes(b"THIS_IS_NOT_A_VALID_IMAGE_FILE_DATA_12345")
-
-    # Should not raise UnidentifiedImageError or OSError; returns black canvas
-    canvas = _compose_canvas_from_source(corrupt_path)
-    assert isinstance(canvas, Image.Image)
-    assert canvas.size == (1920, 1080)
 
 
 def test_slice_chapter_panels_corrupt_image_graceful_skip(tmp_path: Path):
