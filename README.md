@@ -11,7 +11,7 @@ pinned: false
 # Manhwa Recap Studio
 
 Auto-scrape manhwa/manga/webtoon chapters, transcribe panel text with
-**PaddleOCR PP-OCRv5** (primary, no API keys needed, VLM fallback),
+**PaddleOCR PP-OCRv4** (primary, no API keys needed, VLM fallback),
 translate to English, and render a narrated recap video with text-to-speech
 audio. All in one Docker container — runs free on Hugging Face Spaces.
 
@@ -35,7 +35,7 @@ No environment variables required to start. Add `MEGA_EMAIL` / `MEGA_PASSWORD`
 |---|---|---|
 | Next.js (standalone) | 3000 | Frontend + API routes |
 | Pipeline-service | 3001 | Job queue + VLM fallback + socket.io |
-| PaddleOCR service | 3002 | PP-OCRv5 OCR engine (primary transcriptor) |
+| PaddleOCR service | 3002 | PP-OCRv4 OCR engine (primary transcriptor) |
 | Caddy | 7860 | Reverse proxy (HF Spaces entry point) |
 
 ## Optional env vars (Settings → Repository secrets)
@@ -51,7 +51,7 @@ No environment variables required to start. Add `MEGA_EMAIL` / `MEGA_PASSWORD`
 
 - Search 6 sources: MangaHere, FanFox, Webtoons, AsuraScans, MAL, AniList
 - 55 narration voices with inline preview playback
-- **PaddleOCR PP-OCRv5** primary transcription (+13% accuracy over v4, no API keys)
+- **PaddleOCR PP-OCRv4** primary transcription (no API keys)
 - VLM providers (SiliconFlow, Gemini, Groq) as automatic OCR fallback
 - YOLO panel detection
 - edge-tts narration with clean audio (no pops/clicks)

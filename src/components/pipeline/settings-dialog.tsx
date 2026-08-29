@@ -330,7 +330,7 @@ export function SettingsDialog() {
                 ) : (
                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
                     <FileText className="h-3.5 w-3.5" />
-                    <span>PP-OCRv5 is the default transcription engine. VLM providers serve as fallback.</span>
+                    <span>PP-OCRv4 is the default transcription engine. VLM providers serve as fallback.</span>
                   </div>
                 )}
               </div>

@@ -43,8 +43,8 @@ const FEATURES: Feature[] = [
   {
     icon: FileText,
     title: "PaddleOCR Transcription",
-    desc: "PP-OCRv5 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
-    stat: "PP-OCRv5",
+    desc: "PP-OCRv4 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
+    stat: "PP-OCRv4",
     gradient: "from-sky-500/20 to-blue-500/10",
     glowColor: "shadow-sky-500/10",
   },

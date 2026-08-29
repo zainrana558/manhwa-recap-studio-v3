@@ -1302,16 +1302,17 @@ async function getZai() {
 }
 
 // ---------------------------------------------------------------------------
-// PaddleOCR PP-OCRv5 — Primary local OCR transcription.
+// PaddleOCR PP-OCRv4 — Primary local OCR transcription.
 //
 // Sends image file paths to the PaddleOCR Python service (port 3002) for
 // fast, CPU-efficient text extraction. This is the PRIMARY transcription
 // method — VLM is used only as a fallback when OCR is unavailable or
 // returns low-confidence results.
 //
-// PP-OCRv5 gives +13% accuracy over v4, handles multilingual text, and
-// is specifically optimized for manga/manhwa panels (speech bubbles,
-// rotated text, mixed scripts).
+// Pinned to PP-OCRv4 (paddleocr==2.9.1 / paddlepaddle==2.6.2 — see
+// mini-services/paddleocr-service/requirements.txt) to avoid a known,
+// still-open PIR-interpreter SIGSEGV in paddlepaddle>=3.0 on CPU-only
+// inference (PaddlePaddle/PaddleOCR#15287).
 // ---------------------------------------------------------------------------
 
 const OCR_CACHE_DIR = path.join(DATA_DIR, 'cache', 'ocr')
@@ -1375,7 +1376,7 @@ async function setOcrCached(key: string, text: string, status = 'SUCCESS'): Prom
 }
 
 /**
- * Generate per-image transcriptions using PaddleOCR PP-OCRv5.
+ * Generate per-image transcriptions using PaddleOCR PP-OCRv4.
  *
  * Sends image file paths to the local PaddleOCR service for fast, CPU-efficient
  * text extraction. Unlike VLM, OCR runs entirely on-device with no API keys

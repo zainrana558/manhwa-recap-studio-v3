@@ -266,6 +266,7 @@ class FrameEntry:
     source_page: str
     source_index: int
     frame_kind: str = "panel"  # "panel" | "scroll_frame" | "full_page"
+    scroll_group: Optional[str] = None  # shared id for scroll_frame siblings sliced from one tall UI card
     ocr_status: str = "NONE"
     ocr_text: str = ""
     narration_text: str = ""
@@ -280,6 +281,7 @@ class FrameEntry:
             "source_page": self.source_page,
             "source_index": self.source_index,
             "frame_kind": self.frame_kind,
+            "scroll_group": self.scroll_group,
             "ocr_status": self.ocr_status,
             "ocr_text": self.ocr_text,
             "narration_text": self.narration_text,
@@ -309,6 +311,7 @@ class FrameEntry:
             source_page=str(data.get("source_page") or ""),
             source_index=int(data.get("source_index", 0)),
             frame_kind=str(data.get("frame_kind") or "panel"),
+            scroll_group=data.get("scroll_group"),
             ocr_status=str(data.get("ocr_status") or "NONE"),
             ocr_text=str(data.get("ocr_text") or ""),
             narration_text=str(data.get("narration_text") or ""),
@@ -1700,6 +1703,14 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     cw, ch = crop.size
                     if (ch / max(1, cw)) > 1.8:
                         from PIL import Image as PILImage
+                        # Tall UI/quest cards get sliced into several panning
+                        # sub-frames for display. They all show fragments of
+                        # ONE piece of text, so tag them with a shared
+                        # scroll_group — OCR'ing (and narrating) each window
+                        # separately would chop sentences at arbitrary pixel
+                        # boundaries and read them as N disjoint, garbled
+                        # clips instead of one continuous line.
+                        group_id = f"{chapter.tag}_grp{frame_counter:05d}"
                         scroll_frames = _generate_ui_card_scroll_frames(crop, num_scroll_frames=4)
                         for s_frame in scroll_frames:
                             fp = out_dir / f"frame_{frame_counter:05d}.jpg"
@@ -1713,12 +1724,13 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                                     source_page=panel_path.name,
                                     source_index=panel_idx,
                                     frame_kind="scroll_frame",
+                                    scroll_group=group_id,
                                 )
                             )
                             frame_counter += 1
                     else:
                         from PIL import Image as PILImage
-                        frame = _compose_canvas(PILImage.fromarray(crop_arr), ImageFilter=ImageFilter)
+                        frame = _compose_canvas(PILImage.fromarray(crop_arr))
                         fp = out_dir / f"frame_{frame_counter:05d}.jpg"
                         frame.save(fp, quality=92)
                         frame_id = f"{chapter.tag}_frame_{frame_counter:05d}"
@@ -1763,7 +1775,7 @@ def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["I
     # Visible window height in source space to match 16:9 ratio at full width cw
     window_h = int(cw * CANVAS_H / CANVAS_W)
     if window_h >= ch:
-        return [_compose_canvas(crop, None)]
+        return [_compose_canvas(crop)]
 
     scroll_frames = []
     max_top = ch - window_h
@@ -1783,14 +1795,17 @@ def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["I
     return scroll_frames
 
 
-def _compose_canvas(crop, ImageFilter):
-    """Composite `crop` onto a 1920x1080 canvas with solid black background.
-    Uses CONTAIN-FIT: scales the panel to fit ENTIRELY within the canvas,
-    showing the complete panel with black bars on the sides if needed.
-    This ensures NO content is ever cut off — the full panel (including
-    character head and feet) is always visible.
+def _compose_canvas(crop):
+    """Composite `crop` onto a 1920x1080 canvas with a blurred, cover-fit
+    copy of the same panel as the background (instead of plain black bars).
+    Uses CONTAIN-FIT for the foreground: scales the panel to fit ENTIRELY
+    within the canvas, showing the complete panel — including character
+    head and feet — with the blurred backdrop filling the rest of the
+    frame. This ensures NO content is ever cut off while avoiding the
+    dead-black letterbox bars that plain contain-fit leaves on portrait
+    panels.
     Also trims white borders from the source panel first."""
-    from PIL import Image
+    from PIL import Image, ImageFilter
     import numpy as np
 
     # Trim white borders from the crop (manhwa pages have white margins)
@@ -1813,11 +1828,20 @@ def _compose_canvas(crop, ImageFilter):
 
     cw, ch = crop.size
 
-    # Solid black background.
-    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (0, 0, 0))
+    # Blurred, cover-fit background: scales the SAME panel up until it fully
+    # covers the canvas (cropping the overflow, never the foreground), then
+    # blurs + darkens it. Fills the whole frame — no black bars — while the
+    # sharp foreground panel below still shows every pixel of the source.
+    bg_scale = max(CANVAS_W / cw, CANVAS_H / ch)
+    bw, bh = max(1, int(cw * bg_scale)), max(1, int(ch * bg_scale))
+    bg = crop.resize((bw, bh), Image.LANCZOS)
+    bx = (bw - CANVAS_W) // 2
+    by = (bh - CANVAS_H) // 2
+    bg = bg.crop((bx, by, bx + CANVAS_W, by + CANVAS_H))
+    bg = bg.filter(ImageFilter.GaussianBlur(40))
+    canvas = Image.eval(bg, lambda p: int(p * 0.55)).convert("RGB")
 
     # Contain-fit: scale to fit ENTIRELY within canvas, centered.
-    # Black bars on sides if the panel is taller than 16:9.
     # This shows the COMPLETE panel — nothing is ever cut off.
     fg_scale = min(CANVAS_W / cw, CANVAS_H / ch)
     fw, fh = max(1, int(cw * fg_scale)), max(1, int(ch * fg_scale))
@@ -2401,6 +2425,34 @@ def build_chapter_audio_track(
 # 4b. FRAME TIMING (proportional word-count split)
 # ---------------------------------------------------------------------------
 
+def _join_scroll_fragments(fragments: List[str]) -> str:
+    """Join OCR/VLM text fragments read off consecutive, overlapping
+    scroll-pan windows of one tall UI card into a single continuous line.
+
+    Each window is a vertical crop that overlaps its neighbor, so the same
+    words are often transcribed twice at the boundary. Trim that duplicated
+    overlap instead of concatenating verbatim, which would otherwise repeat
+    words/sentences in the narration."""
+    result = ""
+    for frag in fragments:
+        frag = frag.strip()
+        if not frag:
+            continue
+        if not result:
+            result = frag
+            continue
+        result_words = result.split()
+        frag_words = frag.split()
+        max_overlap = min(len(result_words), len(frag_words), 12)
+        overlap = 0
+        for k in range(max_overlap, 0, -1):
+            if [w.lower() for w in result_words[-k:]] == [w.lower() for w in frag_words[:k]]:
+                overlap = k
+                break
+        result = (result + " " + " ".join(frag_words[overlap:])).strip()
+    return result
+
+
 def split_frame_timings(text: str, positions: List[int], duration: float, is_silent: bool = False) -> dict:
     """Proportionally split a segment's TTS duration across its frames by
     word count. For narrated frames, ensures each frame gets at least MIN_FRAME_DURATION
@@ -2954,46 +3006,79 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 if frame_keyed:
                     log.info("[%s] per-frame narration mode: %d frames (canonical frame transcriptions)",
                              chapter.tag, len(frame_paths))
-                    # One segment per frame — narration perfectly synced to each panel.
-                    for pos, fp in enumerate(frame_paths):
+
+                    # One segment per frame, EXCEPT scroll_frame siblings
+                    # (the panning sub-frames sliced from one tall UI card)
+                    # which share a scroll_group and are collapsed into ONE
+                    # segment. OCR'ing/narrating each panning window on its
+                    # own would chop one card's text at arbitrary pixel
+                    # boundaries into several disjoint, garbled clips.
+                    position_groups: List[List[int]] = []
+                    pos = 0
+                    while pos < len(frame_paths):
                         f_entry = manifest.frames[pos] if (manifest and pos < len(manifest.frames)) else None
-                        raw_narr_entry = None
-                        if f_entry:
-                            raw_narr_entry = (
-                                chapter.image_narrations.get(f_entry.frame_id)
-                                or chapter.image_narrations.get(f_entry.filename)
-                                or chapter.image_narrations.get(fp.name)
-                            )
+                        group_key = f_entry.scroll_group if f_entry else None
+                        if group_key:
+                            group = [pos]
+                            pos += 1
+                            while pos < len(frame_paths):
+                                next_entry = manifest.frames[pos] if (manifest and pos < len(manifest.frames)) else None
+                                if next_entry and next_entry.scroll_group == group_key:
+                                    group.append(pos)
+                                    pos += 1
+                                else:
+                                    break
+                            position_groups.append(group)
                         else:
-                            raw_narr_entry = chapter.image_narrations.get(fp.name)
+                            position_groups.append([pos])
+                            pos += 1
 
-                        parsed = parse_narration_item(raw_narr_entry)
-                        raw_text, ocr_status = parsed["text"], parsed["status"]
-                        img_tag = f"{chapter.tag}_frm{pos + 1:04d}"
+                    for positions in position_groups:
+                        fragments: List[str] = []
+                        statuses: List[str] = []
+                        for gpos in positions:
+                            fp = frame_paths[gpos]
+                            f_entry = manifest.frames[gpos] if (manifest and gpos < len(manifest.frames)) else None
+                            raw_narr_entry = None
+                            if f_entry:
+                                raw_narr_entry = (
+                                    chapter.image_narrations.get(f_entry.frame_id)
+                                    or chapter.image_narrations.get(f_entry.filename)
+                                    or chapter.image_narrations.get(fp.name)
+                                )
+                            else:
+                                raw_narr_entry = chapter.image_narrations.get(fp.name)
 
-                        if f_entry:
-                            f_entry.ocr_status = ocr_status
-                            f_entry.ocr_text = raw_text
+                            parsed = parse_narration_item(raw_narr_entry)
+                            raw_text, ocr_status = parsed["text"], parsed["status"]
+                            if f_entry:
+                                f_entry.ocr_status = ocr_status
+                                f_entry.ocr_text = raw_text
+                            if raw_text.strip():
+                                fragments.append(raw_text.strip())
+                            statuses.append(ocr_status)
 
-                        if ocr_status == OcrStatus.FAILED:
-                            log.warning("[%s] [%s] OCR FAILED for frame %s — retaining FAILED status, producing silent frame", chapter.tag, img_tag, fp.name)
-                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.FAILED))
-                        elif ocr_status == OcrStatus.NO_TEXT:
-                            log.info("[%s] [%s] NO_TEXT confirmed for frame %s", chapter.tag, img_tag, fp.name)
-                            segments.append((f"frm{pos + 1:04d}", "", [pos], OcrStatus.NO_TEXT))
-                        elif ocr_status == OcrStatus.UNCERTAIN:
-                            log.warning("[%s] [%s] OCR UNCERTAIN for frame %s (confidence=%.2f) — using available text", chapter.tag, img_tag, fp.name, parsed["confidence"])
-                            translated = translate_text(cfg, raw_text, img_tag)
+                        img_tag = f"{chapter.tag}_frm{positions[0] + 1:04d}"
+                        frame_names = [frame_paths[p].name for p in positions]
+
+                        if not fragments:
+                            if statuses and all(s == OcrStatus.FAILED for s in statuses):
+                                log.warning("[%s] [%s] OCR FAILED for frame(s) %s — retaining FAILED status, producing silent frame(s)",
+                                            chapter.tag, img_tag, frame_names)
+                                segments.append((f"frm{positions[0] + 1:04d}", "", positions, OcrStatus.FAILED))
+                            else:
+                                log.info("[%s] [%s] NO_TEXT confirmed for frame(s) %s", chapter.tag, img_tag, frame_names)
+                                segments.append((f"frm{positions[0] + 1:04d}", "", positions, OcrStatus.NO_TEXT))
+                        else:
+                            combined_text = _join_scroll_fragments(fragments) if len(positions) > 1 else fragments[0]
+                            overall_status = OcrStatus.UNCERTAIN if OcrStatus.UNCERTAIN in statuses else OcrStatus.SUCCESS
+                            if overall_status == OcrStatus.UNCERTAIN:
+                                log.warning("[%s] [%s] OCR UNCERTAIN for frame(s) %s — using available text", chapter.tag, img_tag, frame_names)
+                            translated = translate_text(cfg, combined_text, img_tag)
                             rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
                             if rephrased:
                                 prev_tail = last_sentences(rephrased)
-                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.UNCERTAIN))
-                        else:  # SUCCESS
-                            translated = translate_text(cfg, raw_text, img_tag)
-                            rephrased = rephrase_text(cfg, translated, img_tag, prev_tail)
-                            if rephrased:
-                                prev_tail = last_sentences(rephrased)
-                            segments.append((f"frm{pos + 1:04d}", rephrased, [pos], OcrStatus.SUCCESS))
+                            segments.append((f"frm{positions[0] + 1:04d}", rephrased, positions, overall_status))
                 else:
                     log.info("[%s] per-image narration mode: %d source images, %d frames",
                              chapter.tag, len(chapter.panel_paths), len(frame_paths))

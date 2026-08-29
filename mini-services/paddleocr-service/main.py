@@ -1,9 +1,10 @@
 """
-PaddleOCR PP-OCRv5 Mini-Service
+PaddleOCR PP-OCRv4 Mini-Service
 
 A FastAPI service providing high-accuracy OCR for manhwa/manga recap pipelines.
-Uses PaddleOCR with PP-OCRv5 (falls back to PP-OCRv4) for text extraction
-from speech bubbles and captions.
+Uses PaddleOCR PP-OCRv4 (see requirements.txt for the paddleocr==2.9.1 /
+paddlepaddle==2.6.2 pin and why) for text extraction from speech bubbles and
+captions.
 
 Port: 3002
 """
@@ -54,11 +55,11 @@ def _sigsegv_handler(signum, frame):
     import traceback
     sys.stderr.write(
         "\n=== SIGSEGV (segmentation fault) caught ===\n"
-        "This is a known PaddlePaddle PIR interpreter crash.\n"
-        "The PIR flags have been set to disable the interpreter.\n"
-        "If this persists, try:\n"
-        "  pip install paddlepaddle==3.0.0 paddleocr==3.0.1\n"
-        "  (or downgrade to paddlepaddle==2.6.2 paddleocr==2.9.1)\n"
+        "requirements.txt already pins paddlepaddle==2.6.2 / paddleocr==2.9.1\n"
+        "(pre-PIR legacy executor) specifically to avoid this crash class.\n"
+        "If you are seeing this, check that the running environment actually\n"
+        "has those versions installed (pip show paddlepaddle paddleocr) rather\n"
+        "than a stale 3.x install.\n"
         f"PID={os.getpid()}, signal={signum}\n"
     )
     traceback.print_stack(frame, file=sys.stderr)
@@ -154,7 +155,9 @@ def _run_warmup(ocr_obj: Any) -> bool:
 
 
 def _init_ocr() -> None:
-    """Attempt to initialise PaddleOCR PP-OCRv5, falling back to PP-OCRv4.
+    """Attempt to initialise PaddleOCR PP-OCRv4 (the flagship model on the
+    pinned paddleocr==2.9.1 / paddlepaddle==2.6.2 line — see requirements.txt
+    for why; PP-OCRv5 does not exist on this line, so it is not attempted).
 
     Runs under _init_lock to prevent race conditions during model initialization.
     Validates model with _run_warmup before marking the service READY.
@@ -214,23 +217,17 @@ def _init_ocr() -> None:
         cand_name = "unknown"
 
         try:
-            cand_ocr = _try_init("PP-OCRv5")
-            cand_name = "PP-OCRv5"
-            logger.info("PP-OCRv5 loaded constructor successfully")
-        except Exception as exc_v5:
-            logger.warning("PP-OCRv5 init failed after retries (%s), falling back to PP-OCRv4", exc_v5)
-            try:
-                cand_ocr = _try_init("PP-OCRv4")
-                cand_name = "PP-OCRv4"
-                logger.info("PP-OCRv4 loaded constructor successfully (fallback)")
-            except Exception as exc_v4:
-                logger.error("Both PP-OCRv5 and PP-OCRv4 failed to initialise: v5=%s, v4=%s", exc_v5, exc_v4)
-                ocr = None
-                MODEL_NAME = "unknown"
-                MODEL_READY = False
-                SERVICE_STATE = ServiceState.FAILED
-                INIT_ERROR = f"PP-OCRv5 error: {exc_v5}; PP-OCRv4 error: {exc_v4}"
-                return
+            cand_ocr = _try_init("PP-OCRv4")
+            cand_name = "PP-OCRv4"
+            logger.info("PP-OCRv4 loaded constructor successfully")
+        except Exception as exc_v4:
+            logger.error("PP-OCRv4 failed to initialise: %s", exc_v4)
+            ocr = None
+            MODEL_NAME = "unknown"
+            MODEL_READY = False
+            SERVICE_STATE = ServiceState.FAILED
+            INIT_ERROR = f"PP-OCRv4 error: {exc_v4}"
+            return
 
         # Perform real inference warmup validation
         if _run_warmup(cand_ocr):
@@ -275,7 +272,7 @@ if SERVICE_STATE != ServiceState.READY:
 
 app = FastAPI(
     title="PaddleOCR Service",
-    description="OCR engine for manhwa/manga recap pipeline using PaddleOCR PP-OCRv5",
+    description="OCR engine for manhwa/manga recap pipeline using PaddleOCR PP-OCRv4",
     version="1.0.0",
 )
 

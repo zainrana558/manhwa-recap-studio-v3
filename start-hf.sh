@@ -21,7 +21,7 @@ cd /app
 echo "[start-hf] Initializing database..."
 bun run db:push 2>&1 || echo "[start-hf] db:push warning (tables may already exist)"
 
-# ---- 2. Start PaddleOCR service (port 3002, PP-OCRv5) --------------------
+# ---- 2. Start PaddleOCR service (port 3002, PP-OCRv4) --------------------
 echo "[start-hf] Starting PaddleOCR service on port 3002..."
 (cd mini-services/paddleocr-service && python3 main.py) &
 OCR_PID=$!

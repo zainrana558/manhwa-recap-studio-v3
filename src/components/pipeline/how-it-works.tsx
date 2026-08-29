@@ -23,8 +23,8 @@ const STEPS = [
   {
     icon: FileText,
     title: "OCR",
-    desc: "PaddleOCR PP-OCRv5 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
-    details: "PP-OCRv5 is the primary transcription engine (+13% accuracy over v4). It runs entirely on-device with no API keys. If OCR quality is low, VLM providers (SiliconFlow, Gemini, Groq) serve as automatic fallback.",
+    desc: "PaddleOCR PP-OCRv4 reads speech bubbles and captions from each panel — fast, local, no API keys needed.",
+    details: "PP-OCRv4 is the primary transcription engine. It runs entirely on-device with no API keys. If OCR quality is low, VLM providers (SiliconFlow, Gemini, Groq) serve as automatic fallback.",
     duration: "~15s/ch",
   },
   {

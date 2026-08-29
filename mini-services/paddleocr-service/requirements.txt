@@ -1,9 +1,16 @@
 # Production target: Python 3.10.4, Oracle Cloud Free Tier CPU-only.
-# PaddleOCR 3.7.0 is retained; PaddlePaddle is aligned to the 3.1.x framework
-# line documented by PaddleOCR 3.x as fully supported while staying close to the
-# prior 3.0.0 pin. Use binary wheels; do not build PaddlePaddle from source on OCI.
-paddleocr==3.7.0
-paddlepaddle==3.1.1
+# Pinned to the pre-PIR 2.x line. paddlepaddle>=3.0's PIR interpreter has a
+# known, still-open upstream SIGSEGV during garbage collection on CPU-only
+# inference (paddle::framework::PirInterpreter::CheckGC — see
+# PaddlePaddle/PaddleOCR#15287); main.py's FLAGS_enable_pir_* env vars try to
+# disable it but do not fully suppress the crash in practice. paddlepaddle
+# 2.6.2 uses the legacy executor only (no PIR path at all), and its
+# constructor kwargs (cpu_threads, enable_mkldnn, use_gpu, det_db_thresh,
+# use_angle_cls) match what main.py already passes — no "Unknown argument"
+# stripping needed. Use binary wheels; do not build PaddlePaddle from source
+# on OCI.
+paddleocr==2.9.1
+paddlepaddle==2.6.2
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.18

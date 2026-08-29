@@ -926,7 +926,7 @@ async function processJob(jobId: string): Promise<void> {
 
   // -----------------------------
   // Phase 2: TRANSCRIBE — read bubble/caption text from each panel.
-  // Strategy: PaddleOCR PP-OCRv5 (PRIMARY, local, no API keys needed) →
+  // Strategy: PaddleOCR PP-OCRv4 (PRIMARY, local, no API keys needed) →
   //           VLM providers (FALLBACK, requires API keys, slower)
   // -----------------------------
   await db.job.update({
@@ -1061,7 +1061,7 @@ async function processJob(jobId: string): Promise<void> {
       let usedMethod = 'unknown'
 
       if (ocrAvailable) {
-        // ── PRIMARY: PaddleOCR PP-OCRv5 (fast, local, no API keys) ──
+        // ── PRIMARY: PaddleOCR PP-OCRv4 (fast, local, no API keys) ──
         await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} ${modeLabel} with PaddleOCR ${ocrModelName}...`)
         try {
           const ocrOutcome = await generateImageNarrationsOCR(imageFiles, (done, total) => {
