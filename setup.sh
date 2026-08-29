@@ -369,6 +369,31 @@ log_info "Installing remaining ML dependencies..."
 pip install --no-deps torch torchvision 2>/dev/null
 pip install -r pipeline/requirements.txt 2>&1 | tail -5
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# OCR service dependencies (RapidOCR PP-OCRv6 primary, PaddleOCR PP-OCRv4
+# fallback) — same venv as above, since both requirements files pin
+# identical numpy/opencv-python-headless ranges specifically so they can
+# coexist here without a second venv.
+#
+# rapidocr is installed with --no-deps as a SEPARATE step, not listed in
+# mini-services/paddleocr-service/requirements.txt itself: rapidocr
+# declares `opencv_python` (non-headless) as a dependency, a different
+# named PyPI package from the pinned opencv-python-headless that both
+# provide the `cv2` import — installing rapidocr normally pulls in a
+# second, conflicting opencv-python package alongside the headless one
+# (confirmed directly: both land in the same site-packages/cv2/
+# directory, and the non-headless build pulls in GUI shared libraries
+# that may not load on a headless server). rapidocr's actual runtime need
+# is just `import cv2`, which opencv-python-headless already provides —
+# its other real dependencies (onnxruntime, omegaconf, colorlog,
+# pyclipper) are already listed directly in
+# mini-services/paddleocr-service/requirements.txt, so this only needs to
+# add rapidocr itself, --no-deps, on top of that.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_info "Installing OCR service dependencies (RapidOCR PP-OCRv6 + PaddleOCR PP-OCRv4 fallback)..."
+pip install -r mini-services/paddleocr-service/requirements.txt 2>&1 | tail -5
+pip install --no-deps rapidocr==3.9.2 2>&1 | tail -3
+
 # FIX #14: Verify critical imports
 log_info "Verifying Python environment..."
 if python3 -c "
@@ -383,6 +408,20 @@ print('  All Python deps OK')
 else
     log_error "Python import verification FAILED — check the output above for missing packages"
     log_error "You may need to run: source $PYTHON_VENV/bin/activate && pip install -r pipeline/requirements.txt"
+    exit 1
+fi
+
+log_info "Verifying OCR engines..."
+if python3 -c "
+import rapidocr; print(f'  rapidocr: {rapidocr.__version__ if hasattr(rapidocr, \"__version__\") else \"installed\"}')
+import paddleocr; print(f'  paddleocr: {paddleocr.__version__}')
+import paddle; print(f'  paddlepaddle: {paddle.__version__}')
+print('  Both OCR engines importable OK')
+"; then
+    log_info "OCR engines verified successfully (RapidOCR primary, PaddleOCR fallback)"
+else
+    log_error "OCR engine import verification FAILED — check the output above"
+    log_error "You may need to run: source $PYTHON_VENV/bin/activate && pip install -r mini-services/paddleocr-service/requirements.txt && pip install --no-deps rapidocr==3.9.2"
     exit 1
 fi
 

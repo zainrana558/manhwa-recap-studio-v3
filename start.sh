@@ -8,6 +8,18 @@ cd "$(dirname "$0")"
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 
+# Make setup.sh's venv (created at $(pwd)/.venv) the one every process
+# this script launches actually uses, regardless of whether the calling
+# shell happened to have it activated already — see the matching block
+# in start-services.sh for the full reasoning (paddleocr-service's start.sh
+# and pipeline-service's spawned python3 calls both silently fall back to
+# bare `python3` otherwise). Safe no-op if this venv doesn't exist yet.
+if [ -x "$(pwd)/.venv/bin/python3" ]; then
+    export PATH="$(pwd)/.venv/bin:$PATH"
+    export VIRTUAL_ENV="$(pwd)/.venv"
+    echo "  (using venv: $(pwd)/.venv)"
+fi
+
 echo "🚀 Starting Manhwa Recap Studio..."
 echo ""
 

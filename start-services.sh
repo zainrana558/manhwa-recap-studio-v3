@@ -25,6 +25,24 @@ if ! flock -w 180 200; then
   exit 1
 fi
 
+# Make setup.sh's venv (created at $PROJECT_DIR/.venv) the one every
+# process this script launches actually uses, regardless of whether the
+# calling shell happened to have it activated already. Without this,
+# paddleocr-service's own start.sh and pipeline-service's spawned
+# `python3` calls for master_pipeline.py (see PYTHON_BIN in
+# mini-services/pipeline-service/lib.ts) both silently fall back to
+# whatever bare `python3` resolves to on PATH — correct if this script
+# was run from a shell where the venv was manually activated first, but
+# broken with no error at all (just missing-import failures downstream)
+# from any other context, e.g. a systemd unit or a fresh SSH session
+# after a reboot. Safe no-op if this venv doesn't exist yet (falls
+# through to whatever's already on PATH, same as before).
+if [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+  export PATH="$PROJECT_DIR/.venv/bin:$PATH"
+  export VIRTUAL_ENV="$PROJECT_DIR/.venv"
+  echo "  (using venv: $PROJECT_DIR/.venv)"
+fi
+
 # See the matching block in start.sh for why this exists: pipeline-service's
 # /internal/* endpoints and its socket.io connection both require
 # PIPELINE_SECRET (checkAuth in mini-services/pipeline-service/index.ts).
