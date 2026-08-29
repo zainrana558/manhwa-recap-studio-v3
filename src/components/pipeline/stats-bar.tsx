@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
 import { Film, BookOpen, ImageIcon, CheckCircle2, Cloud, Sparkles, Clock, Play, Zap, Users, Database, Search } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -26,40 +26,6 @@ const PLATFORM_STATS: PlatformStat[] = [
   { icon: Users, label: "Languages", value: "9+", color: "text-sky-400", barColor: "bg-sky-400" },
   { icon: Database, label: "API Providers", value: "3", color: "text-fuchsia-400", barColor: "bg-fuchsia-400" },
 ];
-
-function AnimatedCounter({ target, duration = 1200 }: { target: number; duration?: number }) {
-  const [display, setDisplay] = useState(0);
-  const rafRef = useRef<number>(0);
-  const startTimeRef = useRef<number | null>(null);
-  const prevTargetRef = useRef<number>(0);
-
-  useEffect(() => {
-    if (target !== prevTargetRef.current) {
-      prevTargetRef.current = target;
-      startTimeRef.current = null;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      const tick = (timestamp: number) => {
-        if (startTimeRef.current === null) startTimeRef.current = timestamp;
-        const elapsed = timestamp - startTimeRef.current;
-        const progress = Math.min(elapsed / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3);
-        const value = Math.round(eased * target);
-        setDisplay(value);
-        if (progress < 1) {
-          rafRef.current = requestAnimationFrame(tick);
-        } else {
-          setDisplay(target);
-        }
-      };
-      rafRef.current = requestAnimationFrame(tick);
-    }
-    return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
-  }, [target, duration]);
-
-  return <span>{display.toLocaleString()}</span>;
-}
 
 function StatCard({ item }: { item: PlatformStat }) {
   const Icon = item.icon;

@@ -266,6 +266,13 @@ export function useJobProgress(jobId: string | null): UseJobProgressResult {
           if (!r.ok) return;
           const data = await r.json();
           if (cancelled || !data) return;
+          // A successful poll means the app is still getting live data from
+          // the server even though the socket transport is down — surface
+          // that as "connected" too, otherwise the UI shows a permanent
+          // "Offline" badge while the job is visibly still updating every
+          // 5s, which is exactly backwards for a tool meant to keep working
+          // unattended (the socket dying doesn't mean the job died).
+          setConnected(true);
           // Only update if the REST data is newer (different progress/message)
           setJob((prev) => {
             if (!prev) return data.job;

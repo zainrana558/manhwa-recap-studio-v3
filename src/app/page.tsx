@@ -26,7 +26,6 @@ import { SettingsDialog } from "@/components/pipeline/settings-dialog";
 import { FeaturesGrid } from "@/components/pipeline/features-grid";
 import { BookmarksSection } from "@/components/pipeline/bookmarks-section";
 import { OnboardingTour } from "@/components/pipeline/onboarding-tour";
-import { Testimonials } from "@/components/pipeline/testimonials";
 import { PipelineStats } from "@/components/pipeline/pipeline-stats";
 import { ActivityFeed } from "@/components/pipeline/activity-feed";
 import { useJobProgress } from "@/hooks/use-job-progress";
@@ -82,6 +81,11 @@ export default function Home() {
     setCurrentJobId(jobId);
     setView("job");
     setHistoryRefresh((n) => n + 1);
+    try {
+      localStorage.setItem("activeJobId", jobId);
+    } catch {
+      // ignore — private browsing / storage disabled
+    }
   }, []);
 
   const handleNewJob = useCallback(() => {
@@ -89,11 +93,64 @@ export default function Home() {
     setSelectedManga(null);
     setView("search");
     setHistoryRefresh((n) => n + 1);
+    try {
+      localStorage.removeItem("activeJobId");
+    } catch {
+      // ignore
+    }
   }, []);
 
   const handleSelectHistoryJob = useCallback((jobId: string) => {
     setCurrentJobId(jobId);
     setView("job");
+    try {
+      localStorage.setItem("activeJobId", jobId);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Jobs keep running server-side whether or not the browser is open —
+  // closing the laptop/tab and coming back should land you back on the job
+  // you were watching (or its finished/errored result), not a blank search
+  // page with the job buried in history. Restore it once on mount.
+  useEffect(() => {
+    let cancelled = false;
+    let savedId: string | null = null;
+    try {
+      savedId = localStorage.getItem("activeJobId");
+    } catch {
+      savedId = null;
+    }
+    if (!savedId) return;
+
+    fetch(`/api/jobs/${savedId}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled) return;
+        if (data?.job) {
+          setCurrentJobId(savedId);
+          setView("job");
+        } else {
+          // Job no longer exists (deleted/DB reset) — clear the stale pointer.
+          try {
+            localStorage.removeItem("activeJobId");
+          } catch {
+            // ignore
+          }
+        }
+      })
+      .catch(() => {
+        // Pipeline/web service unreachable at load time — leave the search
+        // view up rather than getting stuck; the user can navigate to
+        // Job History once the service is back.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // Intentionally run once on mount only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleTrendingPick = useCallback((query: string) => {
@@ -363,10 +420,6 @@ export default function Home() {
             <div className="gradient-separator max-w-4xl mx-auto my-0" />
 
             <PipelineStats />
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <Testimonials />
 
             <div className="gradient-separator max-w-4xl mx-auto my-0" />
 

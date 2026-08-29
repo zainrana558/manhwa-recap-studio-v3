@@ -74,7 +74,7 @@ function exportJobsCsv(jobs: JobDetail[]) {
   const header = ["ID", "Title", "Status", "Progress", "Chapters", "Images", "Voice", "Language", "Created", "Updated"];
   const rows = jobs.map((j) => [
     j.id,
-    `"${(j.mangaTitle || "").replace(/"/g, '""')}",`,
+    `"${(j.mangaTitle || "").replace(/"/g, '""')}"`,
     j.status,
     `${j.progress}%`,
     `${j.doneChapters}/${j.totalChapters}`,
