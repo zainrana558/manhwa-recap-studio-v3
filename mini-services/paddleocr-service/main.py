@@ -603,7 +603,32 @@ def _merge_regions(regions, is_ui_box=False):
 
     for line in lines:
         line_sorted = sorted(line, key=lambda r: r.x_min)
-        line_text = " ".join(_clean_and_normalize_ocr_text(r.text.strip()) for r in line_sorted if r.text.strip())
+        line_parts = []  # type: List[str]
+        prev_region = None
+        for r in line_sorted:
+            t = _clean_and_normalize_ocr_text(r.text.strip())
+            if not t:
+                continue
+            if prev_region is not None:
+                gap = r.x_min - prev_region.x_max
+                char_h = max(1.0, ((r.y_max - r.y_min) + (prev_region.y_max - prev_region.y_min)) / 2.0)
+                # Bold/wide-tracked comic lettering (common in webtoon
+                # dialogue and SFX fonts) makes PaddleOCR's text detector
+                # over-segment single words into one box per glyph. Gluing
+                # every region together with a plain space then spells
+                # words out letter by letter ("H U N T E R"). A real
+                # word-to-word gap is comparable to or wider than a
+                # character's height; letter-level kerning within an
+                # over-segmented word is much tighter — join those with no
+                # space, and only insert a space at a genuine word gap.
+                if gap < char_h * 0.35:
+                    line_parts.append(t)
+                else:
+                    line_parts.append(" " + t)
+            else:
+                line_parts.append(t)
+            prev_region = r
+        line_text = _clean_and_normalize_ocr_text("".join(line_parts))
         if line_text:
             text_parts.append(line_text)
         for r in line_sorted:

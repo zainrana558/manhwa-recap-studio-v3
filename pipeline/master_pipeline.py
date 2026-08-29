@@ -1242,6 +1242,38 @@ def _is_featureless_vfx(arr_gray) -> bool:
     return False
 
 
+def _crops_are_near_duplicate(arr_gray_a, arr_gray_b, corr_thresh: float = 0.985) -> bool:
+    """Cheap perceptual check for whether two panel crops are near-identical.
+
+    Catches a single panel that a gutter cut has spuriously sliced into two
+    (or more) near-duplicate pieces — e.g. a bright VFX/light-aura band
+    inside one continuous panel getting misread as an inter-panel gutter —
+    which otherwise ships as two adjacent frames showing what looks like
+    the same panel twice, each padded out to MIN_FRAME_DURATION regardless
+    of how little unique content (or narration) it actually has.
+
+    Downsamples both crops to a small fixed size and compares via
+    normalized cross-correlation, which is robust to the crops' differing
+    source dimensions and tolerant of the minor rescale artifacts that
+    fixed-size downsampling introduces.
+    """
+    if arr_gray_a is None or arr_gray_b is None or arr_gray_a.size == 0 or arr_gray_b.size == 0:
+        return False
+    small_a = cv2.resize(arr_gray_a, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small_b = cv2.resize(arr_gray_b, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    a = small_a - small_a.mean()
+    b = small_b - small_b.mean()
+    denom = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
+    if denom < 1e-6:
+        # Both crops are essentially flat/uniform — treat as duplicate only
+        # if they're also close in brightness (two different flat colors,
+        # e.g. one white gutter fragment and one black panel, are not the
+        # same content).
+        return bool(abs(float(small_a.mean()) - float(small_b.mean())) < 3.0)
+    corr = float((a * b).sum() / denom)
+    return corr >= corr_thresh
+
+
 def _should_skip_panel(arr_gray) -> bool:
     """Determine if a panel should be skipped (not included in the video).
 
@@ -1678,9 +1710,21 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         else:
                             merged_panel_boxes.append((px, py, pw, ph))
                     else:
-                        if merged_panel_boxes and _is_featureless_vfx(
-                            cv2.cvtColor(np.array(img.crop((merged_panel_boxes[-1][0], merged_panel_boxes[-1][1], merged_panel_boxes[-1][0] + merged_panel_boxes[-1][2], merged_panel_boxes[-1][1] + merged_panel_boxes[-1][3]))), cv2.COLOR_RGB2GRAY)
-                        ):
+                        prev_box = merged_panel_boxes[-1] if merged_panel_boxes else None
+                        prev_crop_gray = None
+                        if prev_box is not None:
+                            prev_crop_gray = cv2.cvtColor(
+                                np.array(img.crop((prev_box[0], prev_box[1], prev_box[0] + prev_box[2], prev_box[1] + prev_box[3]))),
+                                cv2.COLOR_RGB2GRAY,
+                            )
+                        if prev_box is not None and _is_featureless_vfx(prev_crop_gray):
+                            prev_x, prev_y, prev_w, prev_h = merged_panel_boxes.pop()
+                            new_y1 = min(prev_y, py)
+                            new_y2 = max(prev_y + prev_h, py + ph)
+                            new_x1 = min(prev_x, px)
+                            new_x2 = max(prev_x + prev_w, px + pw)
+                            merged_panel_boxes.append((new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1))
+                        elif prev_box is not None and _crops_are_near_duplicate(prev_crop_gray, crop_candidate_gray):
                             prev_x, prev_y, prev_w, prev_h = merged_panel_boxes.pop()
                             new_y1 = min(prev_y, py)
                             new_y2 = max(prev_y + prev_h, py + ph)
