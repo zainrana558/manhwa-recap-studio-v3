@@ -357,7 +357,18 @@ export async function searchAllManga(
       seen.set(key, m);
     }
   }
-  const deduped: MangadexManga[] = [...seen.values()];
+  // MAL/AniList are metadata-only catalogs — neither hosts scrapeable manga
+  // pages, so a result surviving the dedup above (i.e. no scrapeable source
+  // matched the same title) is a dead end: selecting it and starting a job
+  // always fails at the scrape phase (getSourceFromId has no mal-/anilist-
+  // case, by design — there's nothing to scrape). Scrapeable sources are
+  // deduped first (see the loop above), so any MAL/AniList entry that's
+  // *not* filtered out here already lost its slot to a real scrapeable
+  // result for the same title; this only removes the entries with no
+  // scrapeable match at all, rather than hiding MAL/AniList results wholesale.
+  const deduped: MangadexManga[] = [...seen.values()].filter(
+    (m) => m.source !== "mal" && m.source !== "anilist"
+  );
 
   // Sort: by relevance to the query first (exact title match > starts-with >
   // contains > no match), then by source priority (scrapeable first).

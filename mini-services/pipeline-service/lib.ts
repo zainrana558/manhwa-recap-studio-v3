@@ -313,18 +313,21 @@ export function filterJunkTextPanels<T extends { image: string; text: string }>(
 
 // --- Source dispatchers ---
 
-export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans'
+export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex' | 'mangapill' | 'toonily'
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('mh-')) return 'mangahere'
   if (id.startsWith('ff-')) return 'fanfox'
   if (id.startsWith('wt-')) return 'webtoons'
   if (id.startsWith('as-')) return 'asurascans'
+  if (id.startsWith('md-')) return 'mangadex'
+  if (id.startsWith('mp-')) return 'mangapill'
+  if (id.startsWith('tl-')) return 'toonily'
   return null
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-)/, '')
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-)/, '')
 }
 
 // --- MangaHere (mangahere.cc) ---
@@ -921,6 +924,290 @@ export async function downloadAsuraScansImage(
   await fs.writeFile(destPath, buf)
 }
 
+// --- MangaDex (api.mangadex.org) ---
+//
+// The search UI (src/lib/scrapers.ts, used by /api/search) has offered
+// MangaDex/MangaPill/Toonily results for a while, but this file — the one
+// actually used once a job starts scraping — never got matching support:
+// getSourceFromId() below returned null for md-/mp-/tl- ids, so every job
+// created from those 3 sources failed 100% of the time at the scrape phase.
+// Ported from the already-working src/lib/scrapers.ts implementations
+// (same requests/parsing, adapted to this file's return shapes).
+
+/** Fetch the chapter list for a manga from MangaDex's official JSON API. */
+export async function fetchMangaDexChapters(
+  mangaId: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  // MangaDex caps `limit` at 500 per request — paginate via `offset` so a
+  // long-running series (500+ English chapters) isn't silently truncated.
+  const allData: Array<{
+    id: string
+    attributes: {
+      chapter?: string
+      title?: string | null
+      translatedLanguage?: string
+      externalUrl?: string | null
+      pages?: number
+    }
+  }> = []
+  let offset = 0
+  const pageLimit = 500
+  const maxPages = 20 // 10,000 chapters — far beyond any real manga
+  for (let page = 0; page < maxPages; page++) {
+    const url = `https://api.mangadex.org/manga/${mangaId}/feed?translatedLanguage[]=en&order[chapter]=asc&limit=${pageLimit}&offset=${offset}&contentRating[]=safe&contentRating[]=suggestive`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`MangaDex chapters ${res.status} for ${mangaId}`)
+    const pageData = (await res.json()) as {
+      data: typeof allData
+      total?: number
+    }
+    allData.push(...pageData.data)
+    const total = pageData.total ?? allData.length
+    offset += pageData.data.length
+    if (pageData.data.length === 0 || offset >= total) break
+  }
+
+  const chapters: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  for (const ch of allData) {
+    // Skip chapters that only have external URLs (DMCA'd/licensed) — we
+    // can't scrape images for those.
+    if (ch.attributes.externalUrl) continue
+    chapters.push({
+      mangadexId: ch.id,
+      chapterNum: ch.attributes.chapter ?? String(chapters.length + 1),
+      title: ch.attributes.title ?? null,
+      language: ch.attributes.translatedLanguage ?? 'en',
+      pageCount: ch.attributes.pages ?? 0,
+      external: false,
+    })
+  }
+
+  if (chapters.length === 0) {
+    throw new Error('MangaDex: no readable chapters (all external/licensed) for ' + mangaId)
+  }
+
+  return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+}
+
+/** Fetch page image URLs for a MangaDex chapter via the at-home server API. */
+export async function fetchMangaDexChapterImages(
+  _mangaSlug: string,
+  chapterId: string,
+): Promise<string[]> {
+  const url = `https://api.mangadex.org/at-home/server/${chapterId}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`MangaDex images ${res.status} for chapter ${chapterId}`)
+  const data = (await res.json()) as { baseUrl: string; chapter: { hash: string; data: string[] } }
+  const images = data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`)
+  if (images.length === 0) {
+    throw new Error(`MangaDex returned no images for chapter ${chapterId}`)
+  }
+  return images
+}
+
+/** Download a MangaDex CDN image — requires a mangadex.org Referer. */
+export async function downloadMangaDexImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { Referer: 'https://mangadex.org/' } })
+  if (!res.ok) throw new Error(`MangaDex image download ${res.status}: ${imageUrl}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  await fs.writeFile(destPath, buf)
+}
+
+// --- MangaPill (mangapill.com) ---
+
+const MANGAPILL_UA = 'Mozilla/5.0'
+const MANGAPILL_BASE = 'https://mangapill.com'
+
+/** Fetch the chapter list for a manga from MangaPill. */
+export async function fetchMangaPillChapters(
+  slug: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const url = `${MANGAPILL_BASE}/manga/${slug}`
+  const res = await fetch(url, { headers: { 'User-Agent': MANGAPILL_UA, Referer: `${MANGAPILL_BASE}/` } })
+  if (!res.ok) throw new Error(`MangaPill chapters ${res.status} for ${slug}`)
+  const html = await res.text()
+
+  const chapters: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  const chapterRegex = /href="\/chapters\/[^"]*"/g
+  const matches = html.match(chapterRegex) || []
+  for (const m of matches) {
+    const href = m.replace(/href="|"/g, '')
+    const chapterId = href.split('/').pop() || ''
+    const numMatch = chapterId.match(/chapter-(\d+(?:\.\d+)?)/)
+    const chapterNum = numMatch ? numMatch[1] : String(chapters.length + 1)
+    chapters.push({ mangadexId: chapterId, chapterNum, title: null, language: 'en', pageCount: 0, external: false })
+  }
+
+  if (chapters.length === 0) {
+    throw new Error(`MangaPill returned no chapters for ${slug}`)
+  }
+
+  return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+}
+
+/** Fetch page image URLs for a MangaPill chapter (CDN URLs embedded in the chapter page HTML). */
+export async function fetchMangaPillChapterImages(
+  _slug: string,
+  chapterId: string,
+): Promise<string[]> {
+  const url = `${MANGAPILL_BASE}/chapters/${chapterId}`
+  const res = await fetch(url, { headers: { 'User-Agent': MANGAPILL_UA, Referer: `${MANGAPILL_BASE}/` } })
+  if (!res.ok) throw new Error(`MangaPill images ${res.status} for chapter ${chapterId}`)
+  const html = await res.text()
+
+  const images: string[] = []
+  const imgRegex = /(?:data-src|src)="(https:\/\/cdn\.readdetectiveconan\.com\/file\/mangap\/[^"]+)"/g
+  let match: RegExpExecArray | null
+  while ((match = imgRegex.exec(html)) !== null) {
+    images.push(match[1])
+  }
+
+  if (images.length === 0) {
+    throw new Error(`MangaPill returned no images for chapter ${chapterId}`)
+  }
+
+  return images
+}
+
+/** Download a MangaPill CDN image. */
+export async function downloadMangaPillImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { 'User-Agent': MANGAPILL_UA, Referer: `${MANGAPILL_BASE}/` } })
+  if (!res.ok) throw new Error(`MangaPill image download ${res.status}: ${imageUrl}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  await fs.writeFile(destPath, buf)
+}
+
+// --- Toonily (toonily.com, Madara WordPress theme) ---
+
+const TOONILY_UA = 'Mozilla/5.0'
+const TOONILY_BASE = 'https://toonily.com'
+
+/** Fetch the chapter list for a manga from Toonily. */
+export async function fetchToonilyChapters(
+  slug: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const url = `${TOONILY_BASE}/serie/${slug}/`
+  const res = await fetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  if (!res.ok) throw new Error(`Toonily chapters ${res.status} for ${slug}`)
+  const html = await res.text()
+
+  const chapters: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  const chapterRegex = /href="(https:\/\/toonily\.com\/[^"]+\/chapter-(\d+(?:\.\d+)?)\/?)"/g
+  const seen = new Set<string>()
+  let match: RegExpExecArray | null
+  while ((match = chapterRegex.exec(html)) !== null) {
+    const chapterUrl = match[1]
+    const chapterNum = match[2]
+    if (seen.has(chapterNum)) continue
+    seen.add(chapterNum)
+    const idMatch = chapterUrl.match(/\/([^/]+)\/chapter-/)
+    const chapterId = idMatch ? `${idMatch[1]}-ch-${chapterNum}` : chapterNum
+    chapters.push({ mangadexId: chapterId, chapterNum, title: null, language: 'en', pageCount: 0, external: false })
+  }
+  // Toonily lists newest-first; reverse to oldest-first like the other sources.
+  chapters.reverse()
+
+  if (chapters.length === 0) {
+    throw new Error(`Toonily returned no chapters for ${slug}`)
+  }
+
+  return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+}
+
+/** Fetch page image URLs for a Toonily chapter from its reader page. */
+export async function fetchToonilyChapterImages(
+  slug: string,
+  chapterId: string,
+): Promise<string[]> {
+  // chapterId was built as "{slug-part}-ch-{num}" in fetchToonilyChapters —
+  // recover the chapter number to rebuild the reader URL.
+  const numMatch = chapterId.match(/-ch-(\d+(?:\.\d+)?)$/)
+  const chapterNum = numMatch ? numMatch[1] : chapterId
+  const url = `${TOONILY_BASE}/serie/${slug}/chapter-${chapterNum}/`
+  const res = await fetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  if (!res.ok) throw new Error(`Toonily images ${res.status} for ${slug}/chapter-${chapterNum}`)
+  const html = await res.text()
+
+  // Madara theme: images are in <div class="reading-content"> with
+  // <img data-src="...">. Ported verbatim from the working implementation
+  // in src/lib/scrapers.ts (getToonilyImages) — do not narrow the host
+  // pattern, Toonily serves page images from a CDN, not toonily.com itself.
+  const images: string[] = []
+  const imgRegex = /data-src="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi
+  let match: RegExpExecArray | null
+  while ((match = imgRegex.exec(html)) !== null) {
+    const imgUrl = match[1].trim()
+    // Skip non-content images (logos, icons, avatars).
+    if (imgUrl.includes('logo') || imgUrl.includes('icon') || imgUrl.includes('avatar')) continue
+    images.push(imgUrl)
+  }
+
+  if (images.length === 0) {
+    throw new Error(`Toonily returned no images for ${slug}/chapter-${chapterNum}`)
+  }
+
+  return images
+}
+
+/** Download a Toonily image. */
+export async function downloadToonilyImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  if (!res.ok) throw new Error(`Toonily image download ${res.status}: ${imageUrl}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  await fs.writeFile(destPath, buf)
+}
+
 // --- Unified dispatchers ---
 
 export async function fetchChaptersForSource(
@@ -938,6 +1225,12 @@ export async function fetchChaptersForSource(
       return fetchWebtoonsChapters(parseInt(slug, 10), chapterLimit)
     case 'asurascans':
       return fetchAsuraScansChapters(slug, chapterLimit)
+    case 'mangadex':
+      return fetchMangaDexChapters(slug, chapterLimit)
+    case 'mangapill':
+      return fetchMangaPillChapters(slug, chapterLimit)
+    case 'toonily':
+      return fetchToonilyChapters(slug, chapterLimit)
   }
 }
 
@@ -959,6 +1252,12 @@ export async function fetchImagesForSource(
       )
     case 'asurascans':
       return fetchAsuraScansChapterImages(slug, chapterSlug)
+    case 'mangadex':
+      return fetchMangaDexChapterImages(slug, chapterSlug)
+    case 'mangapill':
+      return fetchMangaPillChapterImages(slug, chapterSlug)
+    case 'toonily':
+      return fetchToonilyChapterImages(slug, chapterSlug)
   }
 }
 
@@ -976,6 +1275,12 @@ export async function downloadImageForSource(
       return downloadWebtoonsImage(imageUrl, destPath)
     case 'asurascans':
       return downloadAsuraScansImage(imageUrl, destPath)
+    case 'mangadex':
+      return downloadMangaDexImage(imageUrl, destPath)
+    case 'mangapill':
+      return downloadMangaPillImage(imageUrl, destPath)
+    case 'toonily':
+      return downloadToonilyImage(imageUrl, destPath)
   }
 }
 
@@ -1836,10 +2141,6 @@ async function narrateImageBatch(imgPaths: string[], batchStart: number): Promis
 // throughput and halve the transcription time.
 // ---------------------------------------------------------------------------
 
-export function isGeminiConfigured(): boolean {
-  return Boolean(process.env.GEMINI_API_KEY)
-}
-
 /**
  * Same interface as narrateImageBatch, but calls Google Gemini 2.0 Flash
  * via its REST API. Reuses the same prompt + cache + parseBatchResponse so
@@ -1998,10 +2299,6 @@ async function narrateImageBatchGemini(imgPaths: string[], batchStart: number): 
 // Scout). Groq's LPU inference is purpose-built for speed — typically 3-5x
 // faster than cloud GPU providers for the same model size.
 // ---------------------------------------------------------------------------
-
-export function isGroqVlmConfigured(): boolean {
-  return Boolean(process.env.GROQ_API_KEY)
-}
 
 /**
  * Same interface as narrateImageBatch, but calls Groq's vision model via its
@@ -2162,16 +2459,6 @@ async function narrateImageBatchGroq(imgPaths: string[], batchStart: number): Pr
 // free vision models. Uses OpenAI-compatible API format.
 // ---------------------------------------------------------------------------
 
-export function isOpenRouterVlmConfigured(): boolean {
-  return Boolean(process.env.OPENROUTER_API_KEY)
-}
-
-export function isOllamaConfigured(): boolean {
-  // Ollama is "configured" if OLLAMA_BASE_URL is set (or default localhost) and
-  // we don't need an API key — but we check if it's actually reachable later.
-  const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
-  return Boolean(baseUrl)
-}
 
 // OLLAMA VLM — local inference via Ollama's OpenAI-compatible API.
 // Uses a vision-language model (e.g. llava:7b) to transcribe panel text.

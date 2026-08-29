@@ -19,8 +19,10 @@ interface ChapterListItem {
 /**
  * GET /api/manga/{id}?lang={language}
  *
- * The id is prefixed with the source: "mh-{slug}", "ff-{slug}", or "wt-{titleNo}".
- * Returns manga metadata + chapter list from the appropriate scraping source.
+ * The id is prefixed with the source: mh- (MangaHere), ff- (FanFox),
+ * wt- (Webtoons), as- (AsuraScans), md- (MangaDex), mp- (MangaPill), or
+ * tl- (Toonily). Returns manga metadata + chapter list from the
+ * appropriate scraping source.
  */
 export async function GET(
   _req: NextRequest,
@@ -38,7 +40,7 @@ export async function GET(
     const source = getSourceFromId(id);
     if (!source) {
       return NextResponse.json(
-        { error: `Invalid manga id. Expected prefix: mh-, ff-, or wt-. Got: ${id}` },
+        { error: `Invalid manga id. Expected prefix: mh-, ff-, wt-, as-, md-, mp-, or tl-. Got: ${id}` },
         { status: 400 }
       );
     }
@@ -64,6 +66,10 @@ export async function GET(
       mangahere: `https://www.mangahere.cc/manga/${slug}/`,
       fanfox: `https://fanfox.net/manga/${slug}/`,
       webtoons: `https://www.webtoons.com/en/fantasy/_/list?title_no=${slug}`,
+      asurascans: `https://asurascans.com/series/${slug}/`,
+      mangadex: `https://mangadex.org/title/${slug}`,
+      mangapill: `https://mangapill.com/manga/${slug}`,
+      toonily: `https://toonily.com/serie/${slug}/`,
     };
 
     const manga = {

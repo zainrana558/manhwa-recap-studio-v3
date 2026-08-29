@@ -69,9 +69,7 @@ model Job {
   autoArchive   Boolean  @default(false)
   voice       String    @default("en-US-AndrewNeural")
   chapterLimit Int      @default(0)
-  chapterStart Int      @default(1)
-  chapterEnd   Int      @default(0)
-  translate   Boolean   @default(true)
+  translate   Boolean   @default(false)
   bgmPath     String?
   useBgm      Boolean   @default(true)
   createdAt   DateTime  @default(now())
