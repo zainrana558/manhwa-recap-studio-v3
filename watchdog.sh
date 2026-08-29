@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # Lightweight process watchdog for the 3 Manhwa Recap Studio services.
 #
-# start-services.sh only does a one-shot start with no ongoing supervision,
-# so a native crash — most notably the known PaddleOCR PIR-interpreter
-# SIGSEGV (see the crash-mitigation comment at the top of
+# start.sh only does a one-shot start with no ongoing supervision, so a
+# native crash — most notably the known PaddleOCR PIR-interpreter SIGSEGV
+# (see the crash-mitigation comment at the top of
 # mini-services/paddleocr-service/main.py) — killed OCR permanently until a
-# person noticed the pipeline was stuck and reran start-services.sh by hand.
+# person noticed the pipeline was stuck and reran start.sh by hand.
 #
 # This loop polls each service and restarts it in place when it's down,
 # with per-service exponential backoff so a service that's crash-looping on
 # every request doesn't get restarted in a tight, CPU-burning loop.
 #
 # Usage: setsid bash watchdog.sh > /tmp/watchdog.log 2>&1 &
-# (start-services.sh launches this automatically after all 3 services are
+# (start.sh launches this automatically after all 3 services are
 # confirmed up.)
 
 set -u
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# LOG_DIR can be overridden by whichever launcher starts this (start.sh uses
-# "$PROJECT_DIR/logs"; start-services.sh uses "/tmp") so restarted services'
-# logs land in the same place the rest of that launcher's logs already do.
 LOG_DIR="${WATCHDOG_LOG_DIR:-$PROJECT_DIR/logs}"
 mkdir -p "$LOG_DIR" 2>/dev/null
 CHECK_INTERVAL_SEC=15

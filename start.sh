@@ -1,23 +1,60 @@
 #!/bin/bash
-# start.sh — Starts all services on Oracle Cloud VM.
-# Next.js (port 3000) + pipeline-service (port 3001) + Caddy (port 80)
+# start.sh — the ONE script that starts everything on Oracle Cloud VM:
+# PaddleOCR (RapidOCR primary + PaddleOCR fallback, port 3002) +
+# pipeline-service (port 3001) + Next.js (port 3000) + watchdog.
+#
+# This used to be two separate, overlapping scripts (start.sh and
+# start-services.sh) with different levels of robustness in different
+# areas — start.sh had the TTS/OCR dependency bootstrap and watchdog
+# launch, start-services.sh had more robust process killing and
+# readiness polling. Merged into this single script so there's exactly
+# one way to start the stack and nothing can drift between two copies of
+# similar logic again. install-systemd.sh's unit file calls this script
+# by name; start-services.sh has been removed.
 
 set -e
 cd "$(dirname "$0")"
+PROJECT_DIR="$(pwd)"
+LOG_DIR="$PROJECT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+# Guard against two overlapping invocations racing each other. Real-world
+# trigger seen in production: a user rapid-clicking "retry" on a stuck job
+# while services were still coming up — each click can independently
+# trigger a service-start attempt, and two copies of this script running
+# at once both try to kill/rebind the same ports, leaving one instance's
+# process orphaned/zombied and bound to a port while the other believes
+# it owns that port ("address already in use" fighting a stale process,
+# seen directly in production logs). flock serializes the whole script
+# body: a second invocation waits for the first to finish instead of
+# interleaving kill/start calls with it. Bounded wait, not indefinite, so
+# a genuinely wedged first instance doesn't hang every later caller
+# forever.
+LOCK_FILE="$PROJECT_DIR/.start-services.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -w 180 200; then
+    echo "❌ Another start.sh is already running and didn't finish within 180s — aborting to avoid racing it. Check for a wedged process, or just wait and retry." >&2
+    exit 1
+fi
 
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 
-# Make setup.sh's venv (created at $(pwd)/.venv) the one every process
-# this script launches actually uses, regardless of whether the calling
-# shell happened to have it activated already — see the matching block
-# in start-services.sh for the full reasoning (paddleocr-service's start.sh
-# and pipeline-service's spawned python3 calls both silently fall back to
-# bare `python3` otherwise). Safe no-op if this venv doesn't exist yet.
-if [ -x "$(pwd)/.venv/bin/python3" ]; then
-    export PATH="$(pwd)/.venv/bin:$PATH"
-    export VIRTUAL_ENV="$(pwd)/.venv"
-    echo "  (using venv: $(pwd)/.venv)"
+# Make setup.sh's venv (created at $PROJECT_DIR/.venv) the one every
+# process this script launches actually uses, regardless of whether the
+# calling shell happened to have it activated already. Without this,
+# paddleocr-service's own start.sh and pipeline-service's spawned
+# `python3` calls for master_pipeline.py (see PYTHON_BIN in
+# mini-services/pipeline-service/lib.ts) both silently fall back to
+# whatever bare `python3` resolves to on PATH — correct if this script
+# was run from a shell where the venv was manually activated first, but
+# broken with no error at all (just missing-import failures downstream)
+# from any other context, e.g. a systemd unit or a fresh SSH session
+# after a reboot. Safe no-op if this venv doesn't exist yet.
+if [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+    export PATH="$PROJECT_DIR/.venv/bin:$PATH"
+    export VIRTUAL_ENV="$PROJECT_DIR/.venv"
+    echo "  (using venv: $PROJECT_DIR/.venv)"
 fi
 
 echo "🚀 Starting Manhwa Recap Studio..."
@@ -38,11 +75,11 @@ echo ""
 # ═══════════════════════════════════════════════════════════════════════════
 echo "🔧 Checking pipeline dependencies..."
 
-PIPER_VOICE_DIR="$(pwd)/pipeline/voices"
+PIPER_VOICE_DIR="$PROJECT_DIR/pipeline/voices"
 PIPER_VOICE_NAME="en_US-ryan-high"
 PIPER_VOICE_MODEL_PATH="$PIPER_VOICE_DIR/${PIPER_VOICE_NAME}.onnx"
 
-# --- System packages: eSpeak-NG (TTS fallback) + Tesseract (OCR fallback) ---
+# --- System packages: eSpeak-NG (TTS fallback) + Tesseract (OCR last-resort fallback) ---
 _missing_pkgs=()
 command -v espeak-ng >/dev/null 2>&1 || _missing_pkgs+=("espeak-ng")
 command -v tesseract >/dev/null 2>&1 || _missing_pkgs+=("tesseract-ocr")
@@ -85,7 +122,7 @@ fi
 # libpiper_phonemize, and libonnxruntime — zero Python involved), which
 # sidesteps this entirely and works regardless of which Python the box
 # happens to have. That's what this installs instead.
-PIPER_DIR="$(pwd)/pipeline/piper"
+PIPER_DIR="$PROJECT_DIR/pipeline/piper"
 PIPER_BIN="$PIPER_DIR/piper/piper"
 PIPER_ARCH="$(uname -m)"
 case "$PIPER_ARCH" in
@@ -141,18 +178,6 @@ fi
 
 echo ""
 
-# Kill any existing processes
-fuser -k 3000/tcp 2>/dev/null || true
-fuser -k 3002/tcp 2>/dev/null || true
-pkill -f "pipeline-service" 2>/dev/null || true
-pkill -f "index.ts" 2>/dev/null || true
-sleep 2
-
-# C8/C9/C16 FIX: Use dynamic project dir instead of hardcoded path
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="$PROJECT_DIR/logs"
-mkdir -p "$LOG_DIR"
-
 # ═══════════════════════════════════════════════════════════════════════════
 # SHARED PIPELINE_SECRET
 #
@@ -177,75 +202,190 @@ fi
 export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
 export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
 
-# Start paddleocr-service (port 3002)
-echo "▶ Starting paddleocr-service (port 3002)..."
-cd mini-services/paddleocr-service
-nohup bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 &
+# ═══════════════════════════════════════════════════════════════════════════
+# PROCESS MANAGEMENT HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+kill_service() {
+    # Plain `sleep 1` after pkill isn't reliable: uvicorn/bun install SIGTERM
+    # handlers for graceful shutdown, so a process mid-request (or mid-init,
+    # once past module load) can take longer than 1s to actually release its
+    # port -- the next step then binds too early, the new process dies on
+    # "address already in use", and the OLD process silently keeps serving
+    # (exactly what happened on this box: health checks kept answering from
+    # a stale process while the new one's log showed nothing but a bind
+    # error). Poll until the process is actually gone instead of guessing.
+    #
+    # Every pkill/kill below ends in `|| true`: under this script's `set -e`,
+    # pkill returns 1 (and would otherwise abort the whole script) whenever
+    # there's simply nothing matching to kill -- the normal case on a fresh
+    # start or after a clean shutdown. Confirmed directly: without `|| true`
+    # here, the very first call to this function silently killed the entire
+    # script on any run where nothing was already running.
+    local pattern="$1"
+    pkill -f "$pattern" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        pgrep -f "$pattern" > /dev/null || return 0
+        sleep 0.5
+    done
+    # Still alive after 10s of SIGTERM -- force it so we don't proceed with
+    # two processes fighting over the same port.
+    pkill -9 -f "$pattern" 2>/dev/null || true
+    sleep 1
+}
+
+kill_port() {
+    # kill_service matches by process command-line pattern, which silently
+    # misses anything started with a slightly different invocation (a
+    # different interpreter path, an old checkout, a leftover from before a
+    # refactor). Whatever is actually bound to the port is unambiguous --
+    # use that as the ground truth instead of guessing a name pattern.
+    local port="$1"
+    local pids
+    pids=$(ss -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [ -n "$pids" ]; then
+        echo "  (killing stale process(es) on port $port: $pids)"
+        kill -9 $pids 2>/dev/null || true
+    fi
+    for _ in $(seq 1 20); do
+        ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" || return 0
+        sleep 0.5
+    done
+}
+
+echo "=== Starting Manhwa Recap Studio services ==="
+
+# ─────────────────────────────────────────────────────────────────────────
+# 1. PaddleOCR service (port 3002) — RapidOCR PP-OCRv6 primary,
+#    PaddleOCR PP-OCRv4 fallback (see mini-services/paddleocr-service/main.py)
+# ─────────────────────────────────────────────────────────────────────────
+kill_service "uvicorn main:app"
+kill_service "python3 main.py"
+kill_port 3002
+echo "[1/3] Starting PaddleOCR on port 3002..."
+cd "$PROJECT_DIR/mini-services/paddleocr-service"
+# Go through this service's own start.sh, not `python3 main.py` directly —
+# that nested start.sh binds uvicorn to 127.0.0.1 only ("C16 FIX": external
+# access should go through Caddy). Calling main.py directly binds 0.0.0.0
+# (see its own `if __name__ == "__main__"` block), exposing OCR publicly
+# with no auth.
+setsid bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
 PADDLEOCR_PID=$!
-cd ../..
-sleep 3
+cd "$PROJECT_DIR"
+# Poll for real readiness instead of a fixed sleep + a substring grep that
+# matches "ready":false as happily as "ready":true. Model init (RapidOCR's
+# ONNX warmup, or PaddleOCR's self-healing kwarg retries / a cold model
+# download) can legitimately take longer than a fixed few seconds, so give
+# it a real timeout instead of a guess.
+ready=0
+for _ in $(seq 1 60); do
+    if curl -s http://localhost:3002/health | grep -q '"ready":[[:space:]]*true'; then
+        ready=1
+        break
+    fi
+    sleep 2
+done
+if [ "$ready" = "1" ]; then
+    echo "  ✅ PaddleOCR ready (PID: $PADDLEOCR_PID)"
+else
+    echo "  ❌ PaddleOCR failed - check $LOG_DIR/paddleocr.log"
+fi
 
-# Start pipeline-service (port 3001)
-echo "▶ Starting pipeline-service (port 3001)..."
-cd mini-services/pipeline-service
-nohup bun run start > "$LOG_DIR/pipeline.log" 2>&1 &
+# ─────────────────────────────────────────────────────────────────────────
+# 2. Pipeline service (port 3001)
+# ─────────────────────────────────────────────────────────────────────────
+kill_service "bun index.ts"
+kill_port 3001
+echo "[2/3] Starting Pipeline on port 3001..."
+cd "$PROJECT_DIR/mini-services/pipeline-service"
+setsid bun run start > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null &
 PIPELINE_PID=$!
-cd ../..
+cd "$PROJECT_DIR"
+ready=0
+for _ in $(seq 1 20); do
+    if curl -s http://localhost:3001/internal/health 2>/dev/null | grep -q "ok"; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" = "1" ]; then
+    echo "  ✅ Pipeline-service running (PID: $PIPELINE_PID)"
+else
+    echo "  ❌ Pipeline-service failed - check $LOG_DIR/pipeline.log"
+fi
 
-# Start Next.js (port 3000)
-echo "▶ Starting Next.js (port 3000)..."
+# ─────────────────────────────────────────────────────────────────────────
+# 3. Next.js (port 3000)
+# ─────────────────────────────────────────────────────────────────────────
+kill_service "server.js"
+kill_port 3000
+echo "[3/3] Starting Next.js on port 3000..."
+cd "$PROJECT_DIR"
+
 # Clear stale .next build cache to fix "Failed to find Server Action" errors.
-# The production build may contain action IDs from a previous code version;
-# rebuilding ensures the action registry matches current source. Checking
-# only "does server.js exist at all" misses the common case here — a
-# `git pull` that changed source without rebuilding — so compare against
-# the checked-out commit instead: any commit change means the build must
-# be regenerated, not just "does a build exist at all".
+# This happens when the production build has a server-action registry that
+# no longer matches the current source (actions added/removed since last
+# build). Checking only "does server.js exist at all" misses the common
+# case here — a `git pull` that changed source without rebuilding — so
+# compare against the checked-out commit instead: any commit change means
+# source may have moved and the build must be regenerated, not just "does
+# a build exist at all".
 CURRENT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
 BUILD_STAMP_FILE=".next/standalone/.build-commit"
 NEED_BUILD=0
 if [ ! -f ".next/standalone/server.js" ]; then
     NEED_BUILD=1
-    echo "  ⚠️  .next/standalone/server.js missing — building..."
+    echo "  .next/standalone/server.js not found — building..."
 elif [ -n "$CURRENT_COMMIT" ] && [ "$(cat "$BUILD_STAMP_FILE" 2>/dev/null)" != "$CURRENT_COMMIT" ]; then
     NEED_BUILD=1
-    echo "  ⚠️  .next build is stale (source changed since last build) — rebuilding..."
+    echo "  .next build is stale (source changed since last build) — rebuilding..."
 fi
 if [ "$NEED_BUILD" = "1" ]; then
     rm -rf .next
-    bun run build > "$LOG_DIR/nextjs-build.log" 2>&1
-    if [ $? -ne 0 ]; then
-        echo "  ❌ Next.js build failed — check $LOG_DIR/nextjs-build.log"
+    # `if !` (not a bare statement + separate `$?` check) is required here
+    # under this script's `set -e`: a bare failing `bun run build` would
+    # abort the whole script immediately, before ever reaching a
+    # subsequent `if [ $? -ne 0 ]` check.
+    if ! bun run build > "$LOG_DIR/nextjs-build.log" 2>&1; then
+        echo "  ⚠️  Build failed — check $LOG_DIR/nextjs-build.log"
     else
-        echo "  ✅ Next.js build succeeded"
+        echo "  ✅ Build succeeded"
         [ -n "$CURRENT_COMMIT" ] && mkdir -p "$(dirname "$BUILD_STAMP_FILE")" && echo "$CURRENT_COMMIT" > "$BUILD_STAMP_FILE"
     fi
 fi
 # H2 FIX: Bind Next.js to localhost only (Caddy proxies externally)
-HOSTNAME=127.0.0.1 nohup bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 &
+HOSTNAME=127.0.0.1 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
 NEXT_PID=$!
-
-# Wait for services to start
-sleep 5
-
-# Check if they're running
-if curl -s http://localhost:3001/internal/health | grep -q "ok"; then
-    echo "✅ Pipeline-service is running (PID: $PIPELINE_PID)"
+# Real HTTP status check with a poll loop (a cold Turbopack/Next start can
+# take a few seconds) instead of a fixed sleep + an always-false substring
+# check.
+ready=0
+for _ in $(seq 1 20); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null)
+    if [ "$code" = "200" ]; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" = "1" ]; then
+    echo "  ✅ Next.js running (PID: $NEXT_PID)"
 else
-    echo "⚠️  Pipeline-service may not be ready yet (check pipeline.log)"
+    echo "  ⚠️  Next.js may not be ready yet - check $LOG_DIR/nextjs.log"
 fi
 
-if curl -s http://localhost:3002/health | grep -q "\"status\":\"ok\""; then
-    echo "✅ PaddleOCR-service is running (PID: $PADDLEOCR_PID)"
-else
-    echo "⚠️  PaddleOCR-service may not be ready yet (check paddleocr.log)"
-fi
-
-if curl -s -o /dev/null -w "" http://localhost:3000/ 2>/dev/null; then
-    echo "✅ Next.js is running (PID: $NEXT_PID)"
-else
-    echo "⚠️  Next.js may not be ready yet (check nextjs.log)"
-fi
+# ─────────────────────────────────────────────────────────────────────────
+# Watchdog: everything above only starts each service once — nothing was
+# watching them afterward, so a native crash (the PaddleOCR PIR-interpreter
+# SIGSEGV in particular — see mini-services/paddleocr-service/main.py) took
+# OCR down permanently until someone noticed and reran this script by hand.
+# Restart it in place so OCR — and the other two services — recover
+# automatically within seconds instead.
+# ─────────────────────────────────────────────────────────────────────────
+pkill -f "watchdog.sh" 2>/dev/null || true
+WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
+echo "  ✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
 
 # Get public IP
 PUBLIC_IP=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "YOUR_VM_IP")
@@ -257,19 +397,10 @@ echo ""
 echo "  🌐 Website:  http://$PUBLIC_IP"
 echo "  📊 API:      http://$PUBLIC_IP/api/stats"
 echo "  🔧 Pipeline: http://$PUBLIC_IP:3001/internal/health"
-# Watchdog: everything above only starts each service once — nothing was
-# watching them afterward, so a native crash (the PaddleOCR PIR-interpreter
-# SIGSEGV in particular — see mini-services/paddleocr-service/main.py) took
-# OCR down permanently until someone noticed and reran this script by hand.
-# Restart it in place so OCR — and the other two services — recover
-# automatically within seconds instead.
-pkill -f "watchdog.sh" 2>/dev/null
-WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
-echo "✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
-
+echo "  🔎 OCR:      http://$PUBLIC_IP:3002/health"
 echo ""
-echo "  To stop:     fuser -k 3000/tcp; pkill -f 'index.ts'; pkill -f 'watchdog.sh'"
+echo "  To stop:     fuser -k 3000/tcp; pkill -f 'index.ts'; pkill -f 'uvicorn main:app'; pkill -f 'watchdog.sh'"
 echo "  To restart:  bash start.sh"
-echo "  Logs:        tail -f $LOG_DIR/nextjs.log $LOG_DIR/pipeline.log $LOG_DIR/paddleocr.log"
+echo "  Logs:        tail -f $LOG_DIR/nextjs.log $LOG_DIR/pipeline.log $LOG_DIR/paddleocr.log $LOG_DIR/watchdog.log"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

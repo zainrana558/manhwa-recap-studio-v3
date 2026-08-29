@@ -1333,7 +1333,7 @@ const OCR_CACHE_DIR = path.join(DATA_DIR, 'cache', 'ocr')
  * hitting a single isPaddleOCRAvailable() check moments after the service
  * had been (re)started, catching it mid model-load (or even before it had
  * bound its port yet) — cold init can legitimately take up to ~2 minutes
- * on CPU (see start-services.sh's own 60x2s readiness poll). The caller
+ * on CPU (see start.sh's own 60x2s readiness poll). The caller
  * only checks ONCE and then uses whichever engine that single check picked
  * for the ENTIRE job, so one unlucky bit of timing silently downgraded a
  * whole job to VLM (which, with no API key configured, produced almost no
