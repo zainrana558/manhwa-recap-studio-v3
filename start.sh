@@ -362,7 +362,19 @@ NEXT_PID=$!
 # check.
 ready=0
 for _ in $(seq 1 20); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null)
+    # `|| true` is required here under this script's `set -e`: unlike the
+    # PaddleOCR/pipeline-service checks above (curl piped into grep,
+    # inside an if-condition -- exempt from set -e either way), this one
+    # assigns curl's own output to a variable via bare command
+    # substitution with no pipe. curl exits 7 ("failed to connect") on
+    # every iteration until Next.js actually binds the port -- which is
+    # true by definition on the very first loop iteration, moments after
+    # backgrounding it. Confirmed directly: without `|| true`, this
+    # single line killed the entire script (and therefore the whole
+    # systemd-managed stack, including the already-running PaddleOCR and
+    # pipeline-service) on every single start, deterministically, before
+    # ever reaching the `if [ "$code" = "200" ]` check below it.
+    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null || true)
     if [ "$code" = "200" ]; then
         ready=1
         break
