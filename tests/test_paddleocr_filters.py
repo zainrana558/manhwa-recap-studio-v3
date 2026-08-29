@@ -1,132 +1,29 @@
+import os
+import importlib.util
+import sys
 from pathlib import Path
-from pipeline.production import *
-import re
-from pathlib import Path
-from pipeline.production import *
 
-CONFIDENCE_CUTOFF = 0.70
-SYMBOL_RATIO_LIMIT = 0.35
+os.environ["SKIP_OCR_INIT"] = "1"
 
-class _TextRegion:
-    def __init__(self, text, confidence, x_min, y_min, y_max, x_max):
-        self.text = text
-        self.confidence = confidence
-        self.x_min = x_min
-        self.y_min = y_min
-        self.y_max = y_max
-        self.x_max = x_max
+# Load the real filter/merge functions dynamically from
+# mini-services/paddleocr-service/main.py — the same pattern used by
+# tests/test_paddleocr_parser.py. This file used to locally re-implement
+# these functions verbatim instead of importing them, which meant it
+# validated a stale fork that had already drifted from production (e.g. a
+# local CONFIDENCE_CUTOFF of 0.70 vs. the real 0.40) and would not catch a
+# regression in the actual cascade.
+main_path = Path(__file__).parent.parent / "mini-services" / "paddleocr-service" / "main.py"
+spec = importlib.util.spec_from_file_location("paddleocr_main", main_path)
+paddleocr_main = importlib.util.module_from_spec(spec)
+sys.modules["paddleocr_main"] = paddleocr_main
+spec.loader.exec_module(paddleocr_main)
 
-def _is_slash_or_math_artifact(text: str) -> bool:
-    if not text:
-        return True
-    s = text.strip()
-    if re.fullmatch(r'[/\-\\—_\s]+', s):
-        return True
-    if re.search(r'[/\\—\-]{2,}', s) and not re.search(r'[a-zA-Z0-9]', s):
-        return True
-    if re.fullmatch(r'[*+\\/\-—=]\s*[0-9A-Za-z]{0,3}', s):
-        return True
-    if re.fullmatch(r'[*+\\/\-—=]+', s):
-        return True
-    return False
-
-def _symbol_ratio_exceeded(text: str, max_ratio: float = SYMBOL_RATIO_LIMIT) -> bool:
-    if not text:
-        return True
-    alnum_count = len(re.findall(r'[a-zA-Z0-9]', text))
-    if alnum_count == 0:
-        return True
-    non_alnum_count = len(re.findall(r'[^a-zA-Z0-9\s]', text))
-    ratio = non_alnum_count / float(alnum_count)
-    return ratio > max_ratio
-
-def _is_graphic_logo(region: '_TextRegion', img_h: int = 0, img_w: int = 0) -> bool:
-    box_w = region.x_max - region.x_min
-    box_h = region.y_max - region.y_min
-    if box_h <= 0 or box_w <= 0:
-        return False
-    text_lower = region.text.lower()
-    if re.search(r'\bsouls?\s+lac(?:ing|e)\b', text_lower):
-        return True
-    if img_h > 0 and img_w > 0:
-        aspect_ratio = box_w / float(box_h)
-        area_ratio = (box_w * box_h) / float(img_w * img_h)
-        if (area_ratio > 0.15 or aspect_ratio > 5.0 or box_h > img_h * 0.4) and region.confidence < 0.85:
-            if not re.fullmatch(r'[\w\s.,!\'\"]+', region.text) or region.confidence < 0.75:
-                return True
-    return False
-
-def _clean_and_normalize_ocr_text(text: str) -> str:
-    if not text:
-        return ""
-    t = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', text, flags=re.IGNORECASE)
-    t = re.sub(r'\.{2,}', '...', t)
-    t = re.sub(r'\bHO[0O]\b', 'HOO', t)
-    t = re.sub(r'\bHO\s+O\b', 'HOO', t)
-    t = re.sub(r'\bgood-curdling\b', 'blood-curdling', t, flags=re.IGNORECASE)
-    t = re.sub(r'\bgood\s+curdling\b', 'blood-curdling', t, flags=re.IGNORECASE)
-    t = re.sub(r'\bB\s+to\s+be\s+continued\.*', 'To Be Continued...', t, flags=re.IGNORECASE)
-    t = re.sub(r'^\s*B\s+to\s+be\b(?!\s+continued)', 'To Be Continued', t, flags=re.IGNORECASE)
-    t = re.sub(r'\.{2,}', '...', t)
-    return t
-
-def _sort_regions_reading_order(regions, is_ui_box=False):
-    if not regions:
-        return regions
-    if is_ui_box:
-        return sorted(regions, key=lambda r: (r.y_min, r.x_min))
-    heights = [r.y_max - r.y_min for r in regions]
-    mean_height = sum(heights) / len(heights) if heights else 20.0
-    vertical_tolerance = max(mean_height * 0.4, 10.0)
-    remaining = sorted(regions, key=lambda r: r.y_min)
-    rows = []
-    for r in remaining:
-        placed = False
-        for row in rows:
-            row_y = sum(rr.y_min for rr in row) / len(row)
-            if abs(r.y_min - row_y) < vertical_tolerance:
-                row.append(r)
-                placed = True
-                break
-        if not placed:
-            rows.append([r])
-    rows.sort(key=lambda row: sum(rr.y_min for rr in row) / len(row))
-    ordered = []
-    for row in rows:
-        row.sort(key=lambda rr: rr.x_min)
-        ordered.extend(row)
-    return ordered
-
-def _merge_regions(regions, is_ui_box=False):
-    if not regions:
-        return "", 0.0, 0
-    sorted_regions = _sort_regions_reading_order(regions, is_ui_box=is_ui_box)
-    lines = []
-    current_line = [sorted_regions[0]]
-    for region in sorted_regions[1:]:
-        prev = current_line[-1]
-        vertical_gap = abs(region.y_min - prev.y_min)
-        mean_h = (region.y_max - region.y_min + prev.y_max - prev.y_min) / 2
-        threshold = max(mean_h * 0.2, 4.0) if is_ui_box else max(mean_h * 0.5, 10.0)
-        if vertical_gap < threshold:
-            current_line.append(region)
-        else:
-            lines.append(current_line)
-            current_line = [region]
-    lines.append(current_line)
-    text_parts = []
-    all_confidences = []
-    for line in lines:
-        line_sorted = sorted(line, key=lambda r: r.x_min)
-        line_text = " ".join(_clean_and_normalize_ocr_text(r.text.strip()) for r in line_sorted if r.text.strip())
-        if line_text:
-            text_parts.append(line_text)
-        for r in line_sorted:
-            if r.confidence > 0:
-                all_confidences.append(r.confidence)
-    merged_text = _clean_and_normalize_ocr_text(" ".join(text_parts))
-    avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
-    return merged_text, round(avg_confidence, 4), len(sorted_regions)
+_TextRegion = paddleocr_main._TextRegion
+_is_slash_or_math_artifact = paddleocr_main._is_slash_or_math_artifact
+_symbol_ratio_exceeded = paddleocr_main._symbol_ratio_exceeded
+_is_graphic_logo = paddleocr_main._is_graphic_logo
+_clean_and_normalize_ocr_text = paddleocr_main._clean_and_normalize_ocr_text
+_merge_regions = paddleocr_main._merge_regions
 
 
 def test_paddleocr_filters():

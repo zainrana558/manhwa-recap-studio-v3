@@ -1057,7 +1057,7 @@ async function processJob(jobId: string): Promise<void> {
 
     try {
       const modeLabel = frameKeyed ? 'sliced panels' : 'full-page images'
-      let rawNarrations: Array<{ image: string; text: string }>
+      let rawNarrations: Array<{ image: string; text: string; status?: string }>
       let usedMethod = 'unknown'
 
       if (ocrAvailable) {
@@ -1083,7 +1083,7 @@ async function processJob(jobId: string): Promise<void> {
           // failure: manhwa/manhua chapters are often mostly action,
           // establishing, or transition panels with no bubbles at all, so
           // 80%+ silent panels is frequently correct output, not broken OCR.
-          const { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } = ocrOutcome.stats
+          const { totalRegionsDetected, batchCallFailures, imageCallFailures, freshlyProcessed, uncertainWithRegions, panelsWithRegionsDetected } = ocrOutcome.stats
           const detectorNeverFired = freshlyProcessed > 3 && totalRegionsDetected === 0
           // Distinct from detectorNeverFired: text regions WERE found, but
           // the recognizer couldn't read most of them confidently (status
@@ -1094,31 +1094,34 @@ async function processJob(jobId: string): Promise<void> {
           // legitimate empty panel instead of triggering the fallback
           // cascade. Only trip this once there's a reasonable sample size
           // and it's clearly systemic, not a couple of genuinely hard crops.
-          const regionsWithText = Math.max(totalRegionsDetected, uncertainWithRegions)
-          const uncertainRatio = regionsWithText > 0 ? uncertainWithRegions / regionsWithText : 0
+          //
+          // Both sides of this ratio must be panel counts: uncertainWithRegions
+          // is "how many panels had detected-but-unreadable text", so the
+          // denominator has to be "how many panels had any detected text at
+          // all" (panelsWithRegionsDetected) — not totalRegionsDetected, which
+          // is a summed *region* count across every panel and is on a
+          // different scale entirely (that mismatch used to make this ratio
+          // nearly impossible to trip even when recognition was genuinely
+          // failing on most panels with text).
+          const uncertainRatio = panelsWithRegionsDetected > 0 ? uncertainWithRegions / panelsWithRegionsDetected : 0
           const recognizerStruggling = uncertainWithRegions >= 4 && uncertainRatio > 0.5
 
-          // batchCallFailures used to mean "an entire ~20-image HTTP call to
-          // the OCR service failed" — a rare, strong signal of a genuinely
-          // broken/unreachable service, so any occurrence at all (>0) was a
-          // reasonable trigger. Since generateImageNarrationsOCR moved to
-          // one-panel-per-HTTP-request (better fault isolation: a single
-          // slow/hanging image can no longer time out an entire batch), this
-          // counter now increments per INDIVIDUAL PANEL that exhausts all 3
-          // retries. A single hard-to-process image (blurry scan, corrupt
-          // JPEG, extreme rotation) is normal at real-world scale and no
-          // longer implies the service itself is broken — so >0 would now
-          // discard every successfully-OCR'd panel in the chapter over one
-          // unlucky image, every single run. Apply the same "systemic, not
-          // a couple of hard crops" bar used by recognizerStruggling above.
-          const batchFailureRatio = freshlyProcessed > 0 ? batchCallFailures / freshlyProcessed : 0
-          const ocrServiceFailing = freshlyProcessed <= 3 ? batchCallFailures > 0 : batchFailureRatio > 0.3
+          // batchCallFailures counts failed HTTP *chunks* (BATCH_SIZE=3
+          // images each in lib.ts) — dividing that by freshlyProcessed
+          // (an *image* count) mixed units and meant the intended 30%
+          // failure threshold didn't actually trip until roughly ~47% of
+          // images were failing. imageCallFailures counts individual
+          // images that ended up FAILED (via a failed chunk OR a non-
+          // SUCCESS per-image status in a chunk that otherwise succeeded),
+          // so it's the correct numerator against freshlyProcessed.
+          const imageFailureRatio = freshlyProcessed > 0 ? imageCallFailures / freshlyProcessed : 0
+          const ocrServiceFailing = freshlyProcessed <= 3 ? imageCallFailures > 0 : imageFailureRatio > 0.3
 
           if (ocrServiceFailing) {
             await emitLog(jobId, 'warn', 'transcribe',
-              `Chapter ${ch.index}: PaddleOCR failed on ${batchCallFailures}/${freshlyProcessed} panels — falling back to VLM for this chapter`,
+              `Chapter ${ch.index}: PaddleOCR failed on ${imageCallFailures}/${freshlyProcessed} panels (${batchCallFailures} failed HTTP chunk(s)) — falling back to VLM for this chapter`,
             )
-            throw new Error(`OCR service unreachable/erroring (${batchCallFailures}/${freshlyProcessed} panel failures)`)
+            throw new Error(`OCR service unreachable/erroring (${imageCallFailures}/${freshlyProcessed} panel failures)`)
           }
           if (detectorNeverFired) {
             await emitLog(jobId, 'warn', 'transcribe',
@@ -1146,7 +1149,7 @@ async function processJob(jobId: string): Promise<void> {
           await emitLog(jobId, 'warn', 'transcribe',
             `Chapter ${ch.index}: PaddleOCR failed or low quality (${ocrMsg.slice(0, 100)}) — attempting local Tesseract fallback before VLM`,
           )
-          const tessOutcome = runTesseractFallback(imageFiles)
+          const tessOutcome = await runTesseractFallback(imageFiles)
           if (tessOutcome && tessOutcome.some((n: { text: string }) => n.text.trim())) {
             rawNarrations = tessOutcome
             usedMethod = 'Tesseract OCR (local fallback)'
@@ -1160,7 +1163,7 @@ async function processJob(jobId: string): Promise<void> {
         }
       } else {
         // ── FALLBACK 1: Local Tesseract OCR ──
-        const tessOutcome = runTesseractFallback(imageFiles)
+        const tessOutcome = await runTesseractFallback(imageFiles)
         if (tessOutcome && tessOutcome.some((n: { text: string }) => n.text.trim())) {
           rawNarrations = tessOutcome
           usedMethod = 'Tesseract OCR (local)'
@@ -1205,10 +1208,17 @@ async function processJob(jobId: string): Promise<void> {
       // Piper/eSpeak and the narrator would literally say the words
       // "transcription unavailable" out loud over that panel. Same shape as
       // the credit/junk filters above: convert it to silence instead.
+      // Also mark these panels status: 'FAILED' (not left absent/derived)
+      // so master_pipeline.py's OcrStatus.FAILED branch — which logs and
+      // handles a genuine transcription failure differently from a
+      // legitimately silent panel — actually gets a status to read.
+      // Blanking text to '' alone made every one of these indistinguishable
+      // from OcrStatus.NO_TEXT downstream.
       let unavailableSilenced = 0
       for (const n of narrations) {
         if (n.text.trim() === '[transcription unavailable]') {
           n.text = ''
+          n.status = 'FAILED'
           unavailableSilenced++
         }
       }

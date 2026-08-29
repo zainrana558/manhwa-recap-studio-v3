@@ -138,10 +138,11 @@ def _run_warmup(ocr_obj: Any) -> bool:
     try:
         with _inference_lock:
             if hasattr(ocr_obj, "predict") and callable(getattr(ocr_obj, "predict")):
-                try:
-                    _ = ocr_obj.predict(dummy_img)
-                except TypeError:
-                    _ = ocr_obj.predict(dummy_img)
+                # No tuning kwargs are passed here (unlike _run_ocr_on_image),
+                # so a retry with the identical call/args can never behave
+                # differently — any TypeError is a real signature mismatch
+                # and belongs to the outer `except Exception` below.
+                _ = ocr_obj.predict(dummy_img)
             elif hasattr(ocr_obj, "ocr") and callable(getattr(ocr_obj, "ocr")):
                 _ = ocr_obj.ocr(dummy_img)
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -930,8 +931,14 @@ def _ocr_with_cascade(img, options=None):
 
         for variant_name, prep_fn in preprocessing_passes:
             prep_img = prep_fn(img)
-            var_regions = _run_ocr_on_image(prep_img, options)
-            var_text, var_conf, var_count = _merge_regions(var_regions)
+            # Use `opts` (carries the UI-box det_limit_side_len bump) and
+            # pass is_ui_box through to _merge_regions, same as the standard
+            # pass above — using the original `options` here silently
+            # reverted every fallback variant to non-UI-box thresholds,
+            # which defeats the UI-box handling exactly when it's needed
+            # most (the standard pass already failed to reach SUCCESS).
+            var_regions = _run_ocr_on_image(prep_img, opts)
+            var_text, var_conf, var_count = _merge_regions(var_regions, is_ui_box=is_ui_box)
             var_status, var_quality, var_reason = _quality_status(var_text, var_conf, var_count)
 
             candidates.append({

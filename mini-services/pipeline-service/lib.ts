@@ -117,7 +117,10 @@ export function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 import crypto from 'crypto'
-import { spawnSync } from 'child_process'
+import { spawnSync, execFile } from 'child_process'
+import { promisify } from 'util'
+
+const execFileAsync = promisify(execFile)
 
 const VLM_CACHE_DIR = path.join(DATA_DIR, 'cache', 'vlm')
 const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent)
@@ -250,9 +253,9 @@ export function isCreditPanel(text: string): boolean {
  * We set text to empty rather than removing the entry entirely, so the frame
  * indices stay aligned with the Python render step's frame list.
  */
-export function filterCreditPanels(
-  narrations: Array<{ image: string; text: string }>,
-): { filtered: Array<{ image: string; text: string }>; creditsRemoved: number } {
+export function filterCreditPanels<T extends { image: string; text: string }>(
+  narrations: T[],
+): { filtered: T[]; creditsRemoved: number } {
   let creditsRemoved = 0
   const filtered = narrations.map((n) => {
     if (isCreditPanel(n.text)) {
@@ -290,9 +293,9 @@ export function isJunkOnlyText(text: string): boolean {
  * filterCreditPanels — text is set to empty (not the entry removed) so
  * frame indices stay aligned with the Python render step's frame list.
  */
-export function filterJunkTextPanels(
-  narrations: Array<{ image: string; text: string }>,
-): { filtered: Array<{ image: string; text: string }>; junkRemoved: number } {
+export function filterJunkTextPanels<T extends { image: string; text: string }>(
+  narrations: T[],
+): { filtered: T[]; junkRemoved: number } {
   let junkRemoved = 0
   const filtered = narrations.map((n) => {
     if (isJunkOnlyText(n.text)) {
@@ -1091,21 +1094,44 @@ export async function generateImageNarrationsOCR(
   imagePaths: string[],
   onProgress?: (done: number, total: number) => void,
 ): Promise<{
-  results: Array<{ image: string; text: string }>
-  stats: { totalRegionsDetected: number; batchCallFailures: number; freshlyProcessed: number; uncertainWithRegions: number }
+  results: Array<{ image: string; text: string; status?: string }>
+  stats: {
+    totalRegionsDetected: number
+    batchCallFailures: number
+    imageCallFailures: number
+    freshlyProcessed: number
+    uncertainWithRegions: number
+    panelsWithRegionsDetected: number
+  }
 }> {
-  if (imagePaths.length === 0) return { results: [], stats: { totalRegionsDetected: 0, batchCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0 } }
+  if (imagePaths.length === 0) {
+    return {
+      results: [],
+      stats: { totalRegionsDetected: 0, batchCallFailures: 0, imageCallFailures: 0, freshlyProcessed: 0, uncertainWithRegions: 0, panelsWithRegionsDetected: 0 },
+    }
+  }
 
   const baseUrl = process.env.OCR_SERVICE_URL || 'http://localhost:3002'
   const OCR_REQUEST_TIMEOUT_MS = 120000 // 120,000 ms (2 minutes) per single panel request
-  const results: Array<{ image: string; text: string }> = new Array(imagePaths.length)
+  const results: Array<{ image: string; text: string; status?: string }> = new Array(imagePaths.length)
 
   const startTime = Date.now()
   let completedCount = 0
   let totalRegionsDetected = 0
+  // batchCallFailures counts failed HTTP *chunks* (up to 3 images each) —
+  // kept only for the human-readable log line. imageCallFailures counts
+  // individual *images* that ended up FAILED, which is the unit the
+  // failure-ratio math below actually needs (see index.ts ocrServiceFailing).
   let batchCallFailures = 0
+  let imageCallFailures = 0
   let freshlyProcessed = 0
   let uncertainWithRegions = 0
+  // Count of panels where the detector found >=1 text region, regardless
+  // of how many regions — the correct denominator for uncertainRatio in
+  // index.ts (uncertainWithRegions is also a panel count, not a region
+  // count, so it must be compared against another panel count, not the
+  // summed region total).
+  let panelsWithRegionsDetected = 0
   let successCount = 0
   let failureCount = 0
 
@@ -1122,8 +1148,11 @@ export async function generateImageNarrationsOCR(
     const cached = await getOcrCached(cacheKey)
 
     if (cached !== null) {
-      results[i] = { image: path.basename(imgPath), text: cached.text }
-      if (cached.text.trim()) totalRegionsDetected += 1
+      results[i] = { image: path.basename(imgPath), text: cached.text, status: cached.status }
+      if (cached.text.trim()) {
+        totalRegionsDetected += 1
+        panelsWithRegionsDetected += 1
+      }
       if (cached.status === 'SUCCESS') {
         successCount++
       } else {
@@ -1191,6 +1220,8 @@ export async function generateImageNarrationsOCR(
 
             totalRegionsDetected += regions
             freshlyProcessed++
+            if (regions > 0) panelsWithRegionsDetected++
+            if (status !== 'SUCCESS') imageCallFailures++
 
             if (regions > 0 && status !== 'SUCCESS') {
               uncertainWithRegions++
@@ -1206,13 +1237,29 @@ export async function generateImageNarrationsOCR(
               failureCount++
             }
 
-            results[origIdx] = { image: path.basename(imgPath), text }
+            // Preserve the real per-panel status (SUCCESS/UNCERTAIN/FAILED)
+            // instead of collapsing it to just {image, text} — the Python
+            // render step's OcrStatus handling needs this to tell "OCR
+            // legitimately found no dialogue" (NO_TEXT) apart from "OCR
+            // detected text but couldn't read it confidently" (UNCERTAIN/
+            // FAILED); without it every non-SUCCESS panel looked identical
+            // to a silent one downstream.
+            results[origIdx] = { image: path.basename(imgPath), text, status }
             completedCount++
           }
 
           batchSuccess = true
           onProgress?.(completedCount, imagePaths.length)
           break
+        } else if (data.results) {
+          // Response came back OK but with the wrong number of results for
+          // this chunk (truncated/malformed payload) — this used to fall
+          // through to a silent retry with zero diagnostic output, making
+          // it indistinguishable in the logs from an ordinary slow retry.
+          console.warn(
+            `[OCR] Batch chunk (${batch.paths.map(p => path.basename(p)).join(', ')}) attempt ${attempt}/${MAX_OCR_RETRIES}: ` +
+            `response had ${data.results.length} result(s), expected ${batch.paths.length} — retrying`,
+          )
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -1225,6 +1272,7 @@ export async function generateImageNarrationsOCR(
 
     if (!batchSuccess) {
       batchCallFailures++
+      imageCallFailures += batch.paths.length
       for (let bIdx = 0; bIdx < batch.paths.length; bIdx++) {
         const origIdx = batch.indices[bIdx]
         const imgPath = batch.paths[bIdx]
@@ -1232,7 +1280,7 @@ export async function generateImageNarrationsOCR(
         failureCount++
         void setOcrCached(cacheKey, '', 'FAILED')
         void setVlmCached(vlmCacheKey(imgPath), '', 'FAILED')
-        results[origIdx] = { image: path.basename(imgPath), text: '' }
+        results[origIdx] = { image: path.basename(imgPath), text: '', status: 'FAILED' }
         completedCount++
       }
       onProgress?.(completedCount, imagePaths.length)
@@ -1254,7 +1302,10 @@ export async function generateImageNarrationsOCR(
     `==================================================\n`
   )
 
-  return { results, stats: { totalRegionsDetected, batchCallFailures, freshlyProcessed, uncertainWithRegions } }
+  return {
+    results,
+    stats: { totalRegionsDetected, batchCallFailures, imageCallFailures, freshlyProcessed, uncertainWithRegions, panelsWithRegionsDetected },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,7 +1479,7 @@ export async function generateImageNarrations(
 
   if (!HAS_REAL_PROVIDER) {
     console.warn('[VLM] No VLM providers available — attempting emergency tesseract fallback...')
-    const emergencyResults = runTesseractFallback(imagePaths)
+    const emergencyResults = await runTesseractFallback(imagePaths)
     if (emergencyResults) {
       return emergencyResults
     }
@@ -1617,7 +1668,7 @@ export async function generateImageNarrations(
 
         if (!succeeded) {
           console.warn(`[VLM] batch ${num}/${totalBatches} exhausted all retries across providers — attempting tesseract fallback for batch...`)
-          const tessBatchResults = runTesseractFallback(images)
+          const tessBatchResults = await runTesseractFallback(images)
           if (tessBatchResults) {
             batchTexts = tessBatchResults.map((r) => r.text)
             succeeded = true
@@ -2696,33 +2747,42 @@ function parseBatchResponse(raw: string, expectedCount: number): string[] {
  * Emergency fallback to local Tesseract CLI for image transcriptions.
  * Runs multi-pass PSM modes (--psm 6, --psm 11, --psm 3) to extract sparse or unusual bubble text.
  * Returns null if tesseract is not available on PATH or execution fails.
+ *
+ * Runs each `tesseract` call via the async `execFile` (not `spawnSync`) so a
+ * chapter-sized fallback (100+ panels x up to 3 PSM passes x up to 15s each)
+ * cannot block the single-threaded pipeline-service event loop for minutes
+ * at a time — health checks, log streaming, and job cancellation all need
+ * to keep running while this is in flight.
  */
-export function runTesseractFallback(imagePaths: string[]): Array<{ image: string; text: string }> | null {
+export async function runTesseractFallback(imagePaths: string[]): Promise<Array<{ image: string; text: string; status?: string }> | null> {
   try {
     const check = spawnSync('which', ['tesseract'], { encoding: 'utf8' })
     if (check.status !== 0) return null
 
-    const results: Array<{ image: string; text: string }> = []
+    const results: Array<{ image: string; text: string; status?: string }> = []
     for (const imgPath of imagePaths) {
       let text = ''
       // Try PSM 6 (uniform block of text), then PSM 11 (sparse text), then PSM 3 (fully automatic)
       for (const psm of ['6', '11', '3']) {
-        const proc = spawnSync('tesseract', [imgPath, 'stdout', '--psm', psm], {
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        if (proc.status === 0 && proc.stdout) {
-          const txt = proc.stdout.trim()
+        try {
+          const { stdout } = await execFileAsync('tesseract', [imgPath, 'stdout', '--psm', psm], {
+            encoding: 'utf8',
+            timeout: 15000,
+          })
+          const txt = stdout.trim()
           if (txt.length > 0 && /[a-zA-Z0-9]/.test(txt)) {
             text = txt
             break
           }
+        } catch {
+          // Non-zero exit or timeout for this PSM pass — try the next one.
         }
       }
 
       results.push({
         image: path.basename(imgPath),
-        text: text.length > 0 ? text : '',
+        text,
+        status: text ? 'SUCCESS' : 'NO_TEXT',
       })
     }
     return results

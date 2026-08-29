@@ -92,15 +92,31 @@ cd "$PROJECT_DIR"
 
 # Clear stale .next build cache to fix "Failed to find Server Action" errors.
 # This happens when the production build has a server-action registry that
-# no longer matches the current source (actions added/removed since last build).
+# no longer matches the current source (actions added/removed since last
+# build). The old check only looked at whether server.js existed at all, so
+# a `git pull` that changed source without rebuilding (the exact scenario
+# in the reported error log) left a stale-but-present build in place and
+# this check never fired. Compare against the checked-out commit instead —
+# any commit change means source may have moved and the build must be
+# regenerated, not just "does a build exist at all".
+CURRENT_COMMIT="$(cd "$PROJECT_DIR" && git rev-parse HEAD 2>/dev/null || echo "")"
+BUILD_STAMP_FILE=".next/standalone/.build-commit"
+NEED_BUILD=0
 if [ ! -f ".next/standalone/server.js" ]; then
-  echo "  .next/standalone/server.js not found — rebuilding..."
+  NEED_BUILD=1
+  echo "  .next/standalone/server.js not found — building..."
+elif [ -n "$CURRENT_COMMIT" ] && [ "$(cat "$BUILD_STAMP_FILE" 2>/dev/null)" != "$CURRENT_COMMIT" ]; then
+  NEED_BUILD=1
+  echo "  .next build is stale (source changed since last build) — rebuilding..."
+fi
+if [ "$NEED_BUILD" = "1" ]; then
   rm -rf .next
   bun run build > "$LOG_DIR/nextjs-build.log" 2>&1
   if [ $? -ne 0 ]; then
     echo "  ⚠️  Build failed — check $LOG_DIR/nextjs-build.log"
   else
     echo "  ✅ Build succeeded"
+    [ -n "$CURRENT_COMMIT" ] && mkdir -p "$(dirname "$BUILD_STAMP_FILE")" && echo "$CURRENT_COMMIT" > "$BUILD_STAMP_FILE"
   fi
 fi
 
@@ -125,6 +141,16 @@ if [ "$ready" = "1" ]; then
 else
   echo "  ❌ Next.js failed - check $LOG_DIR/nextjs.log"
 fi
+
+# Watchdog: this script only starts each service once and exits — nothing
+# was watching them afterward, so a native crash (the PaddleOCR PIR SIGSEGV
+# in particular — see mini-services/paddleocr-service/main.py) took OCR
+# down permanently until someone noticed and reran this script by hand.
+# Restart it in place (it self-restarts if already running) so OCR — and
+# the other two services — recover automatically within seconds.
+pkill -f "watchdog.sh" 2>/dev/null
+setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
+echo "  ✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
 
 echo ""
 echo "=== All services started ==="
