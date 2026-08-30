@@ -2064,6 +2064,15 @@ def _normalize_case_for_tts(text: str) -> str:
 def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
     """Generate atomic segment audio with Edge-TTS (primary), Piper ONNX (fallback), eSpeak NG (tertiary fallback).
     Also exports matching .vtt / .srt timing markers alongside Edge-TTS audio outputs for caption syncing.
+
+    Returns (audio_path, tts_failed, word_boundaries). word_boundaries is a
+    list of {"text", "start", "end"} dicts (seconds, relative to this
+    segment's own audio) when edge-tts succeeded and provided per-word
+    timing data -- see split_frame_timings, which uses this in place of
+    an estimated proportional word-count split when it's available and
+    trustworthy. None for every other path (cache hit, silent segment,
+    Piper/eSpeak fallback -- neither provides word-level timestamps),
+    in which case callers fall back to the pre-existing estimate.
     """
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
@@ -2071,7 +2080,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     text = text.strip()
     text = _normalize_case_for_tts(text)
     if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
-        return final_path, False
+        return final_path, False, None
 
     final_path.unlink(missing_ok=True)
     tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
@@ -2083,7 +2092,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
             tmp_path.unlink(missing_ok=True)
             raise RuntimeError(f"silent audio QA failed for {tag}")
         os.replace(tmp_path, final_path)
-        return final_path, False
+        return final_path, False, None
 
     failures = []
 
@@ -2094,6 +2103,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
     srt_path = seg_audio_dir / f"{tag}.srt"
     vtt_path = seg_audio_dir / f"{tag}.vtt"
+    word_boundaries = []  # type: list
 
     async def _run_edge_tts():
         communicate = edge_tts.Communicate(text, voice, rate="+5%")
@@ -2104,6 +2114,18 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
                     f.write(chunk["data"])
                 elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
                     submaker.feed(chunk)
+                    if chunk["type"] == "WordBoundary":
+                        # offset/duration are in 100-nanosecond ticks (the
+                        # Windows/.NET "ticks" convention edge-tts's
+                        # underlying service uses) -- confirmed against
+                        # the package's own docs ("converts 100-nanosecond
+                        # ticks into SRT-compliant timestamps"), not
+                        # assumed. /1e7 converts to seconds.
+                        word_boundaries.append({
+                            "text": chunk["text"],
+                            "start": chunk["offset"] / 1e7,
+                            "end": (chunk["offset"] + chunk["duration"]) / 1e7,
+                        })
         srt_text = submaker.get_srt()
         if srt_text:
             srt_path.write_text(srt_text, encoding="utf-8")
@@ -2120,7 +2142,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         if not _audio_qa(tmp_path, allow_silence=False):
             raise RuntimeError("edge-tts output failed audio QA")
         os.replace(tmp_path, final_path)
-        return final_path, False
+        return final_path, False, (word_boundaries or None)
     except Exception as e:
         failures.append(f"edge-tts: {e}")
         log.warning("[%s] edge-tts failed for segment %s (%s) — attempting Piper ONNX fallback", chapter.tag, tag, e)
@@ -2134,7 +2156,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         if _audio_qa(tmp_path, allow_silence=False):
             os.replace(tmp_path, final_path)
             log.info("[%s] Piper ONNX fallback succeeded for segment %s", chapter.tag, tag)
-            return final_path, False
+            return final_path, False, None
         raise RuntimeError("piper output failed audio QA")
     except Exception as e:
         failures.append(f"piper: {e}")
@@ -2147,7 +2169,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         if _audio_qa(tmp_path, allow_silence=False):
             os.replace(tmp_path, final_path)
             log.info("[%s] eSpeak NG fallback succeeded for segment %s", chapter.tag, tag)
-            return final_path, False
+            return final_path, False, None
         raise RuntimeError("espeak output failed audio QA")
     except Exception as e:
         failures.append(f"espeak: {e}")
@@ -2156,7 +2178,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     # Ultimate fallback in legacy mode: generate silence
     _generate_silence(tmp_path, SILENT_FRAME_DURATION)
     os.replace(tmp_path, final_path)
-    return final_path, True
+    return final_path, True, None
 
 def build_chapter_audio_track(
     cfg: PipelineConfig, chapter: Chapter, segment_audio_paths: List[Path],
@@ -2300,22 +2322,71 @@ def _join_scroll_fragments(fragments: List[str]) -> str:
     return result
 
 
-def split_frame_timings(text: str, positions: List[int], duration: float, is_silent: bool = False) -> dict:
-    """Proportionally split a segment's TTS duration across its frames by
-    word count. For narrated frames, ensures each frame gets at least MIN_FRAME_DURATION
-    seconds and adds FRAME_HOLD_PADDING (0.5s) to the last frame.
-    For silent (NO_TEXT or FAILED textless) frames, avoids MIN_FRAME_DURATION and
-    FRAME_HOLD_PADDING to maintain appropriate short pacing."""
+def split_frame_timings(text: str, positions: List[int], duration: float, is_silent: bool = False, word_boundaries: Optional[List[dict]] = None) -> dict:
+    """Split a segment's TTS duration across its frames, using real
+    per-word timing when available and falling back to a proportional
+    word-count estimate otherwise. For narrated frames, ensures each
+    frame gets at least MIN_FRAME_DURATION seconds and adds
+    FRAME_HOLD_PADDING (0.5s) to the last frame. For silent (NO_TEXT or
+    FAILED textless) frames, avoids MIN_FRAME_DURATION and
+    FRAME_HOLD_PADDING to maintain appropriate short pacing.
+
+    word_boundaries, when provided (see synthesize_segment_audio), is a
+    list of {"text", "start", "end"} dicts giving each spoken word's REAL
+    timing from the actual TTS synthesis, in text.split() order. When its
+    length matches text.split()'s word count exactly, this replaces the
+    proportional estimate below with the segment's actual measured
+    pacing -- pauses at punctuation, variable syllable length, and
+    natural pauses between sentences all fall out of using real data
+    instead of assuming every word takes an equal share of time (which
+    is what made "audio panel mismatch" worse than it needed to be: a
+    short word next to a long one were always given equal screen time
+    regardless of how long either actually took to say). Falls back to
+    the proportional estimate if boundaries are missing, empty, or don't
+    line up 1:1 with text.split() -- edge-tts's own internal tokenization
+    for WordBoundary events isn't guaranteed to exactly match a naive
+    whitespace split (e.g. contractions, hyphenation), and forcing a
+    mismatched mapping would silently produce WORSE timing than the
+    estimate it would be replacing.
+    """
     frame_texts = split_into_segments(text, len(positions))
     word_counts = [len(t.split()) for t in frame_texts]
     total_words = sum(word_counts)
     num_frames = len(positions)
+    all_words = text.split()
 
     timings: dict = {}
 
-    # Start with a proportional split.
+    use_real_timing = (
+        not is_silent
+        and word_boundaries
+        and len(word_boundaries) == len(all_words)
+        and total_words > 0
+    )
+
     cursor = 0.0
-    if total_words > 0:
+    if use_real_timing:
+        word_idx = 0
+        for pos, count in zip(positions, word_counts):
+            if count == 0:
+                timings[pos] = (cursor, cursor)
+                continue
+            frame_words = word_boundaries[word_idx: word_idx + count]
+            start = frame_words[0]["start"]
+            end = frame_words[-1]["end"]
+            # Real per-word timestamps are absolute within the segment's
+            # own audio, not relative to a running cursor -- use them
+            # directly so a natural pause edge-tts inserted between
+            # frames (e.g. at a sentence boundary) is preserved instead
+            # of being silently squeezed out by a cumulative estimate.
+            timings[pos] = (start, end)
+            cursor = end
+            word_idx += count
+    elif total_words > 0:
+        # Proportional estimate (pre-existing behavior, used whenever
+        # real timing isn't available or trustworthy): every word
+        # assumed to take an equal share of the segment's total measured
+        # duration.
         for pos, count in zip(positions, word_counts):
             span = duration * (count / total_words)
             timings[pos] = (cursor, cursor + span)
@@ -3042,7 +3113,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 else:
                     consecutive_silent += 1
 
-                audio_path_seg, seg_tts_failed = synthesize_segment_audio(cfg, chapter, tag, text)
+                audio_path_seg, seg_tts_failed, word_boundaries = synthesize_segment_audio(cfg, chapter, tag, text)
                 if not is_silent_segment and seg_tts_failed:
                     tts_failed += 1
 
@@ -3062,7 +3133,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                         audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
                         duration = min_total
 
-                timings = split_frame_timings(text, positions, duration, is_silent=is_silent_segment)
+                timings = split_frame_timings(text, positions, duration, is_silent=is_silent_segment, word_boundaries=word_boundaries)
                 for pos in positions:
                     frame_timing[pos] = timings[pos]
                 # The frame timings now include FRAME_HOLD_PADDING (0.5s per frame)
