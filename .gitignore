@@ -86,3 +86,7 @@ pipeline/__pycache__/
 logs/
 *.pyc
 yolov8n.pt
+
+# ad-hoc QA/verification screenshots (agent-generated, not source)
+/qa-*.png
+/verify-*.png
