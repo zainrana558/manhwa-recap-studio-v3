@@ -1742,8 +1742,19 @@ def _compose_canvas(crop):
     gray = np.mean(crop_arr, axis=2)
     h, w = gray.shape
 
-    non_white_rows = np.any(gray < 240, axis=1)
-    non_white_cols = np.any(gray < 240, axis=0)
+    # A row/column counts as real content only if a meaningful FRACTION of
+    # its pixels are non-white, not merely one. Using np.any() here let a
+    # single stray pixel -- e.g. JPEG compression-ringing noise in an
+    # otherwise blank webtoon margin, which real exported pages always
+    # have -- flag the entire row as "content" and defeat the trim, so a
+    # large near-white gutter margin survived uncut into the final frame
+    # (the visible white gap in the bad output). 1% is a deliberately
+    # small majority-style threshold: real content (text, line art) lights
+    # up far more than 1% of a row/column's pixels, while margin noise
+    # from compression artifacts does not.
+    NON_WHITE_ROW_FRACTION = 0.01
+    non_white_rows = (gray < 240).mean(axis=1) > NON_WHITE_ROW_FRACTION
+    non_white_cols = (gray < 240).mean(axis=0) > NON_WHITE_ROW_FRACTION
     rows = np.where(non_white_rows)[0]
     cols = np.where(non_white_cols)[0]
 
