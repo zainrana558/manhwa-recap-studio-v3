@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional
 
@@ -963,7 +964,7 @@ def _snap_cut_to_safe_row(mask, y: int, window: int = 24) -> int:
     return y
 
 
-def _detect_panels_for_page(img_gray) -> List[tuple]:
+def _detect_panels_for_page(img_gray) -> tuple:
     """Top-level panel detector for one source page/strip image.
 
     Webtoon/manhwa raws are dominated by tall, single-column strips — for
@@ -973,15 +974,19 @@ def _detect_panels_for_page(img_gray) -> List[tuple]:
     the existing YOLO/contour auto-detector, which understands multi-column
     layouts that a pure horizontal-gutter scan can't.
 
-    Returns list of (x, y, w, h) tuples, matching _detect_panels_auto's
-    contract.
+    Returns (panels, method_name) where panels is a list of (x, y, w, h)
+    tuples and method_name is one of "gutter_aware", "yolo", "contour", or
+    "whole_page" — identifying which detector actually produced the result,
+    so callers can log an accurate summary instead of assuming one method
+    ran for the whole chapter.
     """
     h, w = img_gray.shape
     if h / max(w, 1) > 1.3:
         strip_panels = _detect_panels_gutter_aware(img_gray)
         if strip_panels:
-            return [(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in strip_panels]
-    return _detect_panels_auto(img_gray)
+            return ([(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in strip_panels], "gutter_aware")
+    panels, method = _detect_panels_auto(img_gray)
+    return panels, method
 
 
 def _is_blank_crop(arr_gray) -> bool:
@@ -1219,6 +1224,7 @@ def _detect_panels_yolo(img_gray) -> List[tuple]:
 
     model_path = str(Path(__file__).parent / "models" / "comic-panel-yolo" / "best.pt")
     if not Path(model_path).exists():
+        log.info("Comic panel YOLO model not found at %s — falling back to CV/contour detection", model_path)
         return []
 
     try:
@@ -1303,7 +1309,7 @@ def _order_panels_reading_order(panels: List[tuple]) -> List[tuple]:
     return ordered
 
 
-def _detect_panels_auto(img_gray) -> List[tuple]:
+def _detect_panels_auto(img_gray) -> tuple:
     """Auto-mode panel detection: run YOLO first, fall back to CV if weak.
 
     This is the cbxy "auto" engine approach:
@@ -1312,7 +1318,9 @@ def _detect_panels_auto(img_gray) -> List[tuple]:
        run CV detection and use whichever produced more panels.
     3. If CV also looks weak, use the whole page as one panel.
 
-    Returns list of (x, y, w, h) tuples sorted by y position.
+    Returns (panels, method_name): panels is a list of (x, y, w, h) tuples;
+    method_name is "yolo", "contour", or "whole_page" — whichever actually
+    produced the returned panels.
     """
     h, w = img_gray.shape
     page_area = w * h
@@ -1329,7 +1337,7 @@ def _detect_panels_auto(img_gray) -> List[tuple]:
     if not yolo_weak and len(yolo_panels) >= 2:
         # YOLO found multiple panels — use it
         log.debug("YOLO detected %d panels (strong)", len(yolo_panels))
-        return yolo_panels
+        return yolo_panels, "yolo"
 
     # YOLO was weak — try CV
     cv_panels = _detect_panels_contour(img_gray)
@@ -1337,13 +1345,15 @@ def _detect_panels_auto(img_gray) -> List[tuple]:
     # Use whichever found more panels
     if len(cv_panels) > len(yolo_panels):
         log.debug("CV fallback: %d panels (YOLO found %d)", len(cv_panels), len(yolo_panels))
-        return cv_panels
+        return cv_panels, "contour"
 
     # Both weak — use whole page
     if not yolo_panels and not cv_panels:
-        return [(0, 0, w, h)]
+        return [(0, 0, w, h)], "whole_page"
 
-    return yolo_panels if yolo_panels else cv_panels
+    if yolo_panels:
+        return yolo_panels, "yolo"
+    return cv_panels, "contour"
 
 
 def _suppress_nested(panels: List[tuple], iou_thresh: float = 0.55) -> List[tuple]:
@@ -1479,6 +1489,7 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     frame_entries: List[FrameEntry] = []
     frame_counter = 0
     total_blank_skipped = 0
+    detect_method_counts: Counter = Counter()
 
     for panel_idx, panel_path in enumerate(chapter.panel_paths):
         try:
@@ -1487,8 +1498,9 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 w, h = img.size
                 gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
-                panels = _detect_panels_for_page(gray)
-                log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
+                panels, detect_method = _detect_panels_for_page(gray)
+                log.debug("[%s] img %d: detected %d panel(s) via %s", chapter.tag, panel_idx, len(panels), detect_method)
+                detect_method_counts[detect_method] += 1
 
                 content_mask = _build_dilated_content_mask(gray)
                 content_mask = _add_text_boxes_to_mask(content_mask, gray)
@@ -1643,8 +1655,14 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
         frames=frame_entries,
     )
     manifest.save(manifest_path)
-    log.info("[%s] sliced %d source pages into %d canonical frames (contour-based detection)",
-             chapter.tag, len(chapter.panel_paths), len(frame_entries))
+    # Accurate summary of which detector(s) actually ran across this
+    # chapter's pages -- previously hardcoded to always claim
+    # "(contour-based detection)" regardless of what really happened,
+    # which was actively misleading (e.g. showed that label even when
+    # every page went through the gutter-aware or YOLO path instead).
+    method_summary = ", ".join(f"{count}x {name}" for name, count in detect_method_counts.most_common())
+    log.info("[%s] sliced %d source pages into %d canonical frames (detection: %s)",
+             chapter.tag, len(chapter.panel_paths), len(frame_entries), method_summary or "none")
     return [(Path(f.path), f.source_index) for f in manifest.frames]
 
 
