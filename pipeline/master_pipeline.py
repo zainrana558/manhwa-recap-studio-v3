@@ -2290,8 +2290,31 @@ def render_chapter(
     # a killed ffmpeg process, or disk pressure can all leave a file that
     # opens but is truncated, has no audio stream, or is far shorter than
     # expected — ffmpeg exiting 0 is not sufficient proof of a good file).
+    #
+    # Tolerance scales with chapter length (5% of expected duration, floor
+    # 5.0s) instead of a flat 5.0s regardless of length. A flat 5s cap is
+    # ~1% margin on a long, many-frame chapter — far tighter than the real,
+    # benign cumulative drift that legitimately accumulates from several
+    # independent, small sources across dozens of frames/segments: the
+    # loudnorm pass in build_chapter_audio_track shifting final audio
+    # duration via its own lookahead/limiter buffering, ffmpeg's internal
+    # frame-timebase rounding on each declared image duration, and the
+    # MIN_FRAME_DURATION floor's per-frame stretching all being reconciled
+    # independently rather than as one exact running total. None of that
+    # is perceptible in the actual video — audio/video sync is governed by
+    # the real rendered file, not this internal bookkeeping estimate — but
+    # a real production run hit exactly this: a 66-frame, ~482s chapter's
+    # actual rendered duration (496.36s, a 2.9% difference) tripped the old
+    # flat 5.0s tolerance on all 3 retries, and every retry produces the
+    # identical deterministic drift (it's not transient/flaky), so all 3
+    # failed identically and the chapter's entire real, correct 66 panels
+    # got thrown away for an 8-minute black "unavailable" placeholder.
+    # A genuinely broken render (a chapter that comes out a few seconds
+    # long instead of several minutes) still fails obviously under a
+    # percentage check.
     qa_tolerance = float(os.environ.get("VIDEO_QA_TOLERANCE_SECONDS", "5.0"))
     expected_duration = sum(frame_durations)
+    qa_tolerance = max(qa_tolerance, expected_duration * 0.05)
     qa = video_qa(tmp_path, audio_expected=has_audio, expected_duration=expected_duration, tolerance=qa_tolerance)
     if not qa.ok:
         quarantine_dir = cfg.temp_chapters_dir / "quarantine"

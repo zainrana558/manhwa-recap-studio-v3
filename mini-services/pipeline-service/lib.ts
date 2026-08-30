@@ -1564,7 +1564,28 @@ export async function generateImageNarrationsOCR(
             totalRegionsDetected += regions
             freshlyProcessed++
             if (regions > 0) panelsWithRegionsDetected++
-            if (status !== 'SUCCESS') imageCallFailures++
+            // A real failure is either an explicit FAILED status (main.py
+            // only ever sets this for genuine processing errors -- a
+            // corrupt/unreadable image file, or an uncaught cascade
+            // exception -- never for an ordinary empty panel; its own
+            // _quality_status() helper only ever returns SUCCESS or
+            // UNCERTAIN) or an UNCERTAIN result where text regions WERE
+            // detected but not confidently read (regions > 0, matching
+            // uncertainWithRegions below). An UNCERTAIN result with
+            // regions === 0 is the normal, expected outcome for a panel
+            // with no dialogue at all (manhwa chapters are frequently 80%+
+            // silent/action panels) and must not count as a failure.
+            // Confirmed directly against a real job: 24/66 panels were
+            // correctly-silent (0 real recognition misses per the OCR
+            // summary, 0 FAILED-status results), but the OLD
+            // `if (status !== 'SUCCESS') imageCallFailures++` here counted
+            // all 24 as failures anyway, tripping ocrServiceFailing's 30%
+            // threshold below and throwing away a chapter's worth of
+            // already-good RapidOCR/PaddleOCR results in favor of a VLM
+            // fallback (which had no API key configured) and then a
+            // Tesseract re-transcription of the entire chapter -- actively
+            // degrading results that didn't need any fallback at all.
+            if (status === 'FAILED' || (status !== 'SUCCESS' && regions > 0)) imageCallFailures++
 
             if (regions > 0 && status !== 'SUCCESS') {
               uncertainWithRegions++
