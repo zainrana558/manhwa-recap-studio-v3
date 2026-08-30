@@ -234,6 +234,29 @@ export PROJECT_ROOT="$PROJECT_DIR"
 # base directory, matching this constant's fallback exactly.
 export DATA_DIR="$PROJECT_DIR/data"
 
+# Same bug class, a third victim: lib.ts's PYTHON_BIN falls back to the
+# bare string 'python3' via the same too-late process.env read (see
+# PROJECT_ROOT above). Since it's a bare command name, not a path,
+# resolving it depends entirely on process.env.PATH at the moment
+# spawnSync actually runs it -- and index.ts's loadDotenv({override:
+# true}) OVERWRITES process.env.PATH with .env's own PATH= value
+# (deliberately just piper's directory + standard system dirs, written
+# by setup.sh, which predates this venv-PATH-prepending export and was
+# never meant to duplicate it) once it finally runs. That value does not
+# include this venv's bin/ directory, so by job-processing time the
+# bare 'python3' resolves to the system interpreter instead of this
+# venv's -- confirmed directly against a real job: it failed with
+# "ModuleNotFoundError: No module named 'PIL'", a package that is
+# installed in the venv (verified during setup.sh's own dependency
+# verification step) but not system-wide. Exporting an ABSOLUTE path
+# here, rather than just fixing the bare command name, sidesteps
+# process.env.PATH entirely regardless of what later overwrites it --
+# spawnSync uses this exact binary directly with no PATH search
+# involved at all.
+if [ -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+    export PYTHON_BIN="$PROJECT_DIR/.venv/bin/python3"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PROCESS MANAGEMENT HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
