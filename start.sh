@@ -202,6 +202,38 @@ fi
 export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
 export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
 
+# mini-services/pipeline-service/lib.ts computes
+# `PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd()` at MODULE
+# LOAD TIME (a top-level const). pipeline-service's own index.ts does try
+# to load the project-root .env (which setup.sh does populate with a
+# correct PROJECT_ROOT=... line) via an absolute path immune to cwd —
+# but ES module import resolution evaluates ALL of a file's imports
+# (including a later `import ... from './lib'`) before ANY of that
+# file's own top-level statements run, regardless of where the import
+# is textually positioned relative to the .env-loading call. Confirmed
+# directly with a minimal reproduction: lib.ts's PROJECT_ROOT constant
+# is locked in from its process.cwd() fallback before index.ts's
+# loadDotenv() call ever executes. Since this script `cd`s into
+# mini-services/pipeline-service/ before launching it (correctly, since
+# that's where `bun run start` needs to run from), that fallback
+# resolves to the wrong directory — confirmed directly against a real
+# job: every path master_pipeline.py was invoked with (the script path
+# itself, --input-dir, --output, --work-dir, --progress-file) had
+# "mini-services/pipeline-service" wrongly appended into the middle of
+# it. Exporting this explicitly here, the same way PIPELINE_SECRET
+# already is, sidesteps the module-ordering issue entirely: shell-
+# exported environment variables exist before any JS/TS code runs at
+# all, so process.env.PROJECT_ROOT is correct from the very first line
+# of module evaluation, no import-order subtlety involved.
+export PROJECT_ROOT="$PROJECT_DIR"
+# Same reasoning and same module-load-timing bug as PROJECT_ROOT above —
+# lib.ts's DATA_DIR constant has its own independent process.cwd()-based
+# fallback (not derived from PROJECT_ROOT), so fixing PROJECT_ROOT alone
+# does not fix this one too. Confirmed directly: the actual broken job
+# command line showed every data/jobs/... path built from the wrong
+# base directory, matching this constant's fallback exactly.
+export DATA_DIR="$PROJECT_DIR/data"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PROCESS MANAGEMENT HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
