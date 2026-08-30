@@ -1573,25 +1573,18 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     # caption merged with the panel above/below it) was
                     # unconditionally sliced into 4 overlapping panning
                     # windows down its height instead of shown as one
-                    # correctly-composited frame. Each window shows a
-                    # partial, vertically-shifted slice of the SAME
-                    # content -- exactly the visual signature a real job's
-                    # output showed: a thin band of caption text with the
-                    # same text bleeding through blurred above and below it
-                    # at different vertical offsets, in what looked like
-                    # (but was not) a gutter-detection slicing bug. 3.0 is
-                    # a reasoned, conservative increase: comfortably above
-                    # ordinary tall webtoon panels' typical range while
-                    # still catching genuinely extreme, multi-screen-tall
-                    # content this function's docstring describes (a real
-                    # "status window"-style UI element, which Solo
-                    # Leveling specifically does use as a narrative
-                    # device) -- not validated against that specific
-                    # content, since scraped chapter images aren't
-                    # available in this environment; worth confirming a
-                    # real status-window panel (if one appears in a tested
-                    # chapter) still renders sensibly after this change.
-                    if (ch / max(1, cw)) > 3.0:
+                    # correctly-composited frame.
+                    #
+                    # Even at 3.0, real jobs kept showing the same bug for
+                    # crops that legitimately exceed that ratio -- so
+                    # _should_scroll_fragment additionally gates this on
+                    # the text detector's own judgment: if a single
+                    # detected text box already covers most of this
+                    # crop's area, it IS essentially one caption/dialogue
+                    # block, not a multi-element scrollable UI list,
+                    # regardless of raw aspect ratio. See that function's
+                    # own docstring for the full reasoning.
+                    if _should_scroll_fragment(cw, ch, crop):
                         from PIL import Image as PILImage
                         # Tall UI/quest cards get sliced into several panning
                         # sub-frames for display. They all show fragments of
@@ -1653,6 +1646,52 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     log.info("[%s] sliced %d source pages into %d canonical frames (contour-based detection)",
              chapter.tag, len(chapter.panel_paths), len(frame_entries))
     return [(Path(f.path), f.source_index) for f in manifest.frames]
+
+
+SCROLL_FRAGMENT_ASPECT_RATIO = 3.0  # raised from 1.8 -- see _should_scroll_fragment
+SCROLL_FRAGMENT_ONE_CAPTION_AREA_RATIO = 0.6  # a single text box covering more than
+# this fraction of the crop's area means the crop is essentially one
+# caption, not a multi-element UI card -- see _should_scroll_fragment.
+
+
+def _should_scroll_fragment(cw: int, ch: int, crop) -> bool:
+    """Decide whether a tall crop should be panned through as several
+    overlapping video frames (see _generate_ui_card_scroll_frames) or
+    shown as a single, correctly-composited frame.
+
+    Two-part gate: the crop must first be tall enough
+    (height/width > SCROLL_FRAGMENT_ASPECT_RATIO) to even be considered,
+    then the text detector (see _detect_text_boxes,
+    ogkalu/comic-text-and-bubble-detector) gets the final say -- if a
+    single detected text box already covers most of the crop's area, the
+    crop IS essentially one caption/dialogue block, not a multi-element
+    scrollable UI list, regardless of raw aspect ratio.
+
+    This matters beyond just visual correctness: researched, established
+    practice for image+narration video sync (the pattern used across
+    MoviePy/ffmpeg slideshow-narration tooling generally) is "one image,
+    one audio clip, no internal subdivision" -- fragmenting a single
+    caption into multiple video frames is what forces the downstream
+    code to split one TTS segment's audio across multiple frames at all,
+    which is the structural root of audio/panel sync issues for this
+    class of content, not just a cosmetic slicing problem.
+
+    Falls back to the plain aspect-ratio gate alone if the detector is
+    unavailable (returns no boxes), same "degrade, don't crash" pattern
+    as everywhere else it's used -- a real production job kept showing
+    the fragmentation bug even after raising the aspect-ratio threshold
+    alone, from crops that legitimately exceed it (e.g. a caption merged
+    with panel content above/below it during boundary detection).
+    """
+    if (ch / max(1, cw)) <= SCROLL_FRAGMENT_ASPECT_RATIO:
+        return False
+    crop_gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+    crop_area = max(1, cw * ch)
+    for (tx1, ty1, tx2, ty2) in _detect_text_boxes(crop_gray):
+        box_area = max(0, tx2 - tx1) * max(0, ty2 - ty1)
+        if box_area / crop_area > SCROLL_FRAGMENT_ONE_CAPTION_AREA_RATIO:
+            return False  # one big caption -- don't fragment it
+    return True
 
 
 def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["Image.Image"]:

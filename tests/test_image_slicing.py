@@ -89,6 +89,61 @@ def test_ui_card_aspect_ratio_and_scrolling():
         assert frame.size == (1920, 1080), f"Frame canvas size should be 1920x1080, got {frame.size}"
 
 
+def test_should_scroll_fragment_short_crop_never_fragments(monkeypatch):
+    """A crop at or below the aspect-ratio threshold should never be
+    scroll-fragmented, regardless of what the text detector sees."""
+    monkeypatch.setattr(mp, "_detect_text_boxes", lambda gray: [])
+    short_crop = Image.new("RGB", (400, 800), (255, 255, 255))  # aspect 2.0
+    assert mp._should_scroll_fragment(400, 800, short_crop) is False
+
+
+def test_should_scroll_fragment_tall_crop_no_detector_fragments(monkeypatch):
+    """A tall crop with no dominant single text box (detector sees
+    nothing, or several small boxes) should still scroll-fragment --
+    this is the genuine "multi-element UI card" case the feature exists
+    for, and must keep working when the detector is unavailable too."""
+    monkeypatch.setattr(mp, "_detect_text_boxes", lambda gray: [])
+    tall_crop = Image.new("RGB", (400, 1600), (255, 255, 255))  # aspect 4.0
+    assert mp._should_scroll_fragment(400, 1600, tall_crop) is True
+
+
+def test_should_scroll_fragment_one_big_caption_does_not_fragment(monkeypatch):
+    """A tall crop where a single detected text box covers most of its
+    area is essentially one caption, not a UI card -- must NOT be
+    scroll-fragmented, since fragmenting it is what forces the
+    downstream pipeline to split one narration audio clip across
+    multiple video frames sharing it (the structural root of audio/panel
+    sync issues for this class of content)."""
+    cw, ch = 400, 1600  # aspect 4.0
+
+    def fake_one_big_box(gray):
+        h, w = gray.shape[:2]
+        return [(int(w * 0.05), int(h * 0.1), int(w * 0.95), int(h * 0.9))]  # ~76% of area
+
+    monkeypatch.setattr(mp, "_detect_text_boxes", fake_one_big_box)
+    tall_crop = Image.new("RGB", (cw, ch), (255, 255, 255))
+    assert mp._should_scroll_fragment(cw, ch, tall_crop) is False
+
+
+def test_should_scroll_fragment_scattered_small_boxes_still_fragments(monkeypatch):
+    """Several small, scattered text boxes (a real multi-line stat-list
+    UI card) -- none individually dominant -- should still fragment."""
+    cw, ch = 400, 1600
+
+    def fake_scattered_boxes(gray):
+        h, w = gray.shape[:2]
+        return [
+            (10, 10, w - 10, 60),
+            (10, 200, w - 10, 250),
+            (10, 500, w - 10, 550),
+            (10, 1000, w - 10, 1050),
+        ]
+
+    monkeypatch.setattr(mp, "_detect_text_boxes", fake_scattered_boxes)
+    tall_crop = Image.new("RGB", (cw, ch), (255, 255, 255))
+    assert mp._should_scroll_fragment(cw, ch, tall_crop) is True
+
+
 def test_clean_panel_boundary_edge_trimming():
     """Verify that stray top/bottom edge fragments from adjacent panels (e.g. fire panel bleed)
     are cleaned before finalizing slice output.
