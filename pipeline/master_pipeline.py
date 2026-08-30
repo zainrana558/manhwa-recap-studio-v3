@@ -1963,10 +1963,33 @@ def _synthesize_with_piper(text: str, out_wav: Path) -> None:
     # If model is a relative path or filename, let piper resolve it unless explicitly missing as an absolute path
     if Path(model).is_absolute() and not Path(model).exists():
         raise RuntimeError(f"piper voice model unavailable: {model}")
-    with subprocess.Popen([piper, "--model", model, "--output_file", str(out_wav)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+    # Deliberately NOT `with subprocess.Popen(...) as proc:` here -- verified
+    # directly with an isolated timing test that Popen's context-manager
+    # __exit__ calls its own unconditional (untimed) wait() while
+    # propagating a TimeoutExpired raised inside the block, which blocks
+    # until the child actually exits on its own instead of the requested
+    # timeout: a `sleep 10` process with `communicate(timeout=1)` measured
+    # at 10.00s end-to-end through the with-statement, vs 1.00s with the
+    # explicit try/except/kill pattern below. That means this function's
+    # 120s cap was not actually enforced -- a slow or stuck Piper
+    # synthesis (long RAW/VERBATIM-mode text under CPU load competing
+    # with rendering/OCR is exactly the realistic trigger) could hang far
+    # past 120s instead of failing over to eSpeak as
+    # synthesize_segment_audio's cascade intends, which is a real,
+    # plausible contributor to narration going missing or a whole job
+    # stalling on one segment.
+    proc = subprocess.Popen(
+        [piper, "--model", model, "--output_file", str(out_wav)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
         _out, err = proc.communicate(text, timeout=120)
-        if proc.returncode != 0:
-            raise RuntimeError(f"piper failed: {err[-200:]}")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()  # reap the killed process so it doesn't linger as a zombie
+        raise RuntimeError("piper timed out after 120s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"piper failed: {err[-200:]}")
 
 
 def _srt_to_vtt(srt_content: str) -> str:
@@ -1981,6 +2004,63 @@ def _srt_to_vtt(srt_content: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_case_for_tts(text: str) -> str:
+    """Convert shouty ALL-CAPS comic lettering to normal sentence case
+    before handing text to a TTS engine.
+
+    Comic/manhwa lettering is drawn in all-caps by convention -- a purely
+    visual/stylistic choice by the letterer, carrying no more semantic
+    weight than the specific font used -- but production neural TTS
+    engines do not treat it as mere styling. Microsoft's own documentation
+    on Azure/Edge neural voices (the same voice family this pipeline's
+    primary engine, edge-tts, uses) explicitly confirms capitalization
+    changes text-normalization and pronunciation behavior. Feeding raw
+    all-caps OCR text straight to TTS is exactly the out-of-distribution
+    input neural TTS models were never trained on (their training
+    transcripts are ordinary mixed-case text) -- the documented cause of
+    unnatural, shouty, or inconsistently-pronounced narration.
+
+    This can't perfectly recover "proper" capitalization -- comic
+    lettering doesn't preserve the original case distinction at all, so a
+    name like "JINWOO" and a word like "STOP" are visually identical --
+    but sentence case is still a strict improvement over leaving text
+    all-caps, and is the standard mitigation this class of problem gets
+    in practice.
+
+    Leaves already-mixed-case text (e.g. from an upstream narration LLM
+    rewrite, when one is configured) completely untouched -- only
+    triggers when the text is actually shouty in the first place.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    letters = [c for c in stripped if c.isalpha()]
+    if not letters:
+        return stripped
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio < 0.8:
+        return stripped
+
+    lowered = stripped.lower()
+    parts = re.split(r'([.!?]+\s*)', lowered)
+    rebuilt = []
+    capitalize_next = True
+    for part in parts:
+        if not part:
+            continue
+        if capitalize_next and part[0].isalpha():
+            part = part[0].upper() + part[1:]
+            capitalize_next = False
+        if re.fullmatch(r'[.!?]+\s*', part):
+            capitalize_next = True
+        rebuilt.append(part)
+    result = "".join(rebuilt)
+    # Standalone "i" -> "I" is a basic English capitalization rule
+    # regardless of sentence position; cheap and worth restoring.
+    result = re.sub(r'\bi\b', 'I', result)
+    return result
+
+
 def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, text: str) -> tuple:
     """Generate atomic segment audio with Edge-TTS (primary), Piper ONNX (fallback), eSpeak NG (tertiary fallback).
     Also exports matching .vtt / .srt timing markers alongside Edge-TTS audio outputs for caption syncing.
@@ -1989,6 +2069,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
     final_path = seg_audio_dir / f"{tag}.wav"
     text = text.strip()
+    text = _normalize_case_for_tts(text)
     if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
         return final_path, False
 
