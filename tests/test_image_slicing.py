@@ -75,8 +75,10 @@ def test_featureless_vfx_frame_suppression():
 
 
 def test_ui_card_aspect_ratio_and_scrolling():
-    """Verify that tall rectangular system/quest UI panels (aspect > 1.8) generate
-    vertical scroll sub-frames maintaining full resolution width rather than squishing.
+    """Verify that tall rectangular system/quest UI panels (aspect > 3.0,
+    raised from 1.8 -- see the comment at slice_chapter_panels' call site
+    for why) generate vertical scroll sub-frames maintaining full
+    resolution width rather than squishing.
     """
     # 1000h x 400w tall UI card (aspect ratio height/width = 2.5)
     ui_crop = Image.new("RGB", (400, 1000), (30, 30, 60))

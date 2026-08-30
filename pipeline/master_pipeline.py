@@ -1467,7 +1467,40 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         continue
 
                     cw, ch = crop.size
-                    if (ch / max(1, cw)) > 1.8:
+                    # Threshold raised from 1.8 -- mathematically confirmed
+                    # this was firing on ordinary tall panels, not just the
+                    # "system/quest UI card" content it was meant for.
+                    # _generate_ui_card_scroll_frames's own internal early
+                    # return (`if window_h >= ch: return one frame`) can
+                    # NEVER trigger for any crop that reaches it, because
+                    # window_h is always crop_width * 0.5625 (a 16:9 ratio)
+                    # and the caller only invokes it when ch/cw already
+                    # exceeds this threshold -- so with the old 1.8 gate,
+                    # every merged caption/panel crop with a remotely tall
+                    # aspect ratio (extremely common in vertical webtoon
+                    # scroll format, e.g. a standing character shot or a
+                    # caption merged with the panel above/below it) was
+                    # unconditionally sliced into 4 overlapping panning
+                    # windows down its height instead of shown as one
+                    # correctly-composited frame. Each window shows a
+                    # partial, vertically-shifted slice of the SAME
+                    # content -- exactly the visual signature a real job's
+                    # output showed: a thin band of caption text with the
+                    # same text bleeding through blurred above and below it
+                    # at different vertical offsets, in what looked like
+                    # (but was not) a gutter-detection slicing bug. 3.0 is
+                    # a reasoned, conservative increase: comfortably above
+                    # ordinary tall webtoon panels' typical range while
+                    # still catching genuinely extreme, multi-screen-tall
+                    # content this function's docstring describes (a real
+                    # "status window"-style UI element, which Solo
+                    # Leveling specifically does use as a narrative
+                    # device) -- not validated against that specific
+                    # content, since scraped chapter images aren't
+                    # available in this environment; worth confirming a
+                    # real status-window panel (if one appears in a tested
+                    # chapter) still renders sensibly after this change.
+                    if (ch / max(1, cw)) > 3.0:
                         from PIL import Image as PILImage
                         # Tall UI/quest cards get sliced into several panning
                         # sub-frames for display. They all show fragments of
