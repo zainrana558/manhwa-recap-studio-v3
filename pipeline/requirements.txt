@@ -8,3 +8,7 @@ torch>=2.0.0,<3.0.0
 torchvision>=0.15.0,<1.0.0
 ultralytics~=8.0
 huggingface-hub~=0.20
+# RT-DETR-v2 support (ogkalu/comic-text-and-bubble-detector, see
+# pipeline/master_pipeline.py's TEXT_DETECTOR_MODEL_ID comment) landed in
+# transformers on 2025-02-06 -- floor set comfortably above that release.
+transformers>=4.50.0

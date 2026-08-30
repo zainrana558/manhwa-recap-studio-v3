@@ -84,38 +84,50 @@ CANVAS_W, CANVAS_H = 1920, 1080
 OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 FPS = 24  # YouTube-standard 24fps
 
-# Manga panel/text detector (YOLO26-nano, fine-tuned on Manga109-s).
-# Apache-2.0, ~15MB, benchmarked at ~100-180ms/image on CPU (see the
-# model card) -- chosen specifically over heavier alternatives (e.g. the
-# "magi" transformer model, ~2GB, GPU-oriented, personal/research-only
-# license) because this project runs unattended on a CPU-only Oracle Free
-# Tier box. Downloaded at setup time (see start.sh's dependency bootstrap,
-# same pattern as the Piper TTS voice model) rather than committed to git.
-# Detects two classes: 0=panel, 1=text. The `text` class is the piece this
-# pipeline actually lacked: _build_dilated_content_mask's simple pixel
-# threshold correctly keeps a cut from crossing a single line of text (the
-# existing _check_bubble_union guarantee), but has no notion that several
-# separate text lines belong to the same caption/dialogue box -- the white
-# gap *between* two lines of one caption reads identically, pixel-wise, to
-# a genuine inter-panel gutter. A real job's output showed exactly this:
-# multi-line captions sliced into single-line-height fragments, each
-# shown as its own frame. Feeding this model's text-box detections into
-# the content mask as guaranteed-filled rectangles (see
-# _add_yolo_text_boxes_to_mask) fixes that at the source instead of
-# trying to out-guess it with more pixel-level heuristics.
+# Comic text/bubble detector: ogkalu/comic-text-and-bubble-detector
+# (RT-DETR-v2 r50vd, Apache-2.0, 42.9M params). Superseded an earlier
+# choice (a YOLO26-nano model fine-tuned on Manga109-s only) after real
+# jobs kept showing the exact same caption-fragmentation bug despite two
+# rounds of downstream patches (a scroll-fragmentation threshold fix,
+# and this pipeline's own panel-merge logic) -- research into how a
+# real, actively-used production tool solves this exact problem
+# (comic-translate, github.com/ogkalu2/comic-translate) turned up this
+# model specifically: fine-tuned on 11k Manga/Webtoon/Manhua/Western
+# comic images, explicitly with "Tall Webtoons split vertically" as a
+# TRAINING preprocessing step -- direct, proven precedent (not just
+# researched-and-reasoned-about, like the Manga109-only model this
+# replaces) for how to handle the tall vertical-scroll format this
+# pipeline's actual content uses. Also has the specific class this bug
+# needed: `text_free` (text outside a speech bubble) is exactly what a
+# manhwa narration caption is -- a plain bordered box, not a bubble with
+# a tail -- something the earlier model's generic binary panel/text
+# classes, and a webtoon-trained but bubble-only sibling YOLO model
+# considered along the way, don't distinguish.
 #
-# Caveat, stated plainly rather than overclaiming: Manga109 (the training
-# dataset) is traditional page-grid Japanese manga, not the tall
-# single-column vertical-scroll format actual webtoons (this pipeline's
-# primary content) use. Text-box detection is fairly layout-agnostic (a
-# bordered caption box looks similar either way) so it should still help,
-# but this hasn't been validated on real webtoon pages -- only researched
-# and reasoned about. Falls back to the pre-existing pixel-only mask
-# untouched if the model is missing or fails to load, so this is additive
-# and safe either way.
-YOLO_TEXT_MODEL_PATH = Path(__file__).parent / "models" / "manga_panel_detector_fp32.pt"
-_yolo_text_model = None  # type: Any
-_yolo_text_model_load_attempted = False
+# Classes: 0=bubble, 1=text_bubble (dialogue inside a bubble),
+# 2=text_free (caption/narration text outside any bubble). Both text
+# classes are treated as protected regions here (see
+# _add_text_boxes_to_mask) -- either kind of real text is exactly what a
+# gutter cut must never slice through.
+#
+# Downloaded at setup time (see start.sh's dependency bootstrap, same
+# pattern as the Piper TTS voice model) rather than committed to git.
+# Falls back to the pre-existing pixel-only mask untouched if the model
+# is missing or fails to load, so this remains additive and safe either
+# way, same as the model it replaces.
+TEXT_DETECTOR_MODEL_ID = "ogkalu/comic-text-and-bubble-detector"
+TEXT_DETECTOR_LOCAL_DIR = Path(__file__).parent / "models" / "comic-text-and-bubble-detector"
+_text_detector_model = None  # type: Any
+_text_detector_processor = None  # type: Any
+_text_detector_load_attempted = False
+# A crop taller than this multiple of its own width gets split into
+# overlapping vertical bands before detection, each band's own
+# detections offset back into the original crop's coordinates and
+# merged -- directly mirroring how the model's own training data
+# ("Tall Webtoons were split vertically") was prepared, rather than
+# feeding it a single extreme-aspect-ratio image its training
+# distribution didn't actually contain examples of.
+TALL_IMAGE_SPLIT_ASPECT_RATIO = 2.0
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
 SILENT_FRAME_DURATION = 2.0  # seconds a no-text panel holds on screen — deliberately SHORTER
@@ -576,57 +588,136 @@ def discover_chapters(cfg: PipelineConfig) -> List[Chapter]:
 # disqualified as a cut candidate.
 # ---------------------------------------------------------------------------
 
-def _get_yolo_text_model():
-    """Lazily load and cache the manga panel/text YOLO model (see
-    YOLO_TEXT_MODEL_PATH above). Loaded at most once per process; returns
-    None (cheaply, on every subsequent call) if it's missing or fails to
-    load, so callers can unconditionally check the return value rather
-    than needing their own separate "is this available" flag."""
-    global _yolo_text_model, _yolo_text_model_load_attempted
-    if _yolo_text_model_load_attempted:
-        return _yolo_text_model
-    _yolo_text_model_load_attempted = True
-    if not YOLO_TEXT_MODEL_PATH.exists():
-        log.info("Manga panel/text YOLO model not found at %s — skipping (pixel-only mask still applies)", YOLO_TEXT_MODEL_PATH)
-        return None
+def _get_text_detector():
+    """Lazily load and cache the comic text/bubble detector (RT-DETR-v2,
+    see TEXT_DETECTOR_MODEL_ID above). Loaded at most once per process;
+    returns (None, None) cheaply on every subsequent call if it's missing
+    or fails to load, so callers can unconditionally check the return
+    value rather than needing their own separate "is this available"
+    flag. Returns (model, image_processor) since RT-DETR-v2 inference via
+    transformers needs both."""
+    global _text_detector_model, _text_detector_processor, _text_detector_load_attempted
+    if _text_detector_load_attempted:
+        return _text_detector_model, _text_detector_processor
+    _text_detector_load_attempted = True
+    if not TEXT_DETECTOR_LOCAL_DIR.exists():
+        log.info("Comic text/bubble detector not found at %s — skipping (pixel-only mask still applies)", TEXT_DETECTOR_LOCAL_DIR)
+        return None, None
     try:
-        from ultralytics import YOLO
-        _yolo_text_model = YOLO(str(YOLO_TEXT_MODEL_PATH))
-        log.info("Loaded manga panel/text YOLO model from %s", YOLO_TEXT_MODEL_PATH)
+        from transformers import RTDetrImageProcessor, RTDetrV2ForObjectDetection
+        _text_detector_processor = RTDetrImageProcessor.from_pretrained(str(TEXT_DETECTOR_LOCAL_DIR))
+        _text_detector_model = RTDetrV2ForObjectDetection.from_pretrained(str(TEXT_DETECTOR_LOCAL_DIR))
+        _text_detector_model.eval()
+        log.info("Loaded comic text/bubble detector from %s", TEXT_DETECTOR_LOCAL_DIR)
     except Exception as exc:
-        log.warning("Failed to load manga panel/text YOLO model (%s) — continuing without it", exc)
-        _yolo_text_model = None
-    return _yolo_text_model
+        log.warning("Failed to load comic text/bubble detector (%s) — continuing without it", exc)
+        _text_detector_model = None
+        _text_detector_processor = None
+    return _text_detector_model, _text_detector_processor
 
 
-def _detect_text_boxes_yolo(img_gray) -> List[tuple]:
-    """Run the manga YOLO model on one page image, return only its
-    `text` class detections (class 1) as (x1, y1, x2, y2) boxes in the
-    image's own pixel coordinates. Empty list if the model is unavailable
-    or detects nothing -- always a safe, cheap no-op for callers."""
-    model = _get_yolo_text_model()
+def _detect_text_boxes_raw(img_gray) -> List[tuple]:
+    """Run the text/bubble detector on ONE image as-is (no tall-image
+    splitting -- see _detect_text_boxes for that), returning only its
+    text_bubble and text_free class detections (both represent real,
+    readable text; text_free specifically covers caption/narration boxes
+    outside any speech bubble, which a plain bubble-only detector
+    wouldn't distinguish from the empty bubble class) as (x1,y1,x2,y2)
+    boxes in the image's own pixel coordinates. Empty list if the model
+    is unavailable or detects nothing.
+    """
+    model, processor = _get_text_detector()
     if model is None:
         return []
     try:
-        img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR) if img_gray.ndim == 2 else img_gray
-        results = model.predict(img_bgr, conf=0.25, iou=0.45, imgsz=1024, verbose=False)
-        if not results or results[0].boxes is None:
-            return []
+        import torch
+        from PIL import Image as PILImage
+        img_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB) if img_gray.ndim == 2 else img_gray
+        pil_img = PILImage.fromarray(img_rgb)
+        inputs = processor(images=pil_img, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        results = processor.post_process_object_detection(
+            outputs, target_sizes=torch.tensor([(pil_img.height, pil_img.width)]), threshold=0.3,
+        )
         boxes = []
-        for box in results[0].boxes:
-            cls = int(box.cls[0])
-            if cls != 1:  # 0=panel, 1=text -- only want text here
-                continue
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            boxes.append((int(x1), int(y1), int(x2), int(y2)))
+        for result in results:
+            for label_id, box in zip(result["labels"], result["boxes"]):
+                label = int(label_id.item())
+                if label not in (1, 2):  # 1=text_bubble, 2=text_free
+                    continue
+                x1, y1, x2, y2 = [round(float(v)) for v in box.tolist()]
+                boxes.append((x1, y1, x2, y2))
         return boxes
     except Exception as exc:
-        log.warning("YOLO text-box detection failed (%s) — continuing with pixel-only mask", exc)
+        log.warning("Text/bubble detection failed (%s) — continuing with pixel-only mask", exc)
         return []
 
 
-def _add_yolo_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
-    """Fill each YOLO-detected text box into `mask` as a solid rectangle.
+def _detect_text_boxes(img_gray) -> List[tuple]:
+    """Run text/bubble detection on `img_gray`, splitting it into
+    overlapping vertical bands first if it's unusually tall.
+
+    Directly mirrors this model's own training preprocessing
+    ("Tall Webtoons were split vertically", per its model card) rather
+    than feeding it a single extreme-aspect-ratio image its training
+    distribution didn't contain examples of -- a real, tall vertical
+    manhwa page (or a merged multi-panel crop) fed in whole is out of
+    distribution for a detector trained on pre-split, more reasonably-
+    proportioned bands, which is a very plausible reason detections were
+    still missing important text on this pipeline's actual webtoon
+    content even after switching to a webtoon-inclusive model.
+
+    Bands overlap by 20% of the band height so a text box that would
+    otherwise straddle a band boundary is fully visible in at least one
+    band. Detections from each band are offset back into the original
+    image's coordinates and merged, de-duplicating boxes that show up
+    in more than one overlapping band (by simple bounding-box containment
+    rather than a full NMS pass -- adequate here since overlapping bands
+    of the same source image produce near-identical, not just similar,
+    duplicate detections).
+    """
+    h, w = img_gray.shape[:2]
+    if w == 0 or h / max(1, w) <= TALL_IMAGE_SPLIT_ASPECT_RATIO:
+        return _detect_text_boxes_raw(img_gray)
+
+    band_h = w * TALL_IMAGE_SPLIT_ASPECT_RATIO
+    overlap = band_h * 0.2
+    step = band_h - overlap
+    all_boxes = []  # type: List[tuple]
+    y = 0.0
+    while y < h:
+        band_top = int(y)
+        band_bot = int(min(h, y + band_h))
+        band = img_gray[band_top:band_bot, :]
+        for (x1, y1, x2, y2) in _detect_text_boxes_raw(band):
+            all_boxes.append((x1, y1 + band_top, x2, y2 + band_top))
+        if band_bot >= h:
+            break
+        y += step
+
+    # De-duplicate: drop any box that's near-fully contained within an
+    # already-kept box from an earlier (overlapping) band.
+    deduped = []  # type: List[tuple]
+    for box in all_boxes:
+        x1, y1, x2, y2 = box
+        area = max(1, (x2 - x1) * (y2 - y1))
+        is_dup = False
+        for kx1, ky1, kx2, ky2 in deduped:
+            ix1, iy1 = max(x1, kx1), max(y1, ky1)
+            ix2, iy2 = min(x2, kx2), min(y2, ky2)
+            if ix2 > ix1 and iy2 > iy1:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                if inter / area > 0.8:
+                    is_dup = True
+                    break
+        if not is_dup:
+            deduped.append(box)
+    return deduped
+
+
+def _add_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
+    """Fill each detected text box into `mask` as a solid rectangle.
 
     This is what actually fixes multi-line captions getting sliced into
     single-line fragments: _build_dilated_content_mask's pixel threshold
@@ -641,7 +732,7 @@ def _add_yolo_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
     box edge so an over-generous detection box doesn't accidentally
     swallow a genuine gutter running right alongside it.
     """
-    text_boxes = _detect_text_boxes_yolo(img_gray)
+    text_boxes = _detect_text_boxes(img_gray)
     if not text_boxes:
         return mask
     h, w = mask.shape[:2]
@@ -702,7 +793,7 @@ def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
         return [(0, 0, w, h)]
 
     mask = _build_dilated_content_mask(img_gray)
-    mask = _add_yolo_text_boxes_to_mask(mask, img_gray)
+    mask = _add_text_boxes_to_mask(mask, img_gray)
     components = _label_content_components(mask)
 
     n_slices = 8
@@ -1400,7 +1491,7 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
 
                 content_mask = _build_dilated_content_mask(gray)
-                content_mask = _add_yolo_text_boxes_to_mask(content_mask, gray)
+                content_mask = _add_text_boxes_to_mask(content_mask, gray)
 
                 merged_panel_boxes = []
                 for (px, py, pw, ph) in panels:

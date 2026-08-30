@@ -178,38 +178,65 @@ fi
 
 echo ""
 
-# --- Manga panel/text detector (YOLO26-nano, fine-tuned on Manga109-s) ---
-# See the YOLO_TEXT_MODEL_PATH comment in pipeline/master_pipeline.py for
-# the full reasoning. Apache-2.0, ~15MB, benchmarked ~100-180ms/image on
-# CPU. Purely additive: if this download fails or is skipped, the
-# pipeline silently falls back to its pre-existing pixel-only content
-# mask (logged once, not an error) -- same "degrade, don't crash"
-# pattern as the Piper download above.
-YOLO_TEXT_MODEL_DIR="$PROJECT_DIR/pipeline/models"
-YOLO_TEXT_MODEL_PATH="$YOLO_TEXT_MODEL_DIR/manga_panel_detector_fp32.pt"
-if [ ! -f "$YOLO_TEXT_MODEL_PATH" ]; then
-    echo "  Downloading manga panel/text detection model (YOLO26-nano)..."
-    mkdir -p "$YOLO_TEXT_MODEL_DIR"
-    YOLO_TEXT_MODEL_URL="https://huggingface.co/leoxs22/manga-panel-detector-yolo26n/resolve/main/manga_panel_detector_fp32.pt"
-    if curl -fsSL -o "$YOLO_TEXT_MODEL_PATH" "$YOLO_TEXT_MODEL_URL"; then
-        # Model card lists the source file as 14.8MB -- sanity-check the
-        # download landed roughly that size rather than e.g. an HTML error
-        # page saved under the .pt filename (curl -f catches most HTTP
-        # error statuses already, but not a redirect to a valid-but-wrong
-        # small page).
-        DOWNLOADED_SIZE=$(stat -c%s "$YOLO_TEXT_MODEL_PATH" 2>/dev/null || stat -f%z "$YOLO_TEXT_MODEL_PATH" 2>/dev/null || echo 0)
-        if [ "$DOWNLOADED_SIZE" -lt 1000000 ]; then
-            echo "  ⚠️  Downloaded file is only ${DOWNLOADED_SIZE} bytes (expected ~15MB) — discarding, falling back to pixel-only panel/caption detection"
-            rm -f "$YOLO_TEXT_MODEL_PATH"
-        else
-            echo "  ✅ Manga panel/text model downloaded (${DOWNLOADED_SIZE} bytes)"
-        fi
+# --- Comic text/bubble detector (ogkalu/comic-text-and-bubble-detector,
+#     RT-DETR-v2) ---
+# See the TEXT_DETECTOR_MODEL_ID comment in pipeline/master_pipeline.py
+# for the full reasoning (replaced an earlier Manga109-only YOLO model
+# after real jobs kept showing the same caption-fragmentation bug despite
+# downstream patches -- this one is trained on Manga/Webtoon/Manhua/
+# Western comics specifically, with "Tall Webtoons split vertically" as
+# an explicit training step). Apache-2.0, ~170MB. Downloaded via
+# huggingface_hub's snapshot_download (not a single curl -- unlike the
+# YOLO .pt file this replaces, an RT-DETR-v2 checkpoint loaded through
+# transformers needs the whole HF repo structure: config.json, weights,
+# and the image processor's preprocessor_config.json, not one file) into
+# this venv's own huggingface-hub/transformers install (already listed
+# in pipeline/requirements.txt -- if this venv predates that addition,
+# rerun `pip install -r pipeline/requirements.txt` first or this
+# download step will fail with an import error, which is caught and
+# degrades gracefully below same as any other failure mode here).
+# Purely additive either way: if this download fails, is skipped, or the
+# venv doesn't have transformers yet, the pipeline silently falls back to
+# its pre-existing pixel-only content mask (logged once, not an error) --
+# same "degrade, don't crash" pattern as the Piper download above.
+TEXT_DETECTOR_DIR="$PROJECT_DIR/pipeline/models/comic-text-and-bubble-detector"
+if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/null)" ]; then
+    echo "  Downloading comic text/bubble detector (RT-DETR-v2, ~170MB)..."
+    mkdir -p "$TEXT_DETECTOR_DIR"
+    # Capturing output to a variable first, THEN checking $? explicitly,
+    # rather than `if cmd | tail -5; then` -- without `set -o pipefail`
+    # (not set in this script), that pattern's exit status is tail's, not
+    # the python command's, and tail virtually always succeeds reading
+    # piped input regardless of the upstream failing. Confirmed directly:
+    # a deliberately-failing command through that exact pattern still
+    # printed "reported success". Would have meant a failed download
+    # always printed the ✅ success line and left a broken, empty model
+    # directory for the pipeline to trip over later with no clue why.
+    #
+    # `set +e` / `set -e` bracket this specific command: confirmed
+    # directly that a bare `VAR=$(failing_command)` assignment is NOT
+    # exempt from this script's `set -e` (unlike being part of an
+    # if-condition or && / || chain) -- it aborts the whole script right
+    # at that line, before DOWNLOAD_STATUS is ever read, which would
+    # have been the exact same class of `set -e` bug found and fixed
+    # earlier in this same script's kill_service()/kill_port() functions
+    # and the Next.js readiness check.
+    set +e
+    DOWNLOAD_OUTPUT=$("$PROJECT_DIR/.venv/bin/python3" -c "
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR')
+" 2>&1)
+    DOWNLOAD_STATUS=$?
+    set -e
+    if [ $DOWNLOAD_STATUS -eq 0 ]; then
+        echo "  ✅ Comic text/bubble detector downloaded"
     else
-        echo "  ⚠️  Manga panel/text model download failed — falling back to pixel-only panel/caption detection"
-        rm -f "$YOLO_TEXT_MODEL_PATH"
+        echo "  ⚠️  Comic text/bubble detector download failed (missing transformers/huggingface_hub in the venv, or a network issue) — falling back to pixel-only panel/caption detection"
+        echo "$DOWNLOAD_OUTPUT" | tail -5
+        rm -rf "$TEXT_DETECTOR_DIR"
     fi
 else
-    echo "  ✅ Manga panel/text model already present: $YOLO_TEXT_MODEL_PATH"
+    echo "  ✅ Comic text/bubble detector already present: $TEXT_DETECTOR_DIR"
 fi
 
 echo ""
