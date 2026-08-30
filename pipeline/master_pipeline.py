@@ -1564,6 +1564,22 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     crop_arr = np.array(crop)
                     crop_gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
 
+                    # Clean stray boundary-edge fragments bleeding in from an
+                    # adjacent panel (a solid near-black or near-white row
+                    # within the first/last ~15px of the crop) BEFORE the
+                    # blank-crop check and canvas composition. This is a
+                    # narrower, distinct case from _compose_canvas's own
+                    # whole-crop white-margin trim below: it catches a thin
+                    # bleed-through strip (including dark border lines,
+                    # which a white-only threshold can't catch), not a large
+                    # accumulated gutter margin. Was implemented and tested
+                    # (tests/test_image_slicing.py) but its only caller
+                    # (_trim_white_borders) was dead code removed in an
+                    # earlier cleanup pass, orphaning this function entirely
+                    # -- rewiring it here instead of leaving it dead.
+                    crop_arr, crop_gray = _clean_panel_boundary_edges(crop_arr, crop_gray)
+                    crop = Image.fromarray(crop_arr)
+
                     if _is_blank_crop(crop_gray):
                         total_blank_skipped += 1
                         log.debug("[%s] img %d: skipping blank panel", chapter.tag, panel_idx)
