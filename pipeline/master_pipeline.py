@@ -83,6 +83,39 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
 OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 FPS = 24  # YouTube-standard 24fps
+
+# Manga panel/text detector (YOLO26-nano, fine-tuned on Manga109-s).
+# Apache-2.0, ~15MB, benchmarked at ~100-180ms/image on CPU (see the
+# model card) -- chosen specifically over heavier alternatives (e.g. the
+# "magi" transformer model, ~2GB, GPU-oriented, personal/research-only
+# license) because this project runs unattended on a CPU-only Oracle Free
+# Tier box. Downloaded at setup time (see start.sh's dependency bootstrap,
+# same pattern as the Piper TTS voice model) rather than committed to git.
+# Detects two classes: 0=panel, 1=text. The `text` class is the piece this
+# pipeline actually lacked: _build_dilated_content_mask's simple pixel
+# threshold correctly keeps a cut from crossing a single line of text (the
+# existing _check_bubble_union guarantee), but has no notion that several
+# separate text lines belong to the same caption/dialogue box -- the white
+# gap *between* two lines of one caption reads identically, pixel-wise, to
+# a genuine inter-panel gutter. A real job's output showed exactly this:
+# multi-line captions sliced into single-line-height fragments, each
+# shown as its own frame. Feeding this model's text-box detections into
+# the content mask as guaranteed-filled rectangles (see
+# _add_yolo_text_boxes_to_mask) fixes that at the source instead of
+# trying to out-guess it with more pixel-level heuristics.
+#
+# Caveat, stated plainly rather than overclaiming: Manga109 (the training
+# dataset) is traditional page-grid Japanese manga, not the tall
+# single-column vertical-scroll format actual webtoons (this pipeline's
+# primary content) use. Text-box detection is fairly layout-agnostic (a
+# bordered caption box looks similar either way) so it should still help,
+# but this hasn't been validated on real webtoon pages -- only researched
+# and reasoned about. Falls back to the pre-existing pixel-only mask
+# untouched if the model is missing or fails to load, so this is additive
+# and safe either way.
+YOLO_TEXT_MODEL_PATH = Path(__file__).parent / "models" / "manga_panel_detector_fp32.pt"
+_yolo_text_model = None  # type: Any
+_yolo_text_model_load_attempted = False
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
 SILENT_FRAME_DURATION = 2.0  # seconds a no-text panel holds on screen — deliberately SHORTER
@@ -543,6 +576,86 @@ def discover_chapters(cfg: PipelineConfig) -> List[Chapter]:
 # disqualified as a cut candidate.
 # ---------------------------------------------------------------------------
 
+def _get_yolo_text_model():
+    """Lazily load and cache the manga panel/text YOLO model (see
+    YOLO_TEXT_MODEL_PATH above). Loaded at most once per process; returns
+    None (cheaply, on every subsequent call) if it's missing or fails to
+    load, so callers can unconditionally check the return value rather
+    than needing their own separate "is this available" flag."""
+    global _yolo_text_model, _yolo_text_model_load_attempted
+    if _yolo_text_model_load_attempted:
+        return _yolo_text_model
+    _yolo_text_model_load_attempted = True
+    if not YOLO_TEXT_MODEL_PATH.exists():
+        log.info("Manga panel/text YOLO model not found at %s — skipping (pixel-only mask still applies)", YOLO_TEXT_MODEL_PATH)
+        return None
+    try:
+        from ultralytics import YOLO
+        _yolo_text_model = YOLO(str(YOLO_TEXT_MODEL_PATH))
+        log.info("Loaded manga panel/text YOLO model from %s", YOLO_TEXT_MODEL_PATH)
+    except Exception as exc:
+        log.warning("Failed to load manga panel/text YOLO model (%s) — continuing without it", exc)
+        _yolo_text_model = None
+    return _yolo_text_model
+
+
+def _detect_text_boxes_yolo(img_gray) -> List[tuple]:
+    """Run the manga YOLO model on one page image, return only its
+    `text` class detections (class 1) as (x1, y1, x2, y2) boxes in the
+    image's own pixel coordinates. Empty list if the model is unavailable
+    or detects nothing -- always a safe, cheap no-op for callers."""
+    model = _get_yolo_text_model()
+    if model is None:
+        return []
+    try:
+        img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR) if img_gray.ndim == 2 else img_gray
+        results = model.predict(img_bgr, conf=0.25, iou=0.45, imgsz=1024, verbose=False)
+        if not results or results[0].boxes is None:
+            return []
+        boxes = []
+        for box in results[0].boxes:
+            cls = int(box.cls[0])
+            if cls != 1:  # 0=panel, 1=text -- only want text here
+                continue
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            boxes.append((int(x1), int(y1), int(x2), int(y2)))
+        return boxes
+    except Exception as exc:
+        log.warning("YOLO text-box detection failed (%s) — continuing with pixel-only mask", exc)
+        return []
+
+
+def _add_yolo_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
+    """Fill each YOLO-detected text box into `mask` as a solid rectangle.
+
+    This is what actually fixes multi-line captions getting sliced into
+    single-line fragments: _build_dilated_content_mask's pixel threshold
+    correctly protects a single line of ink, but the white space *between*
+    two lines of the same caption box reads identically to a real
+    inter-panel gutter, since there's no concept of "these separate lines
+    belong to one logical block" at the pixel level. Filling in the
+    model's own text bounding box turns the whole caption -- gaps
+    included -- into one solid, connected blob, so the existing
+    _check_bubble_union/gutter-scan logic (unchanged) naturally treats it
+    as one indivisible unit. A small inward margin is trimmed off each
+    box edge so an over-generous detection box doesn't accidentally
+    swallow a genuine gutter running right alongside it.
+    """
+    text_boxes = _detect_text_boxes_yolo(img_gray)
+    if not text_boxes:
+        return mask
+    h, w = mask.shape[:2]
+    margin = 2
+    for (x1, y1, x2, y2) in text_boxes:
+        x1 = max(0, x1 + margin)
+        y1 = max(0, y1 + margin)
+        x2 = min(w, x2 - margin)
+        y2 = min(h, y2 - margin)
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 255
+    return mask
+
+
 def _build_dilated_content_mask(img_gray, dark_thresh: int = 200) -> "np.ndarray":
     """Binary mask (255 = content) of everything that isn't near-white
     background, lightly dilated/closed so speech-bubble outlines, thin text
@@ -589,6 +702,7 @@ def _detect_panels_gutter_aware(img_gray) -> List[tuple]:
         return [(0, 0, w, h)]
 
     mask = _build_dilated_content_mask(img_gray)
+    mask = _add_yolo_text_boxes_to_mask(mask, img_gray)
     components = _label_content_components(mask)
 
     n_slices = 8
@@ -1286,6 +1400,7 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                 log.debug("[%s] img %d: detected %d panel(s)", chapter.tag, panel_idx, len(panels))
 
                 content_mask = _build_dilated_content_mask(gray)
+                content_mask = _add_yolo_text_boxes_to_mask(content_mask, gray)
 
                 merged_panel_boxes = []
                 for (px, py, pw, ph) in panels:

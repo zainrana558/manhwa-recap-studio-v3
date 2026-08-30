@@ -72,6 +72,7 @@ upload/
 pipeline/models/
 pipeline/piper/
 pipeline/voices/
+pipeline/models/
 data/cache/
 
 # Runtime artifacts

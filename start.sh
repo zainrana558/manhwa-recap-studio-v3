@@ -178,6 +178,42 @@ fi
 
 echo ""
 
+# --- Manga panel/text detector (YOLO26-nano, fine-tuned on Manga109-s) ---
+# See the YOLO_TEXT_MODEL_PATH comment in pipeline/master_pipeline.py for
+# the full reasoning. Apache-2.0, ~15MB, benchmarked ~100-180ms/image on
+# CPU. Purely additive: if this download fails or is skipped, the
+# pipeline silently falls back to its pre-existing pixel-only content
+# mask (logged once, not an error) -- same "degrade, don't crash"
+# pattern as the Piper download above.
+YOLO_TEXT_MODEL_DIR="$PROJECT_DIR/pipeline/models"
+YOLO_TEXT_MODEL_PATH="$YOLO_TEXT_MODEL_DIR/manga_panel_detector_fp32.pt"
+if [ ! -f "$YOLO_TEXT_MODEL_PATH" ]; then
+    echo "  Downloading manga panel/text detection model (YOLO26-nano)..."
+    mkdir -p "$YOLO_TEXT_MODEL_DIR"
+    YOLO_TEXT_MODEL_URL="https://huggingface.co/leoxs22/manga-panel-detector-yolo26n/resolve/main/manga_panel_detector_fp32.pt"
+    if curl -fsSL -o "$YOLO_TEXT_MODEL_PATH" "$YOLO_TEXT_MODEL_URL"; then
+        # Model card lists the source file as 14.8MB -- sanity-check the
+        # download landed roughly that size rather than e.g. an HTML error
+        # page saved under the .pt filename (curl -f catches most HTTP
+        # error statuses already, but not a redirect to a valid-but-wrong
+        # small page).
+        DOWNLOADED_SIZE=$(stat -c%s "$YOLO_TEXT_MODEL_PATH" 2>/dev/null || stat -f%z "$YOLO_TEXT_MODEL_PATH" 2>/dev/null || echo 0)
+        if [ "$DOWNLOADED_SIZE" -lt 1000000 ]; then
+            echo "  ⚠️  Downloaded file is only ${DOWNLOADED_SIZE} bytes (expected ~15MB) — discarding, falling back to pixel-only panel/caption detection"
+            rm -f "$YOLO_TEXT_MODEL_PATH"
+        else
+            echo "  ✅ Manga panel/text model downloaded (${DOWNLOADED_SIZE} bytes)"
+        fi
+    else
+        echo "  ⚠️  Manga panel/text model download failed — falling back to pixel-only panel/caption detection"
+        rm -f "$YOLO_TEXT_MODEL_PATH"
+    fi
+else
+    echo "  ✅ Manga panel/text model already present: $YOLO_TEXT_MODEL_PATH"
+fi
+
+echo ""
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SHARED PIPELINE_SECRET
 #
