@@ -546,9 +546,6 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_VISION_MODEL=$OLLAMA_VISION_MODEL
 OLLAMA_TEXT_MODEL=$OLLAMA_TEXT_MODEL
 
-# Pipeline service port
-PORT=$PORT_PIPELINE
-
 # Optional: External VLM providers for faster transcription
 # GROQ_API_KEY=
 # GEMINI_API_KEY=
@@ -561,8 +558,22 @@ else
     log_info ".env already exists — not overwriting"
 fi
 
-# Ensure critical paths are in .env (even if user already had a .env)
-for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PORT PIPER_VOICE_MODEL PATH; do
+# Ensure critical paths are in .env (even if user already had a .env).
+# PORT is deliberately NOT in this list: pipeline-service hardcodes its
+# own port (const PORT = 3001 in index.ts) and never reads process.env.PORT
+# at all, so a generic PORT= here serves no purpose for its intended
+# consumer -- but Next.js's standalone server DOES read process.env.PORT
+# via its own built-in .env auto-loading, and running with its cwd at the
+# project root (unlike pipeline-service, which runs from its own
+# subdirectory and never sees this file), it silently inherits whatever
+# is written here for itself. Confirmed directly against a real
+# deployment: this caused Next.js to try to bind port 3001 (colliding
+# with pipeline-service, which is already listening there) and crash
+# with EADDRINUSE on every single startup attempt, restart-looping
+# indefinitely. start.sh now sets PORT=3000 explicitly when launching
+# Next.js regardless, but the dead/harmful variable is removed here too
+# rather than just patched around downstream.
+for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_MODEL OLLAMA_TEXT_MODEL PIPER_VOICE_MODEL PATH; do
     if ! grep -q "^${VAR_NAME}=" .env 2>/dev/null; then
         case $VAR_NAME in
             PYTHON_BIN)         VAL="$PYTHON_BIN" ;;
@@ -571,7 +582,6 @@ for VAR_NAME in PYTHON_BIN PROJECT_ROOT DATA_DIR OLLAMA_BASE_URL OLLAMA_VISION_M
             OLLAMA_BASE_URL)    VAL="http://localhost:11434" ;;
             OLLAMA_VISION_MODEL) VAL="$OLLAMA_VISION_MODEL" ;;
             OLLAMA_TEXT_MODEL)   VAL="$OLLAMA_TEXT_MODEL" ;;
-            PORT)               VAL="$PORT_PIPELINE" ;;
             PIPER_VOICE_MODEL)   VAL="$PIPER_VOICE_MODEL_PATH" ;;
             # Prepend piper's directory so shutil.which("piper") finds it
             # when master_pipeline.py is spawned from the systemd service.

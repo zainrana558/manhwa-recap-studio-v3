@@ -355,7 +355,21 @@ if [ "$NEED_BUILD" = "1" ]; then
     fi
 fi
 # H2 FIX: Bind Next.js to localhost only (Caddy proxies externally)
-HOSTNAME=127.0.0.1 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
+#
+# PORT=3000 is set explicitly here, not left to inherit from the
+# environment, because setup.sh writes a shared PORT=3001 into the
+# project-root .env (intended for pipeline-service, which reads it from
+# its own process environment). Next.js's standalone server has built-in
+# .env auto-loading and runs with its cwd at the project root (unlike
+# pipeline-service, which runs from its own subdirectory and never sees
+# that file at all), so without an explicit override here it picks up
+# that same PORT=3001, collides with pipeline-service which is already
+# bound to it, and crashes immediately with EADDRINUSE -- confirmed
+# directly against a real deployment: `bun .next/standalone/server.js`
+# run standalone failed with exactly "Failed to start server. Is port
+# 3001 in use?", and the watchdog log showed it restart-looping
+# indefinitely every cycle for over 10 hours as a result.
+HOSTNAME=127.0.0.1 PORT=3000 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
 NEXT_PID=$!
 # Real HTTP status check with a poll loop (a cold Turbopack/Next start can
 # take a few seconds) instead of a fixed sleep + an always-false substring
