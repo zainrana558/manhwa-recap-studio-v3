@@ -12,3 +12,9 @@ huggingface-hub~=0.20
 # pipeline/master_pipeline.py's TEXT_DETECTOR_MODEL_ID comment) landed in
 # transformers on 2025-02-06 -- floor set comfortably above that release.
 transformers>=4.50.0
+# Used for both the Ollama-compatible local endpoint and hosted
+# OpenAI-compatible providers (see translate_text / narration generation in
+# master_pipeline.py, all of which do `from openai import OpenAI`). Was
+# imported in 3 call sites without ever being declared here -- any venv
+# built strictly from this file was silently missing it.
+openai>=1.30.0
