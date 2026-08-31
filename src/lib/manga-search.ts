@@ -7,6 +7,7 @@ import {
   searchMangaDex,
   searchMangaPill,
   searchToonily,
+  searchComick,
 } from "./scrapers";
 
 // ---------------------------------------------------------------------------
@@ -287,6 +288,7 @@ export interface MangaSearchSources {
   mangadex: number;
   mangapill: number;
   toonily: number;
+  comick: number;
 }
 
 export interface UnifiedSearchResult {
@@ -306,7 +308,7 @@ export async function searchAllManga(
 ): Promise<UnifiedSearchResult> {
   const safeLimit = Math.min(Math.max(limit, 1), 25);
 
-  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, malRes, alRes] = await Promise.allSettled([
+  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, malRes, alRes] = await Promise.allSettled([
     searchMangaHere(query, safeLimit),
     searchFanFox(query, safeLimit),
     searchWebtoons(query, safeLimit),
@@ -314,6 +316,7 @@ export async function searchAllManga(
     searchMangaDex(query, safeLimit),
     searchMangaPill(query, safeLimit),
     searchToonily(query, safeLimit),
+    searchComick(query, safeLimit),
     searchJikan(query, safeLimit),
     searchAniList(query, safeLimit),
   ]);
@@ -325,6 +328,7 @@ export async function searchAllManga(
   const mangadex = mdRes.status === "fulfilled" ? mdRes.value : [];
   const mangapill = mpRes.status === "fulfilled" ? mpRes.value : [];
   const toonily = tlRes.status === "fulfilled" ? tlRes.value : [];
+  const comick = cmRes.status === "fulfilled" ? cmRes.value : [];
   const mal = malRes.status === "fulfilled" ? malRes.value : [];
   const anilist = alRes.status === "fulfilled" ? alRes.value : [];
 
@@ -342,6 +346,7 @@ export async function searchAllManga(
     ...mangadex,
     ...mangapill,
     ...toonily,
+    ...comick,
     ...mal,
     ...anilist,
   ]) {
@@ -380,8 +385,9 @@ export async function searchAllManga(
     mangadex: 4,
     mangapill: 5,
     toonily: 6,
-    mal: 7,
-    anilist: 8,
+    comick: 7,
+    mal: 8,
+    anilist: 9,
   };
   const qNorm = normalizeTitle(query);
   function relevance(title: string): number {
@@ -411,6 +417,7 @@ export async function searchAllManga(
       mangadex: mangadex.length,
       mangapill: mangapill.length,
       toonily: toonily.length,
+      comick: comick.length,
       mal: mal.length,
       anilist: anilist.length,
     },
@@ -423,7 +430,7 @@ export async function searchAllManga(
  */
 export async function searchSingleSource(
   query: string,
-  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily",
+  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick",
   limit = 12
 ): Promise<MangadexManga[]> {
   switch (source) {
@@ -441,6 +448,8 @@ export async function searchSingleSource(
       return searchMangaPill(query, limit);
     case "toonily":
       return searchToonily(query, limit);
+    case "comick":
+      return searchComick(query, limit);
     case "mal":
       return searchJikan(query, limit);
     case "anilist":

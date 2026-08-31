@@ -65,6 +65,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [megaPassword, setMegaPassword] = useState("");
   const [autoArchive, setAutoArchive] = useState(false);
   const [translate, setTranslate] = useState(false);
+  const [narrate, setNarrate] = useState(true);
 
   // Chapter selection mode: "first-n" = slider, "specific" = grid picker
   const [chapterSelectionMode, setChapterSelectionMode] = useState<"first-n" | "specific">("first-n");
@@ -225,6 +226,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           ...chapterPayload,
           voice,
           translate,
+          narrate,
           groqKey: groqKey || undefined,
           geminiKey: geminiKey || undefined,
           openRouterKey: openRouterKey || undefined,
@@ -247,7 +249,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
     } finally {
       setStarting(false);
     }
-  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, manga, onJobCreated]);
+  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrate, manga, onJobCreated]);
 
   // --- Voice preview ---
   // Fetches a short edge-tts sample for the selected voice and plays it.
@@ -622,6 +624,21 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
               Click the speaker icon to hear a sample of the selected voice.
             </p>
           )}
+        </div>
+
+        {/* Narration toggle */}
+        <div className="flex items-center justify-between gap-4 p-3 rounded-lg bg-muted/50">
+          <div className="space-y-0.5">
+            <Label className="flex items-center gap-2 text-sm font-medium">
+              <Mic2 className="h-4 w-4 text-muted-foreground" />
+              Recap narration
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              On: rewrite panel text into a flowing recap script. Off: speak the
+              raw transcribed dialogue and captions verbatim.
+            </p>
+          </div>
+          <Switch checked={narrate} onCheckedChange={setNarrate} />
         </div>
 
         {/* Translate toggle */}

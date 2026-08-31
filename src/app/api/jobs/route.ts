@@ -100,6 +100,9 @@ export async function POST(req: NextRequest) {
     const chapterIds = body.chapterIds ?? null;
     const voice = body.voice || "en-US-AndrewNeural";
     const translate = body.translate === true;
+    // Narration is on by default; pass narrate:false to speak the raw
+    // transcribed panel text verbatim instead of an LLM-rewritten recap.
+    const narrate = body.narrate !== false;
     const bgmPath = body.bgmPath ?? null;
     const useBgm = body.useBgm !== false;
 
@@ -197,6 +200,7 @@ export async function POST(req: NextRequest) {
         voice,
         chapterLimit,
         translate,
+        narrate,
         bgmPath,
         useBgm,
         chapters: {

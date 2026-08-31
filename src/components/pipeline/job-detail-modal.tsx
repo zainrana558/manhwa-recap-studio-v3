@@ -120,6 +120,7 @@ export function JobDetailModal({ job, open, onClose }: JobDetailModalProps) {
       voice: job.voice,
       chapterLimit: job.chapterLimit,
       translate: job.translate,
+      narrate: job.narrate,
       useBgm: job.useBgm,
       bgmPath: job.bgmPath,
       totalChapters: job.totalChapters,

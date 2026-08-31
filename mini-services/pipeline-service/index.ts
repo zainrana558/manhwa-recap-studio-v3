@@ -1324,8 +1324,24 @@ async function processJob(jobId: string): Promise<void> {
     '--output', outFile,
     '--work-dir', workDir(jobId),
     '--voice', job.voice,
-    '--narration-provider', 'none',
+    // Narration rewriting. Per-job `narrate` toggle: when false the pipeline
+    // speaks the raw transcribed panel text verbatim (provider 'none'). When
+    // true (default) it uses 'auto' -> first available of OpenAI, Groq, local
+    // Ollama, so the recap gets real narration instead of OCR read aloud.
+    // NARRATION_PROVIDER env overrides the 'auto' choice but not an explicit
+    // narrate:false. The Python side guards every rewrite for faithfulness and
+    // falls back to cleaned source text if the model drifts.
+    '--narration-provider',
+    job.narrate === false ? 'none' : (process.env.NARRATION_PROVIDER || 'auto'),
     '--job-id', jobId,
+    // Reference-recap style: series title on the intro card + a small
+    // channel watermark on every frame. RECAP_WATERMARK overrides the
+    // channel name; RECAP_WATERMARK=0/none disables it.
+    '--recap-title', job.mangaTitle || 'Recap',
+    ...(() => {
+      const wm = process.env.RECAP_WATERMARK ?? 'Denji Recaps'
+      return wm && !['0', 'none', 'false'].includes(wm.toLowerCase()) ? ['--watermark', wm] : []
+    })(),
     ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--progress-file', progressFile,
     '--keep-temp',

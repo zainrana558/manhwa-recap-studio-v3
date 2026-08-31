@@ -34,7 +34,8 @@ export type MangaSource =
   | "asurascans"
   | "mangadex"
   | "mangapill"
-  | "toonily";
+  | "toonily"
+  | "comick";
 
 export interface MangadexManga {
   id: string;
@@ -102,6 +103,7 @@ export interface JobDetail {
   voice: string;
   chapterLimit: number;
   translate: boolean;
+  narrate: boolean;
   bgmPath: string | null;
   useBgm: boolean;
   createdAt: string;
@@ -143,6 +145,7 @@ export interface CreateJobInput {
   chapterLimit: number; // 0 = all
   voice: string;
   translate: boolean;
+  narrate?: boolean;
   groqKey?: string;
   geminiKey?: string;
   openRouterKey?: string;

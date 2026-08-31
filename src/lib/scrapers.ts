@@ -728,7 +728,8 @@ export type ScraperSource =
   | "asurascans"
   | "mangadex"
   | "mangapill"
-  | "toonily";
+  | "toonily"
+  | "comick";
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mh-")) return "mangahere";
@@ -738,11 +739,12 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("md-")) return "mangadex";
   if (id.startsWith("mp-")) return "mangapill";
   if (id.startsWith("tl-")) return "toonily";
+  if (id.startsWith("cm-")) return "comick";
   return null;
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-)/, "");
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-)/, "");
 }
 
 export async function getChaptersForSource(
@@ -764,6 +766,8 @@ export async function getChaptersForSource(
       return getMangaPillChapters(slug);
     case "toonily":
       return getToonilyChapters(slug);
+    case "comick":
+      return getComickChapters(slug);
   }
 }
 
@@ -787,7 +791,106 @@ export async function getImagesForSource(
       return getMangaPillImages(slug, chapterId);
     case "toonily":
       return getToonilyImages(slug, chapterId);
+    case "comick":
+      return getComickImages(slug, chapterId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// COMICK (comick.io) — JSON API aggregator. Large manhwa/manhua catalogue,
+// no API key. `cm-{slug}` id form. See mini-services/pipeline-service/lib.ts
+// for the matching job-time scraper (this file drives search + the chapter
+// list shown at job creation).
+// ---------------------------------------------------------------------------
+
+const COMICK_API = "https://api.comick.fun";
+const COMICK_IMG = "https://meo.comick.pictures";
+const COMICK_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const comickHeaders = () => ({
+  "User-Agent": COMICK_UA,
+  Accept: "application/json",
+  Referer: "https://comick.io/",
+});
+
+export async function searchComick(query: string, limit = 10): Promise<MangadexManga[]> {
+  const url = `${COMICK_API}/v1.0/search?q=${encodeURIComponent(query)}&type=comic&limit=${limit}&page=1`;
+  const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+  if (!res.ok) throw new Error(`Comick search ${res.status}`);
+  const data = (await res.json()) as Array<{
+    hid: string;
+    slug: string;
+    title: string;
+    desc?: string;
+    country?: string;
+    status?: number;
+    year?: number | null;
+    md_covers?: Array<{ b2key?: string }>;
+    last_chapter?: number | string | null;
+  }>;
+  return (Array.isArray(data) ? data : []).map((m) => ({
+    id: `cm-${m.slug}`,
+    title: m.title || m.slug,
+    description: m.desc || "",
+    coverUrl: m.md_covers?.[0]?.b2key ? `${COMICK_IMG}/${m.md_covers[0].b2key}` : null,
+    status:
+      m.status === 2 ? "Completed" : m.status === 1 ? "Ongoing" : m.status === 3 ? "Cancelled" : null,
+    year: m.year ?? null,
+    originalLanguage: m.country ?? null,
+    availableTranslatedLanguages: ["en"],
+    tags: [],
+    contentRating: "safe" as const,
+    lastChapter: m.last_chapter != null ? String(m.last_chapter) : null,
+    source: "comick" as unknown as "mangadex",
+    externalUrl: `https://comick.io/comic/${m.slug}`,
+  }));
+}
+
+export async function getComickChapters(slug: string): Promise<ScrapedChapter[]> {
+  const out: ScrapedChapter[] = [];
+  for (let page = 1; page <= 40; page++) {
+    const url = `${COMICK_API}/comic/${encodeURIComponent(slug)}/chapters?lang=en&page=${page}&limit=100&chap-order=1`;
+    const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+    if (!res.ok) throw new Error(`Comick chapters ${res.status} for ${slug}`);
+    const body = (await res.json()) as {
+      chapters?: Array<{ hid: string; chap?: string | null; title?: string | null; lang?: string }>;
+      total?: number;
+    };
+    const chaps = body.chapters ?? [];
+    if (chaps.length === 0) break;
+    for (const c of chaps) {
+      if (!c.hid) continue;
+      out.push({
+        id: c.hid,
+        chapterNum: c.chap ?? String(out.length + 1),
+        title: c.title ?? null,
+        language: c.lang ?? "en",
+      });
+    }
+    if (body.total && out.length >= body.total) break;
+  }
+  const seen = new Set<string>();
+  const deduped = out.filter((c) => (seen.has(c.chapterNum) ? false : (seen.add(c.chapterNum), true)));
+  deduped.sort((a, b) => (parseFloat(a.chapterNum) || 0) - (parseFloat(b.chapterNum) || 0));
+  if (deduped.length === 0) throw new Error(`Comick: no English chapters for ${slug}`);
+  return deduped;
+}
+
+export async function getComickImages(_slug: string, chapterHid: string): Promise<ScrapedImage[]> {
+  const url = `${COMICK_API}/chapter/${encodeURIComponent(chapterHid)}?tachiyomi=true`;
+  const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+  if (!res.ok) throw new Error(`Comick images ${res.status} for chapter ${chapterHid}`);
+  const body = (await res.json()) as { chapter?: { md_images?: Array<{ b2key?: string }> } };
+  const imgs = (body.chapter?.md_images ?? [])
+    .map((m) => m.b2key)
+    .filter((k): k is string => Boolean(k))
+    .map((k, i) => ({
+      url: `${COMICK_IMG}/${k}`,
+      referer: "https://comick.io/",
+      filename: `${String(i + 1).padStart(3, "0")}.${k.split(".").pop() || "jpg"}`,
+    }));
+  if (imgs.length === 0) throw new Error(`Comick returned no images for chapter ${chapterHid}`);
+  return imgs;
 }
 
 // ---------------------------------------------------------------------------

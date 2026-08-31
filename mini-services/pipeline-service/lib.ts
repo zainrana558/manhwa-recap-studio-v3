@@ -321,7 +321,7 @@ export function filterJunkTextPanels<T extends { image: string; text: string }>(
 
 // --- Source dispatchers ---
 
-export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex' | 'mangapill' | 'toonily'
+export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex' | 'mangapill' | 'toonily' | 'comick'
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('mh-')) return 'mangahere'
@@ -331,11 +331,12 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('md-')) return 'mangadex'
   if (id.startsWith('mp-')) return 'mangapill'
   if (id.startsWith('tl-')) return 'toonily'
+  if (id.startsWith('cm-')) return 'comick'
   return null
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-)/, '')
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-)/, '')
 }
 
 // --- MangaHere (mangahere.cc) ---
@@ -1216,6 +1217,103 @@ export async function downloadToonilyImage(imageUrl: string, destPath: string): 
   await fs.writeFile(destPath, buf)
 }
 
+// --- Comick (comick.io) — JSON API aggregator, huge manhwa catalogue ---
+//
+// Endpoints (no key):
+//   GET {API}/v1.0/search?q=..&type=comic&limit=N     -> [{ hid, slug, title }]
+//   GET {API}/comic/{slug}/chapters?lang=en&page=N    -> { chapters:[{ hid, chap, title, lang }], total }
+//   GET {API}/chapter/{chapterHid}?tachiyomi=true     -> { chapter:{ md_images:[{ b2key }] } }
+// Images resolve to https://meo.comick.pictures/{b2key}.
+// `cm-` id form is `cm-{slug}` (see getSourceFromId below).
+
+const COMICK_API = process.env.COMICK_API || 'https://api.comick.fun'
+const COMICK_IMG = 'https://meo.comick.pictures'
+const COMICK_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+
+function comickHeaders() {
+  return { 'User-Agent': COMICK_UA, Accept: 'application/json', Referer: 'https://comick.io/' }
+}
+
+export async function fetchComickChapters(
+  slug: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const out: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  for (let page = 1; page <= 40; page++) {
+    const url = `${COMICK_API}/comic/${encodeURIComponent(slug)}/chapters?lang=en&page=${page}&limit=100&chap-order=1`
+    const res = await fetch(url, { headers: comickHeaders() })
+    if (!res.ok) throw new Error(`Comick chapters ${res.status} for ${slug}`)
+    const body = (await res.json()) as {
+      chapters?: Array<{ hid: string; chap?: string | null; title?: string | null; lang?: string }>
+      total?: number
+    }
+    const chaps = body.chapters ?? []
+    if (chaps.length === 0) break
+    for (const c of chaps) {
+      if (!c.hid) continue
+      out.push({
+        mangadexId: c.hid, // dispatchers use this as the chapter identifier
+        chapterNum: c.chap ?? String(out.length + 1),
+        title: c.title ?? null,
+        language: c.lang ?? 'en',
+        pageCount: 0,
+        external: false,
+      })
+    }
+    if (body.total && out.length >= body.total) break
+  }
+  // Comick can return the same chapter number from multiple scan groups —
+  // keep the first (highest-priority) of each number, in ascending order.
+  const seen = new Set<string>()
+  const deduped = out.filter((c) => {
+    const k = c.chapterNum ?? ''
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+  deduped.sort((a, b) => (parseFloat(a.chapterNum || '0') || 0) - (parseFloat(b.chapterNum || '0') || 0))
+  if (deduped.length === 0) throw new Error(`Comick: no English chapters for ${slug}`)
+  return chapterLimit > 0 ? deduped.slice(0, chapterLimit) : deduped
+}
+
+export async function fetchComickChapterImages(
+  _slug: string,
+  chapterHid: string,
+): Promise<string[]> {
+  const url = `${COMICK_API}/chapter/${encodeURIComponent(chapterHid)}?tachiyomi=true`
+  const res = await fetch(url, { headers: comickHeaders() })
+  if (!res.ok) throw new Error(`Comick images ${res.status} for chapter ${chapterHid}`)
+  const body = (await res.json()) as { chapter?: { md_images?: Array<{ b2key?: string }> } }
+  const imgs = (body.chapter?.md_images ?? [])
+    .map((m) => (m.b2key ? `${COMICK_IMG}/${m.b2key}` : null))
+    .filter((u): u is string => Boolean(u))
+  if (imgs.length === 0) throw new Error(`Comick returned no images for chapter ${chapterHid}`)
+  return imgs
+}
+
+export async function downloadComickImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { 'User-Agent': COMICK_UA, Referer: 'https://comick.io/' } })
+  if (!res.ok) throw new Error(`Comick image download ${res.status}: ${imageUrl}`)
+  await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+}
+
 // --- Unified dispatchers ---
 
 export async function fetchChaptersForSource(
@@ -1239,6 +1337,8 @@ export async function fetchChaptersForSource(
       return fetchMangaPillChapters(slug, chapterLimit)
     case 'toonily':
       return fetchToonilyChapters(slug, chapterLimit)
+    case 'comick':
+      return fetchComickChapters(slug, chapterLimit)
   }
 }
 
@@ -1266,6 +1366,8 @@ export async function fetchImagesForSource(
       return fetchMangaPillChapterImages(slug, chapterSlug)
     case 'toonily':
       return fetchToonilyChapterImages(slug, chapterSlug)
+    case 'comick':
+      return fetchComickChapterImages(slug, chapterSlug)
   }
 }
 
@@ -1289,6 +1391,8 @@ export async function downloadImageForSource(
       return downloadMangaPillImage(imageUrl, destPath)
     case 'toonily':
       return downloadToonilyImage(imageUrl, destPath)
+    case 'comick':
+      return downloadComickImage(imageUrl, destPath)
   }
 }
 
