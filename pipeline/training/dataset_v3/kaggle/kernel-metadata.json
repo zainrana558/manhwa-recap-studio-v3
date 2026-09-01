@@ -1,0 +1,16 @@
+{
+  "id": "zainrana1122/panel-annotate-qwen",
+  "title": "panel-annotate-qwen",
+  "code_file": "annotate_qwen.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "zainrana1122/webtoon-yolo"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

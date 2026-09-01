@@ -90,3 +90,13 @@ yolov8n.pt
 # ad-hoc QA/verification screenshots (agent-generated, not source)
 /qa-*.png
 /verify-*.png
+# dataset-v3 build: large scraped/annotated data (scripts tracked, data not)
+pipeline/training/dataset_v3/sources/
+pipeline/training/dataset_v3/yolo/
+pipeline/training/dataset_v3/yolo_clean/
+pipeline/training/dataset_v3/_deliver/
+pipeline/training/dataset_v3/_kaggle_merge/
+pipeline/training/dataset_v3/_kaggle_upload/
+pipeline/training/dataset_v3/recap_selfdistill/
+pipeline/training/dataset_v3/*.log
+pipeline/training/twatf_v3/
