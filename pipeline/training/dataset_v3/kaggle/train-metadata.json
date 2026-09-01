@@ -1,0 +1,19 @@
+{
+  "id": "zainrana1122/panel-train-v3",
+  "title": "panel-train-v3",
+  "code_file": "train_v3.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "hieupham154/lie-eater-speech-bubbles",
+    "fatzard/comic-segmentation"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "zainrana1122/panel-annotate-qwen"
+  ]
+}

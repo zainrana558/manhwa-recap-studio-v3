@@ -29,8 +29,14 @@ def _pip(*a):
 # smart-resize. Kaggle's torch stays (Pascal-safe wheels handled by the base
 # image for inference-only bf16->fp16 fallback below).
 if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle"):
-    _pip("-U", "transformers>=4.57.0", "accelerate>=1.1.0", "bitsandbytes>=0.44.0",
-         "qwen-vl-utils", "pillow")
+    _pip("-U", "transformers", "accelerate", "bitsandbytes", "pillow")
+    try:
+        import transformers
+        from packaging import version
+        if version.parse(transformers.__version__) < version.parse("4.57.0"):
+            _pip("-U", "git+https://github.com/huggingface/transformers")
+    except Exception:
+        _pip("-U", "git+https://github.com/huggingface/transformers")
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -46,7 +52,9 @@ OUT = "/kaggle/working/yolo"
 MODEL_ID = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
 TILE = int(os.environ.get("TILE", "1400"))
 OVERLAP = int(os.environ.get("OVERLAP", "340"))
-MAX_MIN = int(os.environ.get("MAX_MIN", "690"))          # stop before the 12h wall
+MAX_MIN = int(os.environ.get("MAX_MIN", "660"))          # stop before the 12h wall
+PER_SERIES_CAP = int(os.environ.get("PER_SERIES_CAP", "260"))  # balance the set
+SHARD = os.environ.get("SHARD", "0/1")                   # "i/n" — process pages where idx%n==i
 EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 PROMPT = (
@@ -69,25 +77,29 @@ PROMPT = (
 
 # ----------------------------------------------------------------------------
 def load_model():
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-    # Pascal (P100) has no bf16; Turing+ (T4) does. Pick compute dtype to match.
+    import transformers
+    from transformers import AutoProcessor
+    try:
+        from transformers import Qwen3VLForConditionalGeneration as MC
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as MC
+    print("transformers", transformers.__version__, flush=True)
     cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
     dt = torch.bfloat16 if cap[0] >= 8 else torch.float16
     print(f"GPU cc {cap}, compute dtype {dt}", flush=True)
-    proc = AutoProcessor.from_pretrained(MODEL_ID, min_pixels=256 * 28 * 28,
-                                         max_pixels=1500 * 28 * 28)
-    kw = dict(torch_dtype=dt, device_map="auto", attn_implementation="sdpa")
-    want_4bit = os.environ.get("FOUR_BIT", "auto")
+    proc = AutoProcessor.from_pretrained(MODEL_ID)
     total_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
                 if torch.cuda.is_available() else 0)
+    kw = dict(dtype=dt, device_map="auto")
+    want_4bit = os.environ.get("FOUR_BIT", "auto")
     if want_4bit == "1" or (want_4bit == "auto" and "8B" in MODEL_ID and total_gb < 20):
         from transformers import BitsAndBytesConfig
         kw["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=dt, bnb_4bit_use_double_quant=True)
-        kw.pop("torch_dtype")
+        kw.pop("dtype")
         print("loading in 4-bit", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **kw)
+    model = MC.from_pretrained(MODEL_ID, **kw)
     model.eval()
     return model, proc
 
@@ -98,10 +110,11 @@ def detect(model, proc, img_bgr):
     rgb = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     msgs = [{"role": "user", "content": [
         {"type": "image", "image": rgb}, {"type": "text", "text": PROMPT}]}]
-    text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    inp = proc(text=[text], images=[rgb], return_tensors="pt").to(model.device)
+    inp = proc.apply_chat_template(
+        msgs, tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt").to(model.device)
     out = model.generate(**inp, max_new_tokens=1536, do_sample=False)
-    gen = out[:, inp.input_ids.shape[1]:]
+    gen = out[:, inp["input_ids"].shape[1]:]
     txt = proc.batch_decode(gen, skip_special_tokens=True)[0]
     m = re.search(r"\[.*\]", txt, re.S)
     if not m:
@@ -228,13 +241,28 @@ def list_pages():
             if os.path.splitext(p)[1].lower() not in EXTS:
                 continue
             parts = p.split("/")
-            # key = last 3 path components (series/chapter/file)
-            rel = "__".join(parts[-3:])
-            if rel in seen:
+            rel = "__".join(parts[-3:])          # series__chapter__file
+            if rel in seen or "/gemini_partial/" in p or "/images/" in p:
                 continue
             seen.add(rel)
             pages.append((os.path.splitext(rel)[0], p))
-    return sorted(pages)
+    pages.sort()
+    # per-series cap for class/style balance (deterministic stride sample)
+    import random as _r
+    byser = {}
+    for rel, p in pages:
+        byser.setdefault(rel.split("__")[0], []).append((rel, p))
+    capped = []
+    for ser, lst in byser.items():
+        if len(lst) > PER_SERIES_CAP:
+            _r.Random(1).shuffle(lst)
+            lst = sorted(lst[:PER_SERIES_CAP])
+        capped.extend(lst)
+    capped.sort()
+    si, sn = (int(x) for x in SHARD.split("/"))
+    if sn > 1:
+        capped = [pp for k, pp in enumerate(capped) if k % sn == si]
+    return capped
 
 
 def main():
