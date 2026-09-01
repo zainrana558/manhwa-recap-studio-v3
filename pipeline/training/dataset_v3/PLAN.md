@@ -87,3 +87,29 @@ Reuse `pipeline/training/kaggle_kernel_train.py` pattern:
   - else -> Gemini flash-lite ($2 pay-as-you-go, or the daily-quota grind);
     quality was decent on the earlier 215-page sample
 - merge -> train_v3.py (yolo11n, panel + bubble)
+
+---
+## UPDATE 2026-09-01 ~21:00Z — v3.1 done, v3.2 launched
+
+**v3.1** (`panel-train-v3`, OLD webtoon_cv labels + Kumiko + roboflow-less):
+157ep/2.6h, val panel P.858 R.83 **mAP50 .863** mAP50-95 .75; bubble mAP50 .987.
+Eyeball vs prod (`manga_panel_detector_fp32_1024.onnx`, raw YOLO head, 8 pages):
+- dense strips (nano-machine ch4): v3.1 **worse** — tall boxes spanning 2-3
+  panels, some panels missed. Old CV labels under-segmented these; model learnt it.
+- clean full-bleed (solo-leveling): v3.1 **over-splits** each panel into
+  horizontal halves; also catches a couple of dark panels prod misses.
+- verdict: v3.1 NOT an install — noisier than prod, different failure modes.
+  Confirms the pivot premise: label quality was the ceiling.
+
+**PDF → code**: `webtoon_cv2.py` implements the two methodology PDFs + the
+reference `webtoon_panel_slicer.py` the user pushed to origin/main:
+§8.1 per-row horizontal edge-energy, §8.8 Lab palette-change, §4.2 luma-jump
+subdivision of over-tall blocks, §8.4 face-safety cut veto, §8.5 caption veto,
+§8.9 confidence floor. A/B vs webtoon_cv.py (260pg): tall-strip series gain
+panels (nano-machine 3.7->4.7, northern-blade 3.5->4.4), page-sliced series
+identical. Nano Machine 800x8225 strip: 2 -> 7 boxes.
+
+**v3.2** (`panel-train-v32`): webtoon-yolo dataset **v3.2** = cv2 labels
+(5721 pg) + roboflow comic+manga (680 pg capped) + Kumiko. 3514 train / 656 val.
+Kernel RUNNING. On done: compare prod / v3.1 / v3.2 on the same 8 pages;
+install v3.2 only if clearly >= prod on both dense strips AND clean pages.
