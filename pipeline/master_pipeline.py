@@ -368,6 +368,11 @@ class FrameEntry:
     narration_text: str = ""
     audio_path: Optional[str] = None
     duration: Optional[float] = None
+    # [x1,y1,x2,y2] of this frame's crop within its source_page, in that page's
+    # native pixels — recorded for offline panel-detector training. None when
+    # the crop spans a page seam (cross-page stitch). Purely informational:
+    # nothing in the render path reads it.
+    source_box: Optional[list] = None
 
     def to_dict(self) -> dict:
         return {
@@ -383,6 +388,7 @@ class FrameEntry:
             "narration_text": self.narration_text,
             "audio_path": self.audio_path,
             "duration": self.duration,
+            "source_box": self.source_box,
         }
 
     @classmethod
@@ -408,6 +414,7 @@ class FrameEntry:
             source_index=int(data.get("source_index", 0)),
             frame_kind=str(data.get("frame_kind") or "panel"),
             scroll_group=data.get("scroll_group"),
+            source_box=data.get("source_box"),
             ocr_status=str(data.get("ocr_status") or "NONE"),
             ocr_text=str(data.get("ocr_text") or ""),
             narration_text=str(data.get("narration_text") or ""),
@@ -2604,14 +2611,21 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
     entries: List[FrameEntry] = []
     counter = 0
 
-    def _emit(crop_rgb, page_idx, page_name):
+    def _emit(crop_rgb, page_idx, page_name, src_box=None):
         nonlocal counter
         # drop dead margin the detector/stitch left on the crop edges
         g = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
         ri = np.where((g < 234).mean(axis=1) >= 0.02)[0]
         ci = np.where((g < 234).mean(axis=0) >= 0.02)[0]
         if ri.size >= 4 and ci.size >= 4:
+            if src_box is not None:
+                # keep the recorded source-page box in step with the trim
+                bx1, by1, bx2, by2 = src_box
+                src_box = [int(bx1 + ci[0]), int(by1 + ri[0]),
+                           int(bx1 + ci[-1] + 1), int(by1 + ri[-1] + 1)]
             crop_rgb = crop_rgb[ri[0]:ri[-1] + 1, ci[0]:ci[-1] + 1]
+        elif src_box is not None:
+            src_box = [int(v) for v in src_box]
         arr_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
         if _is_blank_crop(arr_gray) or crop_rgb.shape[0] < 24 or crop_rgb.shape[1] < 24:
             return
@@ -2641,6 +2655,7 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             frame_id=f"{chapter.tag}_frame_{counter:05d}",
             filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
             source_page=page_name, source_index=page_idx, frame_kind="panel",
+            source_box=list(src_box) if src_box is not None else None,
         ))
         counter += 1
 
@@ -2703,7 +2718,7 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             cx2 = min(w, x2 + pad_x); cy2 = min(h, y2 + pad_y)
             if cx2 - cx1 < w * 0.12 or cy2 - cy1 < h * 0.02:
                 continue
-            _emit(rgb[cy1:cy2, cx1:cx2], page_idx, name)
+            _emit(rgb[cy1:cy2, cx1:cx2], page_idx, name, src_box=(cx1, cy1, cx2, cy2))
 
     log.info("[%s] reference-style framing: %d pages -> %d panel frames",
              chapter.tag, total, len(entries))
