@@ -100,3 +100,26 @@ pipeline/training/dataset_v3/_kaggle_upload/
 pipeline/training/dataset_v3/recap_selfdistill/
 pipeline/training/dataset_v3/*.log
 pipeline/training/twatf_v3/
+
+# dataset-v3: secret + more large data (added after gitignore was reverted mid-session)
+pipeline/training/dataset_v3/.gemini_key
+pipeline/training/dataset_v3/all_sources.tar.gz
+pipeline/training/dataset_v3/yolo_kumiko/
+pipeline/training/dataset_v3/yolo_webtoon_cv/
+pipeline/training/dataset_v3/yolo_webtoon_slicer/
+pipeline/training/dataset_v3/yolo_roboflow/
+pipeline/training/dataset_v3/roboflow/
+pipeline/training/dataset_v3/train_ready/
+pipeline/training/dataset_v3/_train_ds/
+pipeline/training/dataset_v3/models/
+pipeline/training/dataset_v3/qv4/
+pipeline/training/dataset_v3/qwen7_out/
+pipeline/training/dataset_v3/qwen_test_out/
+pipeline/training/dataset_v3/qwen_out/
+
+# stray media / scratch
+/FETCH_HEAD
+/chap_001.mp4
+/master_merged.mp4
+/Caddyfile.prod
+mini-services/pipeline-service/data/
