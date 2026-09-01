@@ -25,18 +25,15 @@ def _pip(*a):
     subprocess.run([sys.executable, "-m", "pip", "-q", "install", *a], check=False)
 
 
-# Qwen3-VL needs a recent transformers; bnb for 4-bit; qwen-vl-utils for the
-# smart-resize. Kaggle's torch stays (Pascal-safe wheels handled by the base
-# image for inference-only bf16->fp16 fallback below).
+# Kaggle GPU kernels always get a P100 (Pascal / sm_60). The base image's torch
+# dropped Pascal kernels -> every CUDA op fails "no kernel image available".
+# Pin the last cu121 build that still ships sm_60, exactly like the train
+# kernel. Qwen2.5-VL (not 3-VL) so we don't need bleeding-edge transformers.
 if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle"):
-    _pip("-U", "transformers", "accelerate", "bitsandbytes", "pillow")
-    try:
-        import transformers
-        from packaging import version
-        if version.parse(transformers.__version__) < version.parse("4.57.0"):
-            _pip("-U", "git+https://github.com/huggingface/transformers")
-    except Exception:
-        _pip("-U", "git+https://github.com/huggingface/transformers")
+    _pip("torch==2.4.1", "torchvision==0.19.1",
+         "--index-url", "https://download.pytorch.org/whl/cu121")
+    _pip("-U", "transformers==4.49.0", "accelerate", "qwen-vl-utils", "pillow",
+         "bitsandbytes==0.43.3")
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -49,7 +46,8 @@ IN_ROOTS = [
 ]
 WORK_SRC = "/kaggle/tmp/src"
 OUT = "/kaggle/working/yolo"
-MODEL_ID = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
+MODEL_ID = os.environ.get("QWEN_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+LOAD_8BIT = os.environ.get("LOAD_8BIT", "1") == "1"
 TILE = int(os.environ.get("TILE", "1400"))
 OVERLAP = int(os.environ.get("OVERLAP", "340"))
 MAX_MIN = int(os.environ.get("MAX_MIN", "660"))          # stop before the 12h wall
@@ -58,20 +56,19 @@ SHARD = os.environ.get("SHARD", "0/1")                   # "i/n" — process pag
 EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 PROMPT = (
-    "This image is a vertical slice of a full-colour Korean webtoon / Japanese "
-    "manga page. Panels may be BORDERLESS (no drawn frame), separated only by "
-    "blank gutter space, a thin line, or a change of shot.\n"
-    "Detect EVERY distinct story panel — one box per camera shot / visual beat. "
-    "Be granular: if different shots are stacked vertically (different framing, "
-    "angle, subject, or a time cut) box EACH separately even when the "
-    "background colour runs continuously. Only merge when it is truly one "
-    "unbroken illustration.\n"
-    "EXCLUDE blank gutter space. A speech bubble / caption belongs to the panel "
-    "it overlaps — never box text alone. Ignore chapter-title cards, credits, "
-    "author notes, ads, page numbers, watermarks. If a panel is cut off at the "
-    "top/bottom edge, still box the visible part.\n"
-    'Return ONLY a JSON array: [{"bbox_2d":[x1,y1,x2,y2],"label":"panel"}] with '
-    "pixel coordinates in THIS image. No prose."
+    "Outline the position of every individual comic panel in this manga / "
+    "webtoon image and output the coordinates in JSON.\n"
+    "A panel = one drawn picture / camera shot. In manga they usually have "
+    "black frame lines; in Korean webtoons they are often borderless, separated "
+    "only by blank space or a scene change. Box the ARTWORK of each panel "
+    "tightly, one box per panel:\n"
+    "- do NOT include the blank gutter between or around panels\n"
+    "- a speech bubble counts as part of the panel it sits on — do not box "
+    "bubbles or text by themselves\n"
+    "- adjacent panels that touch still get separate boxes\n"
+    "- skip title logos, credits, author notes, ads, page numbers, watermarks\n"
+    'Output ONLY: [{"bbox_2d": [x1, y1, x2, y2], "label": "panel"}, ...] '
+    "using pixel coordinates of this image, ordered top-to-bottom."
 )
 
 
@@ -79,26 +76,29 @@ PROMPT = (
 def load_model():
     import transformers
     from transformers import AutoProcessor
-    try:
-        from transformers import Qwen3VLForConditionalGeneration as MC
-    except ImportError:
-        from transformers import AutoModelForImageTextToText as MC
-    print("transformers", transformers.__version__, flush=True)
+    MC = None
+    for name in ("Qwen2_5_VLForConditionalGeneration",
+                 "Qwen2VLForConditionalGeneration",
+                 "AutoModelForImageTextToText"):
+        try:
+            MC = getattr(__import__("transformers", fromlist=[name]), name)
+            break
+        except (ImportError, AttributeError):
+            continue
+    print("transformers", transformers.__version__, "class", MC.__name__, flush=True)
     cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
     dt = torch.bfloat16 if cap[0] >= 8 else torch.float16
-    print(f"GPU cc {cap}, compute dtype {dt}", flush=True)
-    proc = AutoProcessor.from_pretrained(MODEL_ID)
-    total_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
-                if torch.cuda.is_available() else 0)
-    kw = dict(dtype=dt, device_map="auto")
-    want_4bit = os.environ.get("FOUR_BIT", "auto")
-    if want_4bit == "1" or (want_4bit == "auto" and "8B" in MODEL_ID and total_gb < 20):
+    print(f"GPU cc {cap}, dtype {dt}", flush=True)
+    # cap image tokens so a tall tile can't blow VRAM
+    proc = AutoProcessor.from_pretrained(MODEL_ID, max_pixels=1280 * 28 * 28)
+    kw = dict(device_map="auto", attn_implementation="eager")
+    if LOAD_8BIT and "7B" in MODEL_ID:
         from transformers import BitsAndBytesConfig
         kw["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=dt, bnb_4bit_use_double_quant=True)
-        kw.pop("dtype")
-        print("loading in 4-bit", flush=True)
+            load_in_8bit=True, llm_int8_threshold=6.0)
+        print("loading 8-bit", flush=True)
+    else:
+        kw["torch_dtype"] = dt
     model = MC.from_pretrained(MODEL_ID, **kw)
     model.eval()
     return model, proc
@@ -110,26 +110,31 @@ def detect(model, proc, img_bgr):
     rgb = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     msgs = [{"role": "user", "content": [
         {"type": "image", "image": rgb}, {"type": "text", "text": PROMPT}]}]
-    inp = proc.apply_chat_template(
-        msgs, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt").to(model.device)
+    text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    inp = proc(text=[text], images=[rgb], padding=True, return_tensors="pt").to(model.device)
     out = model.generate(**inp, max_new_tokens=1536, do_sample=False)
-    gen = out[:, inp["input_ids"].shape[1]:]
-    txt = proc.batch_decode(gen, skip_special_tokens=True)[0]
-    m = re.search(r"\[.*\]", txt, re.S)
-    if not m:
-        return []
-    try:
-        arr = json.loads(m.group(0))
-    except Exception:
-        return []
-    boxes = []
+    gen = out[:, inp.input_ids.shape[1]:]
+    txt = proc.batch_decode(gen, skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False)[0]
+    if os.environ.get("DUMP_RAW"):
+        print("RAW>>>", txt[:600].replace("\n", " "), flush=True)
     H, W = img_bgr.shape[:2]
-    for it in arr:
-        b = it.get("bbox_2d") or it.get("bbox") or it.get("box_2d")
-        if not b or len(b) != 4:
-            continue
-        x1, y1, x2, y2 = (float(v) for v in b)
+    raw = []
+    m = re.search(r"\[.*\]", txt, re.S)
+    if m:
+        try:
+            for it in json.loads(m.group(0)):
+                b = it.get("bbox_2d") or it.get("bbox") or it.get("box_2d") or it.get("box")
+                if b and len(b) == 4:
+                    raw.append([float(v) for v in b])
+        except Exception:
+            pass
+    if not raw:  # Qwen native box tokens: (x1,y1),(x2,y2)
+        for mm in re.finditer(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", txt):
+            raw.append([float(x) for x in mm.groups()])
+    boxes = []
+    for b in raw:
+        x1, y1, x2, y2 = b
         # Qwen3-VL usually emits absolute px; if it emitted 0-1000, rescale
         if max(x1, x2) <= 1000 and max(y1, y2) <= 1000 and (W > 1000 or H > 1000):
             x1, x2 = x1 / 1000 * W, x2 / 1000 * W
@@ -247,6 +252,10 @@ def list_pages():
             seen.add(rel)
             pages.append((os.path.splitext(rel)[0], p))
     pages.sort()
+    # manga (framed) is handled by Kumiko, not the VLM — skip those series here
+    MANGA = {"chainsaw-man", "one-piece", "berserk", "jujutsu-kaisen"}
+    if os.environ.get("WEBTOON_ONLY", "1") == "1":
+        pages = [(r, p) for (r, p) in pages if r.split("__")[0] not in MANGA]
     # per-series cap for class/style balance (deterministic stride sample)
     import random as _r
     byser = {}

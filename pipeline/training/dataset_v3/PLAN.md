@@ -65,3 +65,25 @@ Reuse `pipeline/training/kaggle_kernel_train.py` pattern:
   it's independent of v2's biases and never bleeds gutters (v2's main flaw).
 - If key 2 also gets blocked: fall back to a local VLM (Florence-2 / Qwen2.5-VL
   7B) or the `source_box` self-distillation alone.
+
+---
+## UPDATE 2026-09-01 (Kaggle P100 constraints)
+
+- Kaggle API always assigns **P100 (Pascal/sm_60)**; base torch dropped Pascal
+  kernels. Must pin `torch==2.4.1+cu121` in every GPU kernel.
+- **Qwen2.5-VL-3B fp16**: fast (~15s/pg) but quality NOT up to par — loose
+  boxes, under-segments manga badly, misplaced on webtoons.
+- **Qwen2.5-VL-7B 8-bit (bnb int8)**: ~6 min/page on P100 (int8 emulated on
+  Pascal) — unusable; also returned 0 parsed boxes (parser now handles Qwen
+  native `(x1,y1),(x2,y2)` box tokens; retesting 3B with better prompt).
+- **Kumiko (CV) on the 4 bordered-manga series: EXCELLENT.** 761 pages,
+  4.1 boxes/pg, 0 empty, tight on frame lines, no gutter bleed. DONE, free,
+  local. Output: pipeline/training/dataset_v3/yolo_kumiko/.
+
+### Revised annotation plan
+- manga (chainsaw-man, one-piece, berserk, jujutsu-kaisen) -> Kumiko  ✅ done
+- ~11 borderless webtoon series -> VLM:
+  - if Qwen-3B + improved prompt is trainable-quality -> use it (free)
+  - else -> Gemini flash-lite ($2 pay-as-you-go, or the daily-quota grind);
+    quality was decent on the earlier 215-page sample
+- merge -> train_v3.py (yolo11n, panel + bubble)
