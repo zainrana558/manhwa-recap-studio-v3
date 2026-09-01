@@ -227,6 +227,19 @@ def write_report(job):
     L.append(f"**job** `{job['id']}` · **{job.get('mangaTitle','?')}** · "
              f"status **{job['status']}** · stage **{job.get('stage','?')}** · {job.get('progress','?')}%")
     L.append("")
+    if DONE_MARK.exists():
+        try:
+            d = json.loads(DONE_MARK.read_text())
+            L.append("**output video:** " + (", ".join(
+                f"{k} {d[k]}" for k in ("duration_hms", "size_mb", "bitrate_kbps", "video", "audio")
+                if k in d) or d.get("error") or d.get("status", "?")))
+            if d.get("video_path"):
+                L.append(f"`{d['video_path']}`  ")
+            if d.get("frames_extracted"):
+                L.append(f"{d['frames_extracted']} sample frames in `logs/video-sample/` (awaiting visual review)")
+            L.append("")
+        except Exception:
+            pass
     if counts:
         zero = counts.count(0)
         thin = sum(1 for c in counts if 0 < c < 8)
