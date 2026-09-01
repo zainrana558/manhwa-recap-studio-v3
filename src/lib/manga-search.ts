@@ -8,6 +8,7 @@ import {
   searchMangaPill,
   searchToonily,
   searchComick,
+  searchWeebCentral,
 } from "./scrapers";
 
 // ---------------------------------------------------------------------------
@@ -289,6 +290,7 @@ export interface MangaSearchSources {
   mangapill: number;
   toonily: number;
   comick: number;
+  weebcentral: number;
 }
 
 export interface UnifiedSearchResult {
@@ -308,7 +310,7 @@ export async function searchAllManga(
 ): Promise<UnifiedSearchResult> {
   const safeLimit = Math.min(Math.max(limit, 1), 25);
 
-  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, malRes, alRes] = await Promise.allSettled([
+  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, wcRes, malRes, alRes] = await Promise.allSettled([
     searchMangaHere(query, safeLimit),
     searchFanFox(query, safeLimit),
     searchWebtoons(query, safeLimit),
@@ -317,6 +319,7 @@ export async function searchAllManga(
     searchMangaPill(query, safeLimit),
     searchToonily(query, safeLimit),
     searchComick(query, safeLimit),
+    searchWeebCentral(query, safeLimit),
     searchJikan(query, safeLimit),
     searchAniList(query, safeLimit),
   ]);
@@ -329,6 +332,7 @@ export async function searchAllManga(
   const mangapill = mpRes.status === "fulfilled" ? mpRes.value : [];
   const toonily = tlRes.status === "fulfilled" ? tlRes.value : [];
   const comick = cmRes.status === "fulfilled" ? cmRes.value : [];
+  const weebcentral = wcRes.status === "fulfilled" ? wcRes.value : [];
   const mal = malRes.status === "fulfilled" ? malRes.value : [];
   const anilist = alRes.status === "fulfilled" ? alRes.value : [];
 
@@ -347,6 +351,7 @@ export async function searchAllManga(
     ...mangapill,
     ...toonily,
     ...comick,
+    ...weebcentral,
     ...mal,
     ...anilist,
   ]) {
@@ -386,8 +391,9 @@ export async function searchAllManga(
     mangapill: 5,
     toonily: 6,
     comick: 7,
-    mal: 8,
-    anilist: 9,
+    weebcentral: 8,
+    mal: 9,
+    anilist: 10,
   };
   const qNorm = normalizeTitle(query);
   function relevance(title: string): number {
@@ -418,6 +424,7 @@ export async function searchAllManga(
       mangapill: mangapill.length,
       toonily: toonily.length,
       comick: comick.length,
+      weebcentral: weebcentral.length,
       mal: mal.length,
       anilist: anilist.length,
     },
@@ -430,7 +437,7 @@ export async function searchAllManga(
  */
 export async function searchSingleSource(
   query: string,
-  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick",
+  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick" | "weebcentral",
   limit = 12
 ): Promise<MangadexManga[]> {
   switch (source) {
@@ -450,6 +457,8 @@ export async function searchSingleSource(
       return searchToonily(query, limit);
     case "comick":
       return searchComick(query, limit);
+    case "weebcentral":
+      return searchWeebCentral(query, limit);
     case "mal":
       return searchJikan(query, limit);
     case "anilist":

@@ -729,7 +729,8 @@ export type ScraperSource =
   | "mangadex"
   | "mangapill"
   | "toonily"
-  | "comick";
+  | "comick"
+  | "weebcentral";
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mh-")) return "mangahere";
@@ -740,11 +741,12 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mp-")) return "mangapill";
   if (id.startsWith("tl-")) return "toonily";
   if (id.startsWith("cm-")) return "comick";
+  if (id.startsWith("wc-")) return "weebcentral";
   return null;
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-)/, "");
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-)/, "");
 }
 
 export async function getChaptersForSource(
@@ -768,6 +770,8 @@ export async function getChaptersForSource(
       return getToonilyChapters(slug);
     case "comick":
       return getComickChapters(slug);
+    case "weebcentral":
+      return getWeebCentralChapters(slug);
   }
 }
 
@@ -793,6 +797,8 @@ export async function getImagesForSource(
       return getToonilyImages(slug, chapterId);
     case "comick":
       return getComickImages(slug, chapterId);
+    case "weebcentral":
+      return getWeebCentralImages(slug, chapterId);
   }
 }
 
@@ -803,7 +809,9 @@ export async function getImagesForSource(
 // list shown at job creation).
 // ---------------------------------------------------------------------------
 
-const COMICK_API = "https://api.comick.fun";
+// The API host moved api.comick.fun -> api.comick.dev (the .fun host now 000s
+// from many networks). Allow COMICK_API to override.
+const COMICK_API = process.env.COMICK_API || "https://api.comick.dev";
 const COMICK_IMG = "https://meo.comick.pictures";
 const COMICK_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -1159,5 +1167,110 @@ export async function getToonilyImages(
     throw new Error("Toonily returned no images for this chapter");
   }
 
+  return images;
+}
+
+// ---------------------------------------------------------------------------
+// WEEBCENTRAL (weebcentral.com) — large manga/manhwa catalogue, HTMX site.
+// All fragment endpoints respond to plain GETs with an `HX-Request: true`
+// header. `wc-{ULID}` id form. Series + chapter ids are 26-char ULIDs.
+// See mini-services/pipeline-service/lib.ts for the matching job-time scraper.
+// ---------------------------------------------------------------------------
+
+const WEEBCENTRAL_BASE = "https://weebcentral.com";
+const WEEBCENTRAL_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const weebHeaders = (referer?: string): Record<string, string> => ({
+  "User-Agent": WEEBCENTRAL_UA,
+  "HX-Request": "true",
+  Accept: "text/html",
+  ...(referer ? { Referer: referer } : {}),
+});
+
+export async function searchWeebCentral(query: string, limit = 10): Promise<MangadexManga[]> {
+  const url =
+    `${WEEBCENTRAL_BASE}/search/data?text=${encodeURIComponent(query)}` +
+    `&sort=Best%20Match&order=Descending&official=Any&anime=Any&adult=Any&display_mode=Minimal%20Display`;
+  const res = await fetchWithTimeout(url, { headers: weebHeaders() }, 15000);
+  if (!res.ok) throw new Error(`WeebCentral search ${res.status}`);
+  const html = await res.text();
+  const out: MangadexManga[] = [];
+  const seen = new Set<string>();
+  const re = /href="https:\/\/weebcentral\.com\/series\/([0-9A-Z]{26})\/([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) && out.length < limit) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    const slug = m[2];
+    out.push({
+      id: `wc-${m[1]}`,
+      title: decodeURIComponent(slug).replace(/-/g, " "),
+      description: "",
+      coverUrl: `https://temp.compsci88.com/cover/normal/${m[1]}.webp`,
+      status: null,
+      year: null,
+      originalLanguage: null,
+      availableTranslatedLanguages: ["en"],
+      tags: [],
+      contentRating: "safe",
+      lastChapter: null,
+      source: "weebcentral",
+      externalUrl: `${WEEBCENTRAL_BASE}/series/${m[1]}/${slug}`,
+    });
+  }
+  return out;
+}
+
+export async function getWeebCentralChapters(seriesId: string): Promise<ScrapedChapter[]> {
+  const url = `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/full-chapter-list`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: weebHeaders(`${WEEBCENTRAL_BASE}/series/${seriesId}`) },
+    15000
+  );
+  if (!res.ok) throw new Error(`WeebCentral chapters ${res.status} for ${seriesId}`);
+  const html = (await res.text()).replace(/\s+/g, " ");
+  const out: ScrapedChapter[] = [];
+  const seen = new Set<string>();
+  const re =
+    /href="(?:https:\/\/weebcentral\.com)?\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span[^>]*>\s*(?:Chapter|Episode)\s+([\d.]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    out.push({ id: m[1], chapterNum: m[2], title: null, language: "en" });
+  }
+  if (out.length === 0) throw new Error(`WeebCentral returned no chapters for ${seriesId}`);
+  out.reverse(); // full-chapter-list is newest-first
+  return out;
+}
+
+export async function getWeebCentralImages(
+  _seriesId: string,
+  chapterId: string
+): Promise<ScrapedImage[]> {
+  const url = `${WEEBCENTRAL_BASE}/chapters/${encodeURIComponent(chapterId)}/images?is_prev=False&current_page=1&reading_style=long_strip`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: weebHeaders(`${WEEBCENTRAL_BASE}/chapters/${chapterId}`) },
+    15000
+  );
+  if (!res.ok) throw new Error(`WeebCentral images ${res.status} for chapter ${chapterId}`);
+  const html = await res.text();
+  const images: ScrapedImage[] = [];
+  const re = /<img[^>]+src="(https:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi;
+  let m: RegExpExecArray | null;
+  let page = 1;
+  while ((m = re.exec(html)) !== null) {
+    const ext = m[1].match(/\.(jpg|jpeg|png|webp)/i)?.[1] || "jpg";
+    images.push({
+      url: m[1],
+      referer: `${WEEBCENTRAL_BASE}/`,
+      filename: `${String(page).padStart(3, "0")}.${ext}`,
+      headers: { "User-Agent": WEEBCENTRAL_UA, Referer: `${WEEBCENTRAL_BASE}/` },
+    });
+    page++;
+  }
+  if (images.length === 0) throw new Error(`WeebCentral returned no images for chapter ${chapterId}`);
   return images;
 }

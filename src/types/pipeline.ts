@@ -35,7 +35,8 @@ export type MangaSource =
   | "mangadex"
   | "mangapill"
   | "toonily"
-  | "comick";
+  | "comick"
+  | "weebcentral";
 
 export interface MangadexManga {
   id: string;

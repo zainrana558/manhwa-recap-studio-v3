@@ -65,6 +65,7 @@ const SOURCE_BADGE_CLASSES: Record<MangaSource, string> = {
   mangapill: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   toonily: "bg-pink-500/15 text-pink-300 border-pink-500/30",
   comick: "bg-violet-500/15 text-violet-300 border-violet-500/30",
+  weebcentral: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30",
 };
 
 const SOURCE_LABEL: Record<MangaSource, string> = {
@@ -78,6 +79,7 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   mangapill: "MangaPill",
   toonily: "Toonily",
   comick: "Comick",
+  weebcentral: "WeebCentral",
 };
 
 const CONTENT_RATING_CLASSES: Record<string, string> = {

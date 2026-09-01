@@ -70,6 +70,8 @@ export async function GET(
       mangadex: `https://mangadex.org/title/${slug}`,
       mangapill: `https://mangapill.com/manga/${slug}`,
       toonily: `https://toonily.com/serie/${slug}/`,
+      comick: `https://comick.io/comic/${slug}`,
+      weebcentral: `https://weebcentral.com/series/${slug}`,
     };
 
     const manga = {
