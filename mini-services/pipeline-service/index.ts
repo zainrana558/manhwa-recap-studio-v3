@@ -671,11 +671,26 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     spawnCwd = process.cwd()
   }
 
+  // Slice-only re-slices EVERY chapter (resumable via per-chapter manifest).
+  // The old flat 10-min cap silently killed the pre-slice on any large job
+  // (~1 min/chapter on 2 vCPU), so a 100-chapter run fell back to coarse
+  // full-page OCR. Scale with chapter count, min 30 min; SLICE_TIMEOUT_MS
+  // overrides. Slicing is CPU-bound and bounded, so a long ceiling is safe.
+  let sliceChapterCount = 0
+  try {
+    sliceChapterCount = (await fs.readdir(datasetDir(jobId), { withFileTypes: true }))
+      .filter((e) => e.isDirectory() && /^chapter_/i.test(e.name)).length
+  } catch {
+    // ignore — fall back to the floor below
+  }
+  const sliceTimeoutMs = Number(process.env.SLICE_TIMEOUT_MS)
+    || Math.max(30 * 60 * 1000, sliceChapterCount * 3 * 60 * 1000)
+
   const result = spawnSync(PYTHON_BIN, args, {
     cwd: spawnCwd,
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
     encoding: 'utf8',
-    timeout: 10 * 60 * 1000, // 10 min hard cap
+    timeout: sliceTimeoutMs,
   })
 
   if (result.error) {
