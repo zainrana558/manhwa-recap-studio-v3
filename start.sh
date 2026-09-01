@@ -201,7 +201,7 @@ echo ""
 # same "degrade, don't crash" pattern as the Piper download above.
 TEXT_DETECTOR_DIR="$PROJECT_DIR/pipeline/models/comic-text-and-bubble-detector"
 if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/null)" ]; then
-    echo "  Downloading comic text/bubble detector (RT-DETR-v2, ~170MB)..."
+    echo "  Downloading comic text/bubble detector (RT-DETR-v2)..."
     mkdir -p "$TEXT_DETECTOR_DIR"
     # Capturing output to a variable first, THEN checking $? explicitly,
     # rather than `if cmd | tail -5; then` -- without `set -o pipefail`
@@ -222,9 +222,14 @@ if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/nu
     # earlier in this same script's kill_service()/kill_port() functions
     # and the Next.js readiness check.
     set +e
+    # Fetch only what the pipeline uses: the ~11MB INT8 ONNX (fast onnxruntime
+    # path, _get_text_detector_onnx) + the config/preprocessor + safetensors
+    # (torch fallback, _get_text_detector). Skip the two big redundant ONNX
+    # exports (detector.onnx ~168MB, detector_int8.onnx ~44MB).
     DOWNLOAD_OUTPUT=$("$PROJECT_DIR/.venv/bin/python3" -c "
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR')
+snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR',
+                  ignore_patterns=['detector.onnx', 'detector_int8.onnx'])
 " 2>&1)
     DOWNLOAD_STATUS=$?
     set -e

@@ -1520,40 +1520,10 @@ async function processJob(jobId: string): Promise<void> {
 
     const outName = path.basename(outFile)
 
-    // -----------------------------
-    // YOUTUBE OPTIMIZATION — generate thumbnail + YouTube-ready encode + metadata.
-    // Runs BEFORE R2/Mega archiving because youtube_optimize.py needs the local file.
-    // -----------------------------
-    try {
-      await emitLog(jobId, 'info', 'done', 'Generating YouTube thumbnail + optimized encode...')
-      const ytScript = path.join(PROJECT_ROOT, 'pipeline', 'youtube_optimize.py')
-      const ytOutputDir = path.join(outputDir(jobId), 'youtube')
-      const ytResult = spawnSync(PYTHON_BIN, [
-        ytScript,
-        '--video', outFile,
-        '--title', job.mangaTitle,
-        '--cover', job.coverUrl || '',
-        '--chapters', String(job.totalChapters),
-        '--images', String(job.totalImages),
-        '--output-dir', ytOutputDir,
-      ], {
-        encoding: 'utf8',
-        timeout: 600000, // 10 min max for re-encode
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      })
-
-      if (ytResult.status === 0) {
-        await emitLog(jobId, 'success', 'done', 'YouTube-ready video + thumbnail + metadata generated')
-        const ytLog = (ytResult.stdout || '').split('\n').filter(l => l.includes('[YT]')).slice(-6)
-        for (const line of ytLog) {
-          await emitLog(jobId, 'info', 'done', line.replace('[YT] ', ''))
-        }
-      } else {
-        await emitLog(jobId, 'warn', 'done', `YouTube optimization failed (non-fatal): ${(ytResult.stderr || '').slice(-200)}`)
-      }
-    } catch (ytErr) {
-      await emitLog(jobId, 'warn', 'done', `YouTube optimization error (non-fatal): ${ytErr instanceof Error ? ytErr.message : ytErr}`)
-    }
+    // YouTube optimization (thumbnail + re-encode + SEO metadata) removed per
+    // user request — it roughly doubled wall time for a deliverable most jobs
+    // never use. The youtube_optimize.py script + /youtube-metadata route are
+    // left dormant so this is a one-block revert if it's wanted back.
 
     // -----------------------------
     // Reclaim disk space: intermediate work/ (sliced frames, per-panel

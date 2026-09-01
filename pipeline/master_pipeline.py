@@ -92,6 +92,9 @@ OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 # recaps run ~10fps). 12fps roughly halves encode time vs 24 with zero quality
 # loss on still images. Override with RECAP_FPS if a motion effect is ever added.
 FPS = int(os.environ.get("RECAP_FPS", "12"))
+# per-frame OCR of the tight raw crop (see _ocr_frames_into_narration_json /
+# _emit). On by default; the raw-crop image is only written when this is set.
+_OCR_FRAMES_ENABLED = os.environ.get("RECAP_OCR_FRAMES", "1").lower() not in ("0", "false", "no")
 
 # Comic text/bubble detector: ogkalu/comic-text-and-bubble-detector
 # (RT-DETR-v2 r50vd, Apache-2.0, 42.9M params). Superseded an earlier
@@ -126,6 +129,14 @@ FPS = int(os.environ.get("RECAP_FPS", "12"))
 # way, same as the model it replaces.
 TEXT_DETECTOR_MODEL_ID = "ogkalu/comic-text-and-bubble-detector"
 TEXT_DETECTOR_LOCAL_DIR = Path(__file__).parent / "models" / "comic-text-and-bubble-detector"
+# small INT8 ONNX export of the same RT-DETR-v2 detector (~11MB, 640px, runs
+# on onnxruntime CPU in ~1s per full webtoon page — ~8x faster than the torch
+# path, and no torch/transformers import). Preferred backend for
+# _detect_text_boxes_raw; the torch model below is the fallback.
+TEXT_DETECTOR_ONNX_PATH = TEXT_DETECTOR_LOCAL_DIR / "detector-v4-s_int8.onnx"
+TEXT_DETECTOR_ONNX_INPUT = 640
+_text_detector_onnx = None  # type: Any
+_text_detector_onnx_attempted = False
 _text_detector_model = None  # type: Any
 _text_detector_processor = None  # type: Any
 _text_detector_load_attempted = False
@@ -351,6 +362,7 @@ class FrameEntry:
     source_index: int
     frame_kind: str = "panel"  # "panel" | "scroll_frame" | "full_page"
     scroll_group: Optional[str] = None  # shared id for scroll_frame siblings sliced from one tall UI card
+    ocr_path: str = ""  # tight raw-pixel crop to OCR (falls back to `path` — the composed canvas — when empty)
     ocr_status: str = "NONE"
     ocr_text: str = ""
     narration_text: str = ""
@@ -655,6 +667,26 @@ def _get_text_detector():
     return _text_detector_model, _text_detector_processor
 
 
+def _get_text_detector_onnx():
+    """The small INT8 RT-DETR-v2 ONNX (TEXT_DETECTOR_ONNX_PATH). onnxruntime
+    only, no torch. (None) if absent / fails."""
+    global _text_detector_onnx, _text_detector_onnx_attempted
+    if _text_detector_onnx_attempted:
+        return _text_detector_onnx
+    _text_detector_onnx_attempted = True
+    if not TEXT_DETECTOR_ONNX_PATH.exists():
+        return None
+    try:
+        import onnxruntime as ort
+        _text_detector_onnx = ort.InferenceSession(
+            str(TEXT_DETECTOR_ONNX_PATH), providers=["CPUExecutionProvider"])
+        log.info("Loaded comic text/bubble detector (INT8 ONNX) from %s", TEXT_DETECTOR_ONNX_PATH)
+    except Exception as exc:  # pragma: no cover
+        log.warning("text/bubble ONNX load failed (%s) — falling back to torch path", exc)
+        _text_detector_onnx = None
+    return _text_detector_onnx
+
+
 def _detect_text_boxes_raw(img_gray) -> List[tuple]:
     """Run the text/bubble detector on ONE image as-is (no tall-image
     splitting -- see _detect_text_boxes for that), returning only its
@@ -665,6 +697,25 @@ def _detect_text_boxes_raw(img_gray) -> List[tuple]:
     boxes in the image's own pixel coordinates. Empty list if the model
     is unavailable or detects nothing.
     """
+    sess = _get_text_detector_onnx()
+    if sess is not None:
+        try:
+            rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB) if img_gray.ndim == 2 else img_gray
+            h, w = rgb.shape[:2]
+            S = TEXT_DETECTOR_ONNX_INPUT
+            x = cv2.resize(rgb, (S, S)).transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+            labels, boxes, scores = sess.run(
+                None, {"images": x, "orig_target_sizes": np.array([[h, w]], dtype=np.int64)})
+            out = []
+            for lab, box, sc in zip(labels[0], boxes[0], scores[0]):
+                if float(sc) < 0.35 or int(lab) not in (1, 2):   # 1=text_bubble 2=text_free
+                    continue
+                x1, y1, x2, y2 = (int(round(float(v))) for v in box)
+                if x2 - x1 >= 4 and y2 - y1 >= 4:
+                    out.append((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
+            return out
+        except Exception as exc:  # pragma: no cover
+            log.warning("text/bubble ONNX inference failed (%s) — trying torch path", exc)
     model, processor = _get_text_detector()
     if model is None:
         return []
@@ -717,8 +768,22 @@ def _detect_text_boxes(img_gray) -> List[tuple]:
     duplicate detections).
     """
     h, w = img_gray.shape[:2]
+    # Content cache — the same page is text-detected up to 3x per run
+    # (_detect_page_panels enrichment, _compose_canvas, _should_scroll_fragment).
+    # A cheap subsampled digest keys them together. Bounded to the last 64 pages.
+    try:
+        _k = (w, h, hash(img_gray[::37, ::37].tobytes()))
+        _c = _detect_text_boxes._cache
+        if _k in _c:
+            return _c[_k]
+    except Exception:
+        _k = None
+
     if w == 0 or h / max(1, w) <= TALL_IMAGE_SPLIT_ASPECT_RATIO:
-        return _detect_text_boxes_raw(img_gray)
+        _r = _detect_text_boxes_raw(img_gray)
+        if _k is not None:
+            _detect_text_boxes._cache[_k] = _r
+        return _r
 
     band_h = w * TALL_IMAGE_SPLIT_ASPECT_RATIO
     overlap = band_h * 0.2
@@ -752,7 +817,15 @@ def _detect_text_boxes(img_gray) -> List[tuple]:
                     break
         if not is_dup:
             deduped.append(box)
+    if _k is not None:
+        _c = _detect_text_boxes._cache
+        _c[_k] = deduped
+        if len(_c) > 64:
+            _c.pop(next(iter(_c)))
     return deduped
+
+
+_detect_text_boxes._cache = {}
 
 
 def _add_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
@@ -1701,33 +1774,70 @@ def _yolo_detect_page(img_rgb, panel_conf: float = 0.20, text_conf: float = 0.25
 
 
 def _split_borderless_column(box, gray, texts) -> "List[list]":
-    """Split one tall panel box at its internal CLEAN GUTTER ROWS — full-width
-    horizontal bands of near-uniform page background between two stacked
-    webtoon panels. Borderless webtoons put every panel full-width with a
-    generous light (occasionally dark) gap between them; the border-trained
-    YOLO detector sees the whole column as a single panel, so this is what
-    actually separates the beats. A box that is not much taller than it is
-    wide, or that has no clean internal gutter, is returned unchanged. A
-    gutter that a YOLO text box straddles is never cut (keeps a bubble
-    whole). Sub-panels shorter than ~0.4x width are folded back into a
-    neighbour so a lone caption strip never becomes its own beat.
+    """Split one tall panel box into the individual webtoon beats stacked
+    inside it.
+
+    Borderless webtoon hosts serve a chapter as fixed-height chunk images and
+    every panel is full-width with a generous light (occasionally flat-black)
+    gutter between them; the border-trained YOLO detector collapses a whole
+    column of stacked panels into one giant box. This finds those internal
+    gutters — full-width bands of near-uniform page background — cuts there,
+    trims each sub-panel to its OWN content (so half a blank gutter never
+    rides along as dead space), and folds only genuinely tiny caption strips
+    into a neighbour. A lone speech bubble is fused with the panel it
+    introduces ONLY when it sits right against it — a bubble separated from
+    every panel by a wide blank gap is kept as its own beat instead of
+    dragging a far-away panel up into one long strip.
+
+    A box not much taller than it is wide, or with no clean internal gutter,
+    is returned unchanged. A gutter a YOLO text box straddles is never cut.
     """
     x1, y1, x2, y2 = (int(v) for v in box)
     W = max(1, x2 - x1)
-    if (y2 - y1) <= 1.7 * W or y2 - y1 < 200:
+    H = y2 - y1
+    if H <= 1.35 * W or H < 320:
         return [list(box)]
     col = gray[max(0, y1):y2, max(0, x1):x2]
-    if col.size == 0:
+    if col.size == 0 or col.shape[0] < 120:
         return [list(box)]
-    row_mean = col.mean(axis=1)
+    ci = col.astype(np.int16)
+    Hc = col.shape[0]
+
+    # "text on black" dramatic column vs normal light page — the gutter (and
+    # the definition of 'ink') is inverted between the two.
+    dark_page = float((col <= 40).mean()) > 0.45
+
     row_std = col.std(axis=1)
-    light_frac = (col >= 232).mean(axis=1)
     dark_frac = (col <= 26).mean(axis=1)
-    # a gutter row: a full-width band of near-uniform page margin — either
-    # very light (the usual webtoon gap) or a flat dark band ("text on black"
-    # dramatic pages). Uniformity (low std) guards against cutting through a
-    # dark-but-detailed night panel.
-    quiet = ((light_frac >= 0.96) & (row_std <= 18)) | ((dark_frac >= 0.96) & (row_std <= 14))
+    if dark_page:
+        bg = 0.0
+        # gutter row: a near-uniform full-width near-black band
+        quiet = (dark_frac >= 0.90) & (row_std <= 20)
+    else:
+        # Robust page-background tone — median of the brightest ~30% of
+        # pixels. Works for pure white, cream scanlations and grey paper
+        # alike (the old fixed ">= 232" test silently failed on every
+        # slightly-off-white source).
+        flat = ci.ravel()
+        bright_vals = flat[flat >= np.percentile(flat, 70)]
+        bg = float(np.median(bright_vals)) if bright_vals.size else 245.0
+        near_bg = (np.abs(ci - bg) <= 16).mean(axis=1)
+        # a genuine inter-panel gutter is a clean full-width background band.
+        # bg-tone (above) is what makes this robust on off-white sources; the
+        # fraction stays fairly tight so a bright sky / white shirt inside a
+        # panel doesn't read as a cut.
+        quiet = ((near_bg >= 0.945) & (row_std <= 18)) | ((dark_frac >= 0.955) & (row_std <= 15))
+
+    def _ink_rows(sub):
+        """boolean per-row: does this row carry drawn content?"""
+        si = sub.astype(np.int16)
+        if dark_page:
+            return (si > 55).mean(axis=1) > 0.010
+        r = (np.abs(si - bg) > 22).mean(axis=1) > 0.010
+        if r.sum() < 8:
+            r = (si <= max(30.0, bg - 45)).mean(axis=1) > 0.05
+        return r
+
     bands, i, n = [], 0, len(quiet)
     while i < n:
         if not quiet[i]:
@@ -1736,65 +1846,248 @@ def _split_borderless_column(box, gray, texts) -> "List[list]":
         j = i
         while j < n and quiet[j]:
             j += 1
-        # a real inter-panel webtoon gap is a generous band; a ~15px quiet run
-        # is just the space between a speech bubble and the art below it
-        if j - i >= 26:
-            bands.append((i, j))
+        if j - i >= 26:          # a real inter-panel gap is a generous band
+            bands.append([i, j])
         i = j
     if not bands:
         return [list(box)]
 
     def _text_straddles(row_y):
         for (tx1, ty1, tx2, ty2, _s) in (texts or []):
-            if ty1 < row_y - 3 < row_y + 3 < ty2 and min(tx2, x2) - max(tx1, x1) > 0.2 * W:
+            if ty1 < row_y - 3 and ty2 > row_y + 3 and min(tx2, x2) - max(tx1, x1) > 0.2 * W:
                 return True
         return False
 
-    cuts = [0]
+    # Content segments live BETWEEN the gutter bands. A fat gutter (>= 60px)
+    # is dropped whole — its blank rows belong to no beat; a thin one is split
+    # at its midpoint so each side keeps a small natural margin.
+    spans, prev = [], 0
     for (a, b) in bands:
-        mid = (a + b) // 2
-        if not _text_straddles(y1 + mid):
-            cuts.append(mid)
-    cuts.append(y2 - y1)
-    cuts = sorted(set(cuts))
-    segs = [[x1, y1 + cuts[k], x2, y1 + cuts[k + 1]] for k in range(len(cuts) - 1)]
-    # drop fully-blank segments; keep the rest
-    kept_segs: "List[list]" = []
-    for s in segs:
-        sub = gray[max(0, s[1]):s[3], max(0, s[0]):s[2]]
-        if sub.size == 0 or (sub < 232).mean() < 0.012:
+        lo, hi = (a, b) if b - a >= 60 else ((a + b) // 2, (a + b) // 2)
+        if _text_straddles(y1 + (lo + hi) // 2):
             continue
-        kept_segs.append(s)
-    if not kept_segs:
+        spans.append((prev, lo))
+        prev = hi
+    spans.append((prev, Hc))
+
+    # text/bubble boxes overlapping this column, in column-local y (ints)
+    col_texts = []
+    for (tx1, ty1, tx2, ty2, _s) in (texts or []):
+        if min(tx2, x2) - max(tx1, x1) > 0.12 * W:
+            col_texts.append((int(ty1) - y1, int(ty2) - y1))
+
+    def _snap_out_to_text(t0, t1):
+        """grow [t0,t1] so it never bisects a speech bubble the detector saw."""
+        for (a, b) in col_texts:
+            if b <= t0 or a >= t1:
+                continue                       # text box entirely outside — fine
+            if a < t0:
+                t0 = int(a) - 4
+            if b > t1:
+                t1 = int(b) + 4
+        return int(t0), int(t1)
+
+    def _trim_span(lo, hi):
+        sub = ci[lo:hi]
+        if sub.shape[0] < 8:
+            return None
+        rr = np.where(_ink_rows(sub))[0]
+        if rr.size < 8:
+            return None
+        # generous padding so a bubble's faint rounded top/bottom isn't shaved
+        t0 = int(rr[0]) - 12
+        t1 = int(rr[-1]) + 13
+        t0, t1 = _snap_out_to_text(lo + t0, lo + t1)
+        t0 = max(0, t0)
+        t1 = min(Hc, t1)
+        return [x1, y1 + t0, x2, y1 + t1]
+
+    segs = [s for s in (_trim_span(lo, hi) for (lo, hi) in spans) if s is not None]
+    if len(segs) <= 1:
         return [list(box)]
-    def _bubble_only(s):
-        """A segment that is mostly page background with just a floating
-        speech bubble and little/no drawn scenery — reads better fused with
-        the panel it introduces than held on its own."""
-        sg = gray[max(0, s[1]):s[3], max(0, s[0]):s[2]]
+    # de-overlap: two segments the text-snap pushed into each other are one beat
+    segs.sort(key=lambda s: s[1])
+    merged = [segs[0]]
+    for s in segs[1:]:
+        if s[1] < merged[-1][3] - 6:
+            merged[-1][3] = max(merged[-1][3], s[3])
+        else:
+            merged.append(s)
+    segs = merged
+    if len(segs) <= 1:
+        return [list(box)]
+
+    def _is_thin_strip(s):
+        h = s[3] - s[1]
+        return h < 0.42 * W and h < 360
+
+    def _is_lone_bubble(s):
+        sg = gray[max(0, s[1]):s[3], max(0, s[0]):s[2]].astype(np.int16)
         if sg.size == 0:
             return False
-        bright = float((sg >= 232).mean())
-        artish = float(((sg >= 40) & (sg <= 210)).mean())   # mid-tones = drawn scenery
-        return bright >= 0.55 and artish <= 0.22
+        h, w = sg.shape
+        if h > 0.62 * W or h > 470:         # a tall segment is never "just a bubble"
+            return False
+        ink = np.abs(sg - bg) > 40
+        rr = np.where(ink.mean(axis=1) > 0.02)[0]
+        cc = np.where(ink.mean(axis=0) > 0.02)[0]
+        if rr.size == 0 or cc.size == 0:
+            return False
+        span_v = (rr[-1] - rr[0]) / max(1, h)
+        cx = (cc[0] + cc[-1]) / 2.0 / max(1, w)
+        fill = float(ink[rr[0]:rr[-1] + 1, cc[0]:cc[-1] + 1].mean())
+        # ink confined to a compact, roughly-centred block = a speech balloon
+        return span_v <= 0.9 and 0.18 <= cx <= 0.82 and fill >= 0.10
 
-    # fold a too-thin sub-panel (a lone caption strip) OR a bubble-only slice
-    # into a neighbour — a bubble in a gap is read just before the panel
-    # BELOW it, so it fuses downward by preference.
-    thin_h = 0.55 * W
-    changed = True
-    while changed and len(kept_segs) > 1:
-        changed = False
-        for k, s in enumerate(kept_segs):
-            if (s[3] - s[1]) >= thin_h and not _bubble_only(s):
+    def _ink_area(s):
+        sg = gray[max(0, s[1]):s[3], max(0, s[0]):s[2]].astype(np.int16)
+        if sg.size == 0:
+            return 0.0
+        return float((np.abs(sg - bg) > 40).mean()) if not dark_page else float((sg > 55).mean())
+
+    # A short sub-panel (a caption strip, a lone bubble, a sliver of art) reads
+    # better fused with the panel it sits next to than held as its own beat —
+    # UNLESS it carries real text and is a long way from any panel (then it is
+    # a deliberate standalone caption). This is the same "fuse downward"
+    # behaviour as before the rewrite; the bg-tone fix above is what stopped
+    # the giant slivers, not aggressive splitting.
+    def _fold_pass(segs):
+        changed = True
+        while changed and len(segs) > 1:
+            changed = False
+            for k, s in enumerate(segs):
+                if not (_is_thin_strip(s) or _is_lone_bubble(s)):
+                    continue
+                cand = []
+                if k + 1 < len(segs):
+                    cand.append((k + 1, segs[k + 1][1] - s[3]))
+                if k - 1 >= 0:
+                    cand.append((k - 1, s[1] - segs[k - 1][3]))
+                if not cand:
+                    continue
+                j, gap = min(cand, key=lambda t: t[1])
+                if gap > 1.0 * W:
+                    # far from anything: keep only a real caption block, else
+                    # it's scan noise / a stray mark — drop it
+                    if _ink_area(s) < 0.045:
+                        del segs[k]
+                        changed = True
+                        break
+                    continue
+                lo, hi = min(k, j), max(k, j)
+                segs[lo] = [x1, min(segs[lo][1], segs[hi][1]), x2, max(segs[lo][3], segs[hi][3])]
+                del segs[hi]
+                changed = True
+                break
+        # any segment still shorter than ~0.42x width folds into its nearest
+        # neighbour (no beat is worth a thin strip)
+        changed = True
+        while changed and len(segs) > 1:
+            changed = False
+            segs.sort(key=lambda s: s[1])
+            for k, s in enumerate(segs):
+                if (s[3] - s[1]) >= 0.42 * W:
+                    continue
+                j = k + 1 if k == 0 else (k - 1 if k == len(segs) - 1 else
+                                          (k - 1 if (s[1] - segs[k - 1][3]) <= (segs[k + 1][1] - s[3]) else k + 1))
+                lo, hi = min(k, j), max(k, j)
+                segs[lo] = [x1, min(segs[lo][1], segs[hi][1]), x2, max(segs[lo][3], segs[hi][3])]
+                del segs[hi]
+                changed = True
+                break
+        return segs
+
+    segs = _fold_pass(segs)
+
+    # Text-cluster pass: a tall segment with no clean gutter but two or more
+    # vertically-separated blocks of dialogue (a webtoon "conversation" page —
+    # bubbles scattered over one continuous background) is really that many
+    # beats. Cut in the clear gap BETWEEN bubble clusters (never through one).
+    # This is what stops a whole page of dialogue landing on one 16-second
+    # static frame.
+    col_tb = sorted(((a, b) for (a, b) in ((int(t[1]) - y1, int(t[3]) - y1)
+                     for t in (texts or []) if min(t[2], x2) - max(t[0], x1) > 0.12 * W)
+                     if 0 <= a < Hc and 0 < b <= Hc + 40), key=lambda p: p[0])
+    if col_tb and len(segs) < 40:
+        clustered: "List[list]" = []
+        for s in segs:
+            sh = s[3] - s[1]
+            # a compact single panel (roughly square or wider) is one beat even
+            # with two bubbles; only look to split something meaningfully tall.
+            if sh <= 1.15 * W:
+                clustered.append(s)
                 continue
-            j = k + 1 if k + 1 < len(kept_segs) else k - 1
-            lo, hi = min(k, j), max(k, j)
-            kept_segs[lo] = [x1, kept_segs[lo][1], x2, kept_segs[hi][3]]
-            del kept_segs[hi]
-            changed = True
-            break
-    return kept_segs
+            local = [(a, b) for (a, b) in col_tb if a >= s[1] - y1 - 8 and b <= s[3] - y1 + 8]
+            if len(local) < 2:
+                clustered.append(s)
+                continue
+            # group boxes into clusters (a clear vertical gap between them)
+            groups = [[local[0]]]
+            for (a, b) in local[1:]:
+                if a - groups[-1][-1][1] > max(38, 0.09 * W):
+                    groups.append([(a, b)])
+                else:
+                    groups[-1].append((a, b))
+            if len(groups) < 2:
+                clustered.append(s)
+                continue
+            cuts = [s[1]]
+            for g0, g1 in zip(groups, groups[1:]):
+                gap_lo = y1 + max(gg[1] for gg in g0)
+                gap_hi = y1 + min(gg[0] for gg in g1)
+                # the gap must be genuinely clear of any text box (not just of
+                # THESE two groups' boxes) before we cut in it
+                if (gap_hi - gap_lo >= 28
+                        and not any(tb_a < gap_hi - 4 and tb_b > gap_lo + 4 for (tb_a, tb_b) in col_tb)):
+                    cuts.append((gap_lo + gap_hi) // 2)
+            cuts.append(s[3])
+            cuts = sorted(set(cuts))
+            if len(cuts) > 2:
+                for c0, c1 in zip(cuts, cuts[1:]):
+                    if c1 - c0 >= 28:
+                        # trim each sub-beat to its own content so the fold
+                        # pass below can recognise a caption-only slice
+                        t = _trim_span(int(c0) - y1, int(c1) - y1)
+                        clustered.append(t if t is not None else [s[0], c0, s[2], c1])
+            else:
+                clustered.append(s)
+        segs = _fold_pass(clustered)   # fuse any caption-only slice into its panel
+
+    # Second pass: a segment still MUCH taller than wide probably holds two
+    # beats the uniform-gutter test was too strict to see. Cut it once at its
+    # widest internal low-ink band — but only when that band is unambiguous
+    # (real content well clear on both sides, no text across it).
+    out: "List[list]" = []
+    for s in segs:
+        sh, sw = s[3] - s[1], s[2] - s[0]
+        if sh <= 2.8 * sw or sh < 240:
+            out.append(s)
+            continue
+        sub = gray[max(0, s[1]):s[3], max(0, s[0]):s[2]]
+        ink = _ink_rows(sub)
+        low = ~ink
+        m0, m1 = int(0.12 * sub.shape[0]), int(0.88 * sub.shape[0])
+        best, i = None, m0
+        while i < m1:
+            if low[i]:
+                j = i
+                while j < m1 and low[j]:
+                    j += 1
+                if best is None or (j - i) > (best[1] - best[0]):
+                    best = (i, j)
+                i = j
+            else:
+                i += 1
+        # only accept the cut when real content sits on BOTH sides of the gap
+        if (best and (best[1] - best[0]) >= 16
+                and ink[:best[0]].sum() >= 12 and ink[best[1]:].sum() >= 12
+                and not _text_straddles(s[1] + (best[0] + best[1]) // 2)):
+            mid = s[1] + (best[0] + best[1]) // 2
+            out.append([s[0], s[1], s[2], mid])
+            out.append([s[0], mid, s[2], s[3]])
+        else:
+            out.append(s)
+    return out
 
 
 def _detect_page_panels(img_rgb) -> "List[tuple]":
@@ -1817,6 +2110,24 @@ def _detect_page_panels(img_rgb) -> "List[tuple]":
     panels_y, texts_y = _yolo_detect_page(img_rgb)
     if panels_y is not None and (panels_y or texts_y):
         pg_area = float(W * H)
+        # Enrich the text boxes with the RT-DETR comic text/bubble detector
+        # (webtoon-trained, far better recall than the Manga109 YOLO's text
+        # class). These drive every "never cut through a bubble" guard
+        # downstream (_split_borderless_column, the contiguity merge's
+        # _text_bridges, the seam stitch) and let the splitter cut BETWEEN
+        # bubble clusters where there is no clean gutter.
+        if os.environ.get("RECAP_TEXT_DET_SPLIT", "1").lower() not in ("0", "false", "no"):
+            try:
+                _tb = _detect_text_boxes(cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2GRAY))
+                _existing = list(texts_y or [])
+                for (tx1, ty1, tx2, ty2) in _tb:
+                    if not any(min(tx2, e[2]) - max(tx1, e[0]) > 0 and
+                               min(ty2, e[3]) - max(ty1, e[1]) > 0.5 * (ty2 - ty1)
+                               for e in _existing):
+                        _existing.append((int(tx1), int(ty1), int(tx2), int(ty2), 0.9))
+                texts_y = _existing
+            except Exception as _e:  # pragma: no cover
+                log.debug("text-detector enrichment skipped (%s)", _e)
         # drop detector noise: a box too small to be a panel, or a thin
         # sliver that's really just a promoted text box (NOT a merge — these
         # are false positives, never real panels).
@@ -2309,9 +2620,26 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             return
         fp = out_dir / f"frame_{counter:05d}.jpg"
         _compose_canvas(Image.fromarray(crop_rgb)).save(fp, quality=92)
+        # OCR reads this tight raw-pixel crop, NOT the composed canvas: the
+        # canvas contain-fits a tall panel to a small centred strip and rings
+        # it with a blurred copy of itself, both of which wreck recognition.
+        # (deleted again by _ocr_frames_into_narration_json once OCR has run)
+        ocr_path = ""
+        if _OCR_FRAMES_ENABLED:
+            ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
+            try:
+                oc = crop_rgb
+                if max(oc.shape[:2]) < 1500:   # upscale small crops for the detector
+                    s = 1500 / max(oc.shape[:2])
+                    oc = cv2.resize(oc, (int(oc.shape[1] * s), int(oc.shape[0] * s)),
+                                    interpolation=cv2.INTER_CUBIC)
+                Image.fromarray(oc).save(ocr_fp, quality=94)
+                ocr_path = str(ocr_fp.resolve())
+            except Exception:
+                ocr_path = ""
         entries.append(FrameEntry(
             frame_id=f"{chapter.tag}_frame_{counter:05d}",
-            filename=fp.name, path=str(fp.resolve()),
+            filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
             source_page=page_name, source_index=page_idx, frame_kind="panel",
         ))
         counter += 1
@@ -2395,10 +2723,11 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
     import json as _json
     import urllib.request
 
-    if os.environ.get("RECAP_OCR_FRAMES", "1").lower() in ("0", "false", "no"):
+    if not _OCR_FRAMES_ENABLED:
         return False
     base = os.environ.get("OCR_SERVICE_URL", "http://localhost:3002")
-    paths = [e.path for e in frame_entries]
+    # prefer the tight raw crop (see _emit) — falls back to the composed canvas
+    paths = [(e.ocr_path or e.path) for e in frame_entries]
     if not paths:
         return False
     try:
@@ -2414,11 +2743,38 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
         return False
 
     by_index = {int(x.get("index", i)): x for i, x in enumerate(results)}
-    narration = []
+    texts = []
     for i, e in enumerate(frame_entries):
         item = by_index.get(i, {})
         text = (item.get("text") or "").strip()
         status = item.get("status") or ("SUCCESS" if text else "NO_TEXT")
+        texts.append([text, status])
+
+    # A cut that ran through a speech bubble makes the SAME words tail frame N
+    # and head frame N+1 ("…IS THAT GUY A" / "IS THAT GUY A STRONG HUNTER") —
+    # spoken twice, and the second panel's audio starts on stale words. Drop
+    # the duplicated run from the later frame's start.
+    def _norm(w):
+        return re.sub(r"[^a-z0-9]", "", w.lower())
+
+    for i in range(len(texts) - 1):
+        a, b = texts[i][0], texts[i + 1][0]
+        if not a or not b:
+            continue
+        aw, bw = a.split(), b.split()
+        best = 0
+        for k in range(min(8, len(aw), len(bw)), 2, -1):
+            if [_norm(w) for w in aw[-k:]] == [_norm(w) for w in bw[:k]]:
+                best = k
+                break
+        if best:
+            texts[i + 1][0] = " ".join(bw[best:]).strip()
+
+    narration = []
+    for i, e in enumerate(frame_entries):
+        text, status = texts[i]
+        if not text and status == "SUCCESS":
+            status = "NO_TEXT"
         e.ocr_text, e.ocr_status = text, status
         narration.append({"image": e.filename, "text": text, "status": status})
 
@@ -2426,6 +2782,15 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
     chapter.image_narrations = {n["image"]: n for n in narration}
     got = sum(1 for n in narration if n["text"])
     log.info("[%s] per-frame OCR: %d/%d frames transcribed (RapidOCR)", chapter.tag, got, len(narration))
+
+    # the upscaled raw-crop OCR images have served their purpose — reclaim the space
+    for e in frame_entries:
+        if e.ocr_path and e.ocr_path != e.path:
+            try:
+                Path(e.ocr_path).unlink()
+            except OSError:
+                pass
+            e.ocr_path = ""
     return True
 
 
@@ -2827,16 +3192,17 @@ def _compose_canvas(crop):
     # Contain-fit: scale to fit ENTIRELY within canvas, centered — the whole
     # panel (bubbles, character head and feet) always visible, over the
     # blurred backdrop. This is how the reference recap frames each view.
-    # (Page-mode chunks are ~3:2 portrait, so contain-fit already fills most
-    # of the height; the old extreme-aspect "overscan" hack that zoomed
-    # text-strip crops is gone with the per-bubble slicer.)
+    # NOTE: NO cover-crop for tall panels — cropping a tall webtoon panel to
+    # fill more width was clipping speech bubbles ("text sliced through").
+    # A tall panel letterboxes on its own blurred backdrop; that is the
+    # reference look and it never loses a word.
     fg_scale = min(CANVAS_W / cw, CANVAS_H / ch) * PANEL_FIT_MARGIN
 
     fw, fh = max(1, int(cw * fg_scale)), max(1, int(ch * fg_scale))
     fg = crop.resize((fw, fh), Image.LANCZOS)
     fx = (CANVAS_W - fw) // 2
     fy = (CANVAS_H - fh) // 2
-    # Crop any overflow so the pasted foreground never exceeds the canvas.
+    # Crop any residual overflow so the pasted foreground never exceeds canvas.
     if fw > CANVAS_W or fh > CANVAS_H:
         left = max(0, (fw - CANVAS_W) // 2)
         top = max(0, (fh - CANVAS_H) // 2)
@@ -3037,6 +3403,41 @@ _CREDIT_PATTERNS = [
     r"\bplease (?:support|rate|comment|subscribe)\b.*",
 ]
 
+# strong markers — a known studio / author name, or a "Role:" label — that
+# alone-plus-one signals a credits card; plain words like "studio" only count
+# as weak corroboration so a line of dialogue that happens to say "studio" and
+# "editor" isn't blanked.
+_CREDIT_BLOB_STRONG = re.compile(
+    r"(?:\bredice\b|\bred\s*ice\b|\bdubu\b|\bchugong\b|\bh[-\s]?goon\b|\bd\s*&\s*c\b|"
+    r"\b(?:translat\w*|editor|edited|proofread\w*|typeset\w*|scanlat\w*|redraw\w*|"
+    r"cleaner|art|artwork|story|original\s+novel)\s*(?:[:·\-—]|\bby\b))",
+    re.IGNORECASE,
+)
+_CREDIT_BLOB_WEAK = re.compile(
+    r"(?:\bwebtoon\b|\bstudio\b|\bartist\b|\badaptation\b|\bproduction\b|"
+    r"\beditor\b|\btranslat\w*|\bproofread\w*|\bto\s+be\s+continued\b|"
+    r"\bthanks\s+for\s+reading\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_credits_blob(text: str) -> bool:
+    """True when a panel's text is a title / staff-credits card rather than
+    story dialogue: at least one STRONG marker (studio/author name or a
+    'Role:' label) plus one more credit marker, in a short non-prose line."""
+    if not text:
+        return False
+    strong = {m.group(0).lower() for m in _CREDIT_BLOB_STRONG.finditer(text)}
+    if not strong:
+        return False
+    weak = {m.group(0).lower() for m in _CREDIT_BLOB_WEAK.finditer(text)}
+    if len(strong) + len(weak) < 2:
+        return False
+    words = re.findall(r"[A-Za-z']+", text)
+    # a credits card is short and mostly proper nouns / labels, not prose
+    return len(words) <= 18
+
+
 def _clean_source_text(text: str) -> str:
     """Strip scanlation credits / front-matter from raw OCR/transcription text
     BEFORE it is translated and rewritten.
@@ -3066,6 +3467,13 @@ def _clean_source_text(text: str) -> str:
     # If after that the panel is basically empty or was ALL credits markup,
     # bail early — it's a front-matter / watermark panel.
     if len(re.sub(r"[^A-Za-z]", "", cleaned)) < 3:
+        return ""
+
+    # Whole-panel title / staff-credits card, wherever it lands in the chunk
+    # stream (webtoon hosts pad several lead-in images before the real title):
+    # a cluster of production-credit keywords / known studio + author names is
+    # never story content.
+    if _is_credits_blob(cleaned):
         return ""
 
     for pat in _CREDIT_PATTERNS:
