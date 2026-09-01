@@ -1,49 +1,47 @@
 #!/usr/bin/env python3
-"""Merge the per-source YOLO label sets into one training dataset.
+"""Merge the per-source YOLO label sets into one balanced training dataset.
 
-Sources (each: images/ + labels/, class 0 = panel):
-  - yolo_kumiko/        Kumiko on the 4 bordered-manga series  (independent)
-  - yolo/               Gemini flash-lite on webtoon pages     (independent)
-  - yolo_webtoon_slicer/ pipeline slicer on webtoon pages      (optional, opt-in)
+  yolo_kumiko/       Kumiko on 4 bordered-manga series      (CV, excellent)
+  yolo_webtoon_cv/   CV horizontal-gutter split, 12 webtoons (CV, good)
+  yolo/              Gemini flash-lite on webtoon pages     (VLM, ~decent)
 
-Geometric QC + per-series cap + series-held-out val split. Output: a flat
-YOLO dir ready to zip for Kaggle.
+Priorities: keep every manga page; keep every MULTI-box webtoon page (real
+segmentation signal); add a capped sample of single-box webtoon pages
+(content-region signal). Per-series cap so ORV can't dominate. `tbate` held
+out entirely for val (style generalisation).
 
-    python assemble.py --out train_ready [--include-slicer]
+    python assemble.py --out train_ready
 """
 import argparse
 import glob
 import hashlib
 import random
-import shutil
 from pathlib import Path
+import shutil
 
 import cv2
-import numpy as np
 
 HERE = Path(__file__).parent
-VAL_SERIES = {"tbate"}          # one series held out entirely (style-generalisation check)
-VAL_FRAC = 0.10                 # + a slice of every other series
-CAP = 400
+VAL_SERIES = {"tbate"}
+VAL_FRAC = 0.08
+CAP = 340                       # per series
+SINGLE_BOX_KEEP = 900          # cap on single-box webtoon pages
+
+
+def nboxes(lp):
+    return sum(1 for ln in Path(lp).read_text().split("\n") if len(ln.split()) == 5) \
+        if Path(lp).exists() else 0
 
 
 def read_boxes(lp):
     out = []
-    if Path(lp).exists():
-        for ln in Path(lp).read_text().split("\n"):
-            f = ln.split()
-            if len(f) == 5:
-                out.append([float(x) for x in f[1:]])  # cx cy w h
+    for ln in Path(lp).read_text().split("\n"):
+        f = ln.split()
+        if len(f) == 5:
+            cx, cy, w, h = (float(x) for x in f[1:])
+            if 0.10 < w <= 1.001 and 0.008 < h <= 1.001 and w * h < 0.995:
+                out.append((cx, cy, w, h))
     return out
-
-
-def ok_box(b):
-    cx, cy, w, h = b
-    if w < 0.12 or h < 0.010 or w > 1.02 or h > 1.02:
-        return False
-    if w * h > 0.99:
-        return False
-    return True
 
 
 def phash(im):
@@ -54,65 +52,80 @@ def phash(im):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(HERE / "train_ready"))
-    ap.add_argument("--include-slicer", action="store_true")
     args = ap.parse_args()
     out = Path(args.out)
+    if out.exists():
+        shutil.rmtree(out)
     for s in ("train", "val"):
         (out / "images" / s).mkdir(parents=True, exist_ok=True)
         (out / "labels" / s).mkdir(parents=True, exist_ok=True)
 
-    srcs = [HERE / "yolo_kumiko", HERE / "yolo"]
-    if args.include_slicer:
-        srcs.append(HERE / "yolo_webtoon_slicer")
-
     rng = random.Random(0)
-    by_series = {}
-    for sd in srcs:
-        for ip in glob.glob(f"{sd}/images/*"):
-            stem = Path(ip).stem
-            series = stem.split("__")[0]
-            by_series.setdefault(series, []).append((sd, ip, stem))
+    # gather candidates: (priority, series, img_path, label_path)
+    cands = []
+    KUM = HERE / "yolo_kumiko"
+    for ip in glob.glob(f"{KUM}/images/*"):
+        st = Path(ip).stem
+        cands.append((0, st.split("__")[0], ip, f"{KUM}/labels/{st}.txt"))
+    WC = HERE / "yolo_webtoon_cv"
+    sb = []
+    for ip in glob.glob(f"{WC}/images/*"):
+        st = Path(ip).stem
+        lp = f"{WC}/labels/{st}.txt"
+        n = nboxes(lp)
+        if n >= 2:
+            cands.append((1, st.split("__")[0], ip, lp))
+        elif n == 1:
+            sb.append((2, st.split("__")[0], ip, lp))
+    rng.shuffle(sb)
+    cands += sb[:SINGLE_BOX_KEEP]
+    GEM = HERE / "yolo"
+    for ip in glob.glob(f"{GEM}/images/*"):
+        st = Path(ip).stem
+        if st.split("__")[0] in ("chainsaw-man",):     # covered by Kumiko
+            continue
+        cands.append((1, st.split("__")[0], ip, f"{GEM}/labels/{st}.txt"))
 
-    seen = set()
-    kept = dropped = 0
+    rng.shuffle(cands)
+    cands.sort(key=lambda c: c[0])          # priority 0 (manga) first
+    seen_hash = set()
     per_series = {}
-    for series, items in sorted(by_series.items()):
-        rng.shuffle(items)
-        items = items[:CAP]
-        for sd, ip, stem in items:
-            im = cv2.imread(ip)
-            if im is None:
-                dropped += 1
-                continue
-            H, W = im.shape[:2]
-            hh = phash(im)
-            if hh in seen:
-                dropped += 1
-                continue
-            boxes = [b for b in read_boxes(f"{sd}/labels/{stem}.txt") if ok_box(b)]
-            # coverage sanity: a page with real ink but no boxes is a miss -> skip
-            g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-            inky = float((g < 235).mean()) > 0.05
-            if not boxes and inky:
-                dropped += 1
-                continue
-            seen.add(hh)
-            split = "val" if (series in VAL_SERIES or rng.random() < VAL_FRAC) else "train"
-            name = f"{stem}"[:120]
-            shutil.copy(ip, out / "images" / split / f"{name}.jpg")
-            with open(out / "labels" / split / f"{name}.txt", "w") as f:
-                for cx, cy, w, h in boxes:
-                    f.write(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
-            kept += 1
-            per_series[series] = per_series.get(series, 0) + 1
+    kept = dropped = 0
+    stats = {}
+    for prio, series, ip, lp in cands:
+        if per_series.get(series, 0) >= CAP:
+            dropped += 1
+            continue
+        im = cv2.imread(ip)
+        if im is None:
+            dropped += 1
+            continue
+        hh = phash(im)
+        if hh in seen_hash:
+            dropped += 1
+            continue
+        boxes = read_boxes(lp) if Path(lp).exists() else []
+        seen_hash.add(hh)
+        per_series[series] = per_series.get(series, 0) + 1
+        split = "val" if (series in VAL_SERIES or rng.random() < VAL_FRAC) else "train"
+        name = Path(ip).stem[:120]
+        cv2.imwrite(str(out / "images" / split / f"{name}.jpg"), im, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        with open(out / "labels" / split / f"{name}.txt", "w") as f:
+            for cx, cy, w, h in boxes:
+                f.write(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+        kept += 1
+        stats[series] = stats.get(series, 0) + 1
 
-    ntr = len(glob.glob(f"{out}/images/train/*"))
-    nva = len(glob.glob(f"{out}/images/val/*"))
     import yaml
     yaml.safe_dump({"path": ".", "train": "images/train", "val": "images/val",
                     "nc": 1, "names": ["panel"]}, open(out / "data.yaml", "w"))
+    ntr = len(glob.glob(f"{out}/images/train/*"))
+    nva = len(glob.glob(f"{out}/images/val/*"))
     print(f"kept {kept}  dropped {dropped}  | train {ntr}  val {nva}")
-    for s, n in sorted(per_series.items(), key=lambda x: -x[1]):
+    manga = sum(v for k, v in stats.items() if k in
+                ("chainsaw-man", "one-piece", "berserk", "jujutsu-kaisen"))
+    print(f"  manga {manga}  webtoon {kept - manga}")
+    for s, n in sorted(stats.items(), key=lambda x: -x[1]):
         print(f"  {s}: {n}")
 
 
