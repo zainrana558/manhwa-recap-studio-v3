@@ -1221,6 +1221,23 @@ export async function searchWeebCentral(query: string, limit = 10): Promise<Mang
   return out;
 }
 
+/** Series ULID -> human title (the search slug is the ULID, not a readable name). */
+export async function getWeebCentralSeriesTitle(seriesId: string): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/x`,
+      { headers: { "User-Agent": WEEBCENTRAL_UA } },
+      10000
+    );
+    if (!res.ok) return null;
+    const html = await res.text();
+    const m = html.match(/<title>([^<]+?)\s*\|\s*Weeb Central<\/title>/i);
+    return m ? m[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getWeebCentralChapters(seriesId: string): Promise<ScrapedChapter[]> {
   const url = `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/full-chapter-list`;
   const res = await fetchWithTimeout(

@@ -3,6 +3,7 @@ import {
   getSourceFromId,
   getSlugFromId,
   getChaptersForSource,
+  getWeebCentralSeriesTitle,
 } from "@/lib/scrapers";
 
 export const dynamic = "force-dynamic";
@@ -60,6 +61,8 @@ export async function GET(
     // Build a minimal manga object.
     const title = source === "webtoons"
       ? id // Webtoons doesn't have a slug, use the titleNo
+      : source === "weebcentral"
+      ? (await getWeebCentralSeriesTitle(slug)) ?? slug // slug is the ULID
       : slug.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const baseUrls: Record<string, string> = {
