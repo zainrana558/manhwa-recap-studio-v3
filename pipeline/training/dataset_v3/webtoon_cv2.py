@@ -52,6 +52,27 @@ def _row_signals(im):
     return ink, dark, edge, lab, luma, (cx0, cx1)
 
 
+def _looks_like_face_cut(g_gray, y, band=34):
+    """§8.4 cheap face/body safety: would a cut at row y bisect a tall,
+    high-contrast vertical structure (head/torso)?  Ported from the
+    reference webtoon_panel_slicer.py."""
+    h, w = g_gray.shape[:2]
+    strip = g_gray[max(0, y - band):min(h, y + band)]
+    if strip.shape[0] < band:
+        return False
+    dark = strip < 80
+    long_runs = 0
+    cols = range(0, w, 4)
+    for c in cols:
+        cur = mx = 0
+        for v in dark[:, c]:
+            cur = cur + 1 if v else 0
+            mx = max(mx, cur)
+        if mx > band * 0.7:
+            long_runs += 1
+    return long_runs > len(list(cols)) * 0.30
+
+
 def _runs(mask, min_len):
     """Contiguous True runs of length >= min_len -> list of (start, end)."""
     out = []
@@ -166,8 +187,14 @@ def split_webtoon(im, debug=False):
                 break
             if idx < gap or idx > bh - gap:
                 continue
-            if all(abs(idx - q) >= gap for q in picks):
-                picks.append(int(idx))
+            if any(abs(idx - q) < gap for q in picks):
+                continue
+            # §8.4 don't slice a head/torso unless a strong palette/luma
+            # event says this really is a panel boundary
+            if pal[idx] < 0.75 and jump[idx] < 0.8 and \
+               _looks_like_face_cut(g_gray, y1 + idx):
+                continue
+            picks.append(int(idx))
             if len(picks) >= 10:
                 break
         picks.sort()

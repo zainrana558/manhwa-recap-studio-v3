@@ -2,7 +2,8 @@
 """Merge the per-source YOLO label sets into one balanced training dataset.
 
   yolo_kumiko/       Kumiko on 4 bordered-manga series      (CV, excellent)
-  yolo_webtoon_cv/   CV horizontal-gutter split, 12 webtoons (CV, good)
+  yolo_webtoon_cv2/  CV gutter + edge/palette/luma split    (CV, good; v1 fallback)
+  yolo_roboflow/     Roboflow comic/manga panel datasets    (human bbox, capped)
   yolo/              Gemini flash-lite on webtoon pages     (VLM, ~decent)
 
 Priorities: keep every manga page; keep every MULTI-box webtoon page (real
@@ -67,7 +68,9 @@ def main():
     for ip in glob.glob(f"{KUM}/images/*"):
         st = Path(ip).stem
         cands.append((0, st.split("__")[0], ip, f"{KUM}/labels/{st}.txt"))
-    WC = HERE / "yolo_webtoon_cv"
+    WC = HERE / "yolo_webtoon_cv2"
+    if not (WC / "images").is_dir():
+        WC = HERE / "yolo_webtoon_cv"
     sb = []
     for ip in glob.glob(f"{WC}/images/*"):
         st = Path(ip).stem
@@ -79,6 +82,10 @@ def main():
             sb.append((2, st.split("__")[0], ip, lp))
     rng.shuffle(sb)
     cands += sb[:SINGLE_BOX_KEEP]
+    RF = HERE / "yolo_roboflow"          # human-annotated comic/manga panels
+    for ip in glob.glob(f"{RF}/images/*"):
+        st = Path(ip).stem
+        cands.append((1, "rf_" + st.split("_")[0], ip, f"{RF}/labels/{st}.txt"))
     GEM = HERE / "yolo"
     for ip in glob.glob(f"{GEM}/images/*"):
         st = Path(ip).stem
@@ -122,7 +129,7 @@ def main():
     ntr = len(glob.glob(f"{out}/images/train/*"))
     nva = len(glob.glob(f"{out}/images/val/*"))
     print(f"kept {kept}  dropped {dropped}  | train {ntr}  val {nva}")
-    manga = sum(v for k, v in stats.items() if k in
+    manga = sum(v for k, v in stats.items() if k.startswith("rf_") or k in
                 ("chainsaw-man", "one-piece", "berserk", "jujutsu-kaisen"))
     print(f"  manga {manga}  webtoon {kept - manga}")
     for s, n in sorted(stats.items(), key=lambda x: -x[1]):
