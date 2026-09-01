@@ -31,6 +31,7 @@ alert() { echo "$(ts) ALERT $*" | tee -a "$ALERTS" >> "$LOG"; }
 declare -A down_streak
 prev_job_stage=""
 prev_stall_flagged=""
+prev_err_flagged=""
 
 http() { curl -s -m 8 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null; }
 
@@ -63,43 +64,44 @@ while true; do
     (cd "$PROJECT_DIR" && setsid bash watchdog.sh > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &)
   fi
 
-  # newest job from the DB
-  job_line=""
+  # newest job from the DB (+ its latest JobLog line & recency)
+  jid=""; jstatus=""; jstage=""; jprog=""; jmsg=""; last_log_age=""
   if [ -f "$DB" ]; then
-    job_line="$(sqlite3 "$DB" "SELECT id||'|'||status||'|'||COALESCE(mangaTitle,'?') FROM Job ORDER BY createdAt DESC LIMIT 1;" 2>/dev/null)"
+    row="$(sqlite3 -separator '|' "$DB" \
+      "SELECT id,status,COALESCE(stage,'?'),COALESCE(progress,'?'),COALESCE(substr(message,1,70),'') FROM Job ORDER BY createdAt DESC LIMIT 1;" 2>/dev/null)"
+    IFS='|' read -r jid jstatus jstage jprog jmsg <<<"$row"
+    if [ -n "$jid" ]; then
+      # ms-epoch of the most recent JobLog row for this job
+      last_ms="$(sqlite3 "$DB" "SELECT COALESCE(MAX(createdAt),0) FROM JobLog WHERE jobId='$jid';" 2>/dev/null)"
+      now_ms=$(( $(date +%s) * 1000 ))
+      last_log_age=$(( (now_ms - ${last_ms%.*}) / 1000 ))
+    fi
   fi
-  jid="${job_line%%|*}"
-  jrest="${job_line#*|}"; jstatus="${jrest%%|*}"; jtitle="${jrest#*|}"
+
   pstr="no-job"
   if [ -n "$jid" ]; then
-    pj="$PROJECT_DIR/data/jobs/$jid/progress.json"
-    if [ -f "$pj" ]; then
-      read -r stage prog ci tc upd msg < <(python3 - "$pj" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-print(d.get("stage","?"), d.get("progress","?"), d.get("chapter_index","?"),
-      d.get("total_chapters","?"), d.get("updated_at",0), str(d.get("message",""))[:60].replace(" ","_"))
-PY
-)
-      now=$(date +%s)
-      age=$(( now - ${upd%.*} ))
-      pstr="job=$jid $jstatus stage=$stage ${prog}% ch=${ci}/${tc} age=${age}s"
-      # stall detection: only while the job looks active
-      case "$jstatus" in
-        running|processing|active|in_progress|queued)
-          if [ "$age" -gt "$STALL_SECS" ]; then
-            if [ "$prev_stall_flagged" != "$jid:$upd" ]; then
-              alert "job $jid appears STALLED — status=$jstatus stage=$stage progress=${prog}% no update for ${age}s (msg: $msg)"
-              prev_stall_flagged="$jid:$upd"
-            fi
-          fi ;;
-      esac
-      if [ "$stage" != "$prev_job_stage" ] && [ -n "$prev_job_stage" ]; then
-        note "job $jid stage: $prev_job_stage -> $stage (${prog}%, ch ${ci}/${tc})"
+    pstr="job=$jid $jstatus stage=$jstage ${jprog}% logAge=${last_log_age}s"
+    if [ "$jstage" != "$prev_job_stage" ] && [ -n "$prev_job_stage" ]; then
+      note "job $jid stage: $prev_job_stage -> $jstage (${jprog}%) — $jmsg"
+    fi
+    prev_job_stage="$jstage"
+
+    case "$jstatus" in
+      done|complete|completed|error|failed|cancelled) : ;;   # terminal, no stall check
+      *)
+        if [ "${last_log_age:-0}" -gt "$STALL_SECS" ]; then
+          key="$jid:$last_ms"
+          if [ "$prev_stall_flagged" != "$key" ]; then
+            alert "job $jid appears STALLED — status=$jstatus stage=$jstage ${jprog}% — no JobLog update for ${last_log_age}s (last msg: $jmsg)"
+            prev_stall_flagged="$key"
+          fi
+        fi ;;
+    esac
+    if [ "$jstatus" = "error" ] || [ "$jstatus" = "failed" ]; then
+      if [ "$prev_err_flagged" != "$jid" ]; then
+        alert "job $jid FAILED — stage=$jstage msg: $jmsg"
+        prev_err_flagged="$jid"
       fi
-      prev_job_stage="$stage"
-    else
-      pstr="job=$jid $jstatus (no progress.json yet)"
     fi
   fi
 
