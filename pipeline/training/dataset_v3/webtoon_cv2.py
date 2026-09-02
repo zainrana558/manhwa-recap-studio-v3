@@ -110,6 +110,123 @@ def _rolling_std(x, win):
     return np.sqrt(np.maximum(0.0, ss / cnt - (s / cnt) ** 2))
 
 
+_MODELS = (HERE / ".." / ".." / "models").resolve()
+_BUBBLE_ONNX = _MODELS / "comic-text-and-bubble-detector" / "detector-v4-s_int8.onnx"
+_MANGA109_ONNX = _MODELS / "manga109-yolo" / "model.onnx"
+_sess_cache = {}
+
+
+def _get_sess(path):
+    key = str(path)
+    if key not in _sess_cache:
+        try:
+            import onnxruntime as ort
+            _sess_cache[key] = (ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                                if Path(path).exists() else None)
+        except Exception:
+            _sess_cache[key] = None
+    return _sess_cache[key]
+
+
+def _tiles(Hs, band, step):
+    y = 0
+    while y < Hs:
+        yield y, min(Hs, y + band)
+        if y + band >= Hs:
+            break
+        y += step
+
+
+def _protected_rows(im, H, W):
+    """Rows a panel cut must not pass through, from the free detector stack
+    (all run at 640-wide, batched, CPU):
+      bubble  — ogkalu comic-text-and-bubble-detector cls 0,1 (bubble + text)
+      caption — same model cls 2 (text_free / narration box)
+      face    — deepghs manga109_yolo cls 1
+    Returns (bubble_rows, caption_rows, face_rows) as H-length bool arrays.
+    Falls back to a CV bright-blob mask for bubbles if the models are absent.
+    """
+    bub = np.zeros(H, bool)
+    cap = np.zeros(H, bool)
+    fac = np.zeros(H, bool)
+    ds = 640.0 / W
+    ims = cv2.resize(im, (640, max(1, int(round(H * ds)))), interpolation=cv2.INTER_AREA)
+    Hs = ims.shape[0]
+    band, step = 832, 660
+    spans = list(_tiles(Hs, band, step))
+
+    tb = _get_sess(_BUBBLE_ONNX)
+    if tb is not None:
+        for a, b in spans:                       # model is batch-1 only
+            try:
+                x = cv2.resize(cv2.cvtColor(ims[a:b], cv2.COLOR_BGR2RGB), (640, 640)) \
+                    .transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+                lb, bx, sc = tb.run(None, {"images": x,
+                                           "orig_target_sizes": np.array([[b - a, 640]], np.int64)})
+                for l, bo, cf in zip(lb[0], bx[0], sc[0]):
+                    if float(cf) < 0.35 or int(l) not in (0, 1, 2):
+                        continue
+                    r1 = max(0, int((a + bo[1]) / ds) - 2)
+                    r2 = min(H, int((a + bo[3]) / ds) + 2)
+                    if r2 - r1 >= 4:
+                        (cap if int(l) == 2 else bub)[r1:r2] = True
+            except Exception:
+                pass
+    if not bub.any() and tb is None:
+        g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        br = cv2.morphologyEx((g > 236).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        n, _, st, _ = cv2.connectedComponentsWithStats(br, 8)
+        for i in range(1, n):
+            x, y, w, h, ar = st[i]
+            if 0.006 * W * W < ar < 0.42 * W * W and 0.10 * W < w < 0.86 * W \
+               and 22 < h < 0.55 * W and ar / float(w * h) >= 0.42:
+                bub[y:y + h] = True
+
+    tf = _get_sess(_MANGA109_ONNX)
+    if tf is not None:
+        for a, b in spans:                       # model is batch-1 only
+            try:
+                t = cv2.cvtColor(ims[a:b], cv2.COLOR_BGR2RGB)
+                th, tw = t.shape[:2]
+                sc = min(640 / tw, 640 / th)
+                nw, nh = int(tw * sc), int(th * sc)
+                cv_ = np.full((640, 640, 3), 114, np.uint8)
+                cv_[:nh, :nw] = cv2.resize(t, (nw, nh))
+                x = cv_.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+                o = tf.run(None, {"images": x})[0][0].T          # (N, 8)
+                s = o[:, 4:]
+                cl = s.argmax(1)
+                cfv = s.max(1)
+                for i in np.where((cfv > 0.42) & (cl == 1))[0]:
+                    cy, bh = o[i, 1], o[i, 3]
+                    r1 = max(0, int((a + (cy - bh / 2) / sc) / ds) - 2)
+                    r2 = min(H, int((a + (cy + bh / 2) / sc) / ds) + 2)
+                    if r2 - r1 >= 6:
+                        fac[r1:r2] = True
+            except Exception:
+                pass
+    return bub, cap, fac
+
+
+def _snap_off_blob(y, blob, lo, hi, margin=34):
+    """If row y sits inside — or within `margin` px of — a text blob, move
+    the cut to just above that blob so the whole bubble goes with the LOWER
+    panel (bubbles sit at panel tops)."""
+    n = len(blob)
+    w0, w1 = max(0, y - margin), min(n, y + margin + 1)
+    hit = np.where(blob[w0:w1])[0]
+    if hit.size == 0:
+        return y
+    a = w0 + int(hit[0])
+    while a > lo and blob[a - 1]:
+        a -= 1
+    b = w0 + int(hit[-1])
+    while b < hi - 1 and blob[b + 1]:
+        b += 1
+    top = a - 3
+    return top if top > lo else (b + 3 if b + 3 < hi else y)
+
+
 def _tighten(g_gray, a, b, W):
     """Trim blank margins of a [a,b) row span -> [x1,y1,x2,y2] or None.
     A row counts as content only if it has dark marks AND is not a solid
@@ -131,6 +248,10 @@ def split_webtoon(im, debug=False):
     H, W = im.shape[:2]
     g_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     ink, dark, edge, lab, luma, _ = _row_signals(im)
+    # §8.5 protected rows from the free detector stack: a cut must not pass
+    # through a bubble / caption (ogkalu RT-DETR) or a face (manga109 YOLO)
+    bub, cap, face = _protected_rows(im, H, W)
+    blob = bub | face | cap
 
     min_gut = max(24, int(H * 0.020))
 
@@ -149,9 +270,9 @@ def split_webtoon(im, debug=False):
     cuts = [0]
     for a, b in gut_runs:
         if a > 0 and b < H:
-            cuts.append((a + b) // 2)
+            cuts.append(_snap_off_blob((a + b) // 2, blob, 0, H))
     cuts.append(H)
-    cuts = sorted(set(cuts))
+    cuts = sorted(set(c for c in cuts if 0 <= c <= H))
 
     blocks = []
     for a, b in zip(cuts[:-1], cuts[1:]):
@@ -210,6 +331,21 @@ def split_webtoon(im, debug=False):
         quiet_row = (local_ink < np.percentile(local_ink, 40)) & (e_s < 0.55)
         event_row = ((pal > 0.6) | ((jump > 0.65) & (e_s < 0.45)))
         score = np.where(quiet_row | event_row | void_row | (after_evt > 0), score, 0.0)
+        # a narration / caption box introduces the beat *below* it — put the
+        # boundary at its TOP edge so the caption travels with that beat
+        for c0, c1 in _runs(cap[y1:y2], 12):
+            t = max(0, c0 - 6)
+            score[max(0, t - 5):t + 5] = np.maximum(score[max(0, t - 5):t + 5], 0.86)
+        # §8.5: a cut may not land inside — or right at the edge of — a
+        # speech bubble / SFX blob / caption box
+        bl = blob[y1:y2].astype(np.float32)
+        bl = np.convolve(bl, np.ones(41) / 41, "same") > 0.02
+        score[bl] = 0.0
+        # but DO allow the just-above-caption row we just boosted
+        for c0, c1 in _runs(cap[y1:y2], 12):
+            t = max(0, c0 - 6)
+            if not blob[y1 + max(0, t - 8)]:
+                score[max(0, t - 4):t + 2] = 0.86
 
         # 8.5 caption veto: never cut *through* a tall bright box (narration)
         # floating on darker art. Small margin only, so gutters that merely
@@ -237,7 +373,14 @@ def split_webtoon(im, debug=False):
             picks.append(int(idx))
             if len(picks) >= 10:
                 break
-        picks.sort()
+        # §8.5: lift any cut that sits inside/near a bubble to above it,
+        # so the whole bubble stays with the panel below where it belongs
+        lifted = []
+        for idx in picks:
+            gi = _snap_off_blob(y1 + idx, blob, y1, y2) - y1
+            if gap <= gi <= bh - gap and all(abs(gi - q) >= gap for q in lifted):
+                lifted.append(gi)
+        picks = sorted(set(lifted))
         segs = list(zip([0] + picks, picks + [bh]))
         for sa, sb in segs:
             sub = _tighten(g_gray, y1 + sa, y1 + sb, W)
@@ -258,6 +401,21 @@ def split_webtoon(im, debug=False):
             merged.append(s)
     out = [s for s in merged
            if (s[3] - s[1]) >= max(24, int(H * 0.018)) and (s[2] - s[0]) >= 0.30 * W]
+
+    # §8.5 final pass: no shared boundary between two panels may bisect a
+    # bubble — pull it to the bubble's top edge (bubble -> lower panel)
+    for k in range(len(out) - 1):
+        up, dn = out[k], out[k + 1]
+        lo_b, hi_b = up[3], dn[1]
+        span = blob[min(lo_b, hi_b):max(lo_b, hi_b) + 1]
+        mid = (lo_b + hi_b) // 2
+        if (0 <= mid < H and blob[mid]) or span.any():
+            top = _snap_off_blob(mid if blob[mid] else int(np.where(span)[0][0]) + min(lo_b, hi_b),
+                                 blob, up[1] + 8, dn[3] - 8)
+            if up[1] + 8 < top < dn[3] - 8:
+                up[3] = max(up[1] + 8, min(up[3], top))
+                dn[1] = min(dn[3] - 8, top)
+
     if not out and blocks:
         y = [min(s[1] for s in blocks), max(s[3] for s in blocks)]
         x = [min(s[0] for s in blocks), max(s[2] for s in blocks)]
