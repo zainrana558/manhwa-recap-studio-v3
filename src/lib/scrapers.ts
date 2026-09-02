@@ -1249,16 +1249,25 @@ export async function getWeebCentralChapters(seriesId: string): Promise<ScrapedC
   const html = (await res.text()).replace(/\s+/g, " ");
   const out: ScrapedChapter[] = [];
   const seen = new Set<string>();
+  // Row label lives in `<span class="">…</span>`. It is NOT always "Chapter N":
+  // long webtoons use season prefixes ("S4 - Episode 178", "S3 - Chapter 235").
+  // Grab the label, then pull the trailing number; fall back to list position.
   const re =
-    /href="(?:https:\/\/weebcentral\.com)?\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span[^>]*>\s*(?:Chapter|Episode)\s+([\d.]+)/g;
+    /\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span class="">\s*([^<]+?)\s*<\/span>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     if (seen.has(m[1])) continue;
     seen.add(m[1]);
-    out.push({ id: m[1], chapterNum: m[2], title: null, language: "en" });
+    const label = m[2];
+    const numM =
+      label.match(/(?:Chapter|Episode)\s+([\d.]+)/i) || label.match(/([\d.]+)\s*$/);
+    out.push({ id: m[1], chapterNum: numM ? numM[1] : null, title: label, language: "en" });
   }
   if (out.length === 0) throw new Error(`WeebCentral returned no chapters for ${seriesId}`);
   out.reverse(); // full-chapter-list is newest-first
+  out.forEach((c, i) => {
+    if (!c.chapterNum) c.chapterNum = String(i + 1);
+  });
   return out;
 }
 

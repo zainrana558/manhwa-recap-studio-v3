@@ -1392,17 +1392,20 @@ export async function fetchWeebCentralChapters(
     external: boolean
   }> = []
   const seen = new Set<string>()
-  // each row: href="/chapters/{ULID}" … <span class="">Chapter 200</span>
-  const re =
-    /href="(?:https:\/\/weebcentral\.com)?\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span[^>]*>\s*(?:Chapter|Episode)\s+([\d.]+)/g
+  // Row label is `<span class="">…</span>` — NOT always "Chapter N": long
+  // webtoons use season prefixes ("S4 - Episode 178", "S3 - Chapter 235").
+  // Grab the label, pull its trailing number, fall back to list position.
+  const re = /\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span class="">\s*([^<]+?)\s*<\/span>/g
   let m: RegExpExecArray | null
   while ((m = re.exec(html))) {
     if (seen.has(m[1])) continue
     seen.add(m[1])
+    const label = m[2]
+    const numM = label.match(/(?:Chapter|Episode)\s+([\d.]+)/i) || label.match(/([\d.]+)\s*$/)
     out.push({
       mangadexId: m[1],
-      chapterNum: m[2],
-      title: null,
+      chapterNum: numM ? numM[1] : null,
+      title: label,
       language: 'en',
       pageCount: 0,
       external: false,
@@ -1410,6 +1413,9 @@ export async function fetchWeebCentralChapters(
   }
   // full-chapter-list is newest-first — flip to ascending
   out.reverse()
+  out.forEach((c, i) => {
+    if (!c.chapterNum) c.chapterNum = String(i + 1)
+  })
   return chapterLimit > 0 ? out.slice(0, chapterLimit) : out
 }
 
