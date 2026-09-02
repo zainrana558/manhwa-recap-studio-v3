@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""webtoon_cv v2 — the PDF methodology (Section 8) turned into code.
+"""webtoon_cv v2 — the PDF methodology (Section 8) + v6.1 slicer, as code.
 
 Adds to webtoon_cv.py's pure white-gutter split:
   8.1  horizontal edge-density map  -> gutters read as low-edge-energy bands
@@ -10,6 +10,12 @@ Adds to webtoon_cv.py's pure white-gutter split:
        that is still much taller than its siblings
   8.9  every cut carries a confidence; low-confidence internal cuts are
        dropped and the block is left whole rather than mis-split
+
+From webtoon_panel_slicer.py v6.1 (kept v2's text-region handling):
+  L1   black-void gutter  -> action manhwa uses solid black dividers
+       (luma~0), which the white-only + dark<0.35 masks never fired on
+  L2   event-zone end     -> an SFX / impact splash *terminates* a beat;
+       cut just after a rolling-std spike, not in the middle of it
 
 Drop-in: same split_webtoon(im) -> [[x1,y1,x2,y2], ...] contract as
 webtoon_cv.py, so main()/assemble.py are unchanged.
@@ -90,10 +96,28 @@ def _runs(mask, min_len):
     return out
 
 
+def _rolling_std(x, win):
+    """Vectorised trailing rolling std (v6.1 used an O(n*win) loop)."""
+    x = x.astype(np.float64)
+    n = len(x)
+    c1 = np.concatenate([[0.0], np.cumsum(x)])
+    c2 = np.concatenate([[0.0], np.cumsum(x * x)])
+    lo = np.maximum(0, np.arange(n) - win + 1)
+    hi = np.arange(n) + 1
+    cnt = (hi - lo).astype(np.float64)
+    s = c1[hi] - c1[lo]
+    ss = c2[hi] - c2[lo]
+    return np.sqrt(np.maximum(0.0, ss / cnt - (s / cnt) ** 2))
+
+
 def _tighten(g_gray, a, b, W):
-    """Trim blank margins of a [a,b) row span -> [x1,y1,x2,y2] or None."""
+    """Trim blank margins of a [a,b) row span -> [x1,y1,x2,y2] or None.
+    A row counts as content only if it has dark marks AND is not a solid
+    black void (so a cut at a black manhwa divider doesn't bleed black)."""
     s = g_gray[a:b]
-    rows = np.where((s < 245).mean(axis=1) > 0.010)[0]
+    has_ink = (s < 245).mean(axis=1) > 0.010
+    not_void = (s > 32).mean(axis=1) > 0.02
+    rows = np.where(has_ink & not_void)[0]
     if rows.size < 3:
         return None
     y1, y2 = a + int(rows[0]), a + int(rows[-1]) + 1
@@ -110,10 +134,14 @@ def split_webtoon(im, debug=False):
 
     min_gut = max(24, int(H * 0.020))
 
-    # ---- 8.1: a gutter row is low-ink AND low-edge-energy -----------------
+    # ---- 8.1 + L1: a gutter row is low-edge-energy AND (near-white OR
+    #                near-black) -------------------------------------------
     #   pure-white gutters: ink < .010
     #   tinted/grey gutters: ink can be higher but edge energy stays tiny
-    quiet = ((ink < 0.010) & (dark < 0.5)) | ((ink < 0.055) & (edge < 0.045) & (dark < 0.35))
+    #   L1 black-void gutters: manhwa solid-black dividers (luma ~ 0)
+    white_q = ((ink < 0.010) & (dark < 0.5)) | ((ink < 0.055) & (edge < 0.045) & (dark < 0.35))
+    void_q = (luma < 28) & (edge < 0.055)
+    quiet = white_q | void_q
     # close 1-2px speckle so a bubble tail crossing the gutter doesn't break it
     quiet = np.convolve(quiet.astype(np.float32), np.ones(3) / 3, "same") > 0.5
 
@@ -161,15 +189,27 @@ def split_webtoon(im, debug=False):
         pal = pal / (np.percentile(pal, 97) + 1e-6)
         jump = jump / (np.percentile(jump, 97) + 1e-6)
         e_s = np.convolve(e, np.ones(win) / win, "same")
-        score = (np.clip(1.0 - e_s, 0, 1) * 0.42
-                 + np.clip(pal, 0, 1) * 0.33
-                 + np.clip(jump, 0, 1) * 0.25)
-        # a cut may land on a quiet row OR on a sharp scene transition, but
-        # never mid-way through busy line-art with no palette/brightness event
+        # L2: rows just after a rolling-std spike (SFX / impact splash ends
+        # a beat) — the cut belongs *after* the zone, not inside it
+        rs = _rolling_std(lum, 40)
+        rs_hi = rs > np.percentile(rs, 88)
+        after_evt = np.zeros(bh, np.float32)
+        for z0, z1 in _runs(rs_hi, 24):
+            if (z1 - z0) < bh * 0.6:
+                after_evt[z1:min(bh, z1 + 22)] = 1.0
+        score = (np.clip(1.0 - e_s, 0, 1) * 0.36
+                 + np.clip(pal, 0, 1) * 0.27
+                 + np.clip(jump, 0, 1) * 0.19
+                 + after_evt * 0.30)
+        # a cut may land on a quiet row, a sharp scene transition, a black
+        # void, or an event-zone end — but never mid-way through busy
+        # line-art with no such signal
         local_ink = ink[y1:y2]
+        void_row = (lum < 28) & (e_s < 0.16)
+        score = np.where(void_row, np.maximum(score, 0.92), score)
         quiet_row = (local_ink < np.percentile(local_ink, 40)) & (e_s < 0.55)
         event_row = ((pal > 0.6) | ((jump > 0.65) & (e_s < 0.45)))
-        score = np.where(quiet_row | event_row, score, 0.0)
+        score = np.where(quiet_row | event_row | void_row | (after_evt > 0), score, 0.0)
 
         # 8.5 caption veto: never cut *through* a tall bright box (narration)
         # floating on darker art. Small margin only, so gutters that merely
