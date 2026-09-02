@@ -17,7 +17,10 @@ def _pipq(*a):
 
 _pipq("torch==2.4.1", "torchvision==0.19.1",
       "--index-url", "https://download.pytorch.org/whl/cu121")
-_pipq("--no-deps", "ultralytics", "ultralytics-thop", "py-cpuinfo")
+# pin: an ultralytics newer than this ships the Muon optimizer, whose
+# muon_update() does u.view(len(u), -1) and crashes on P100/AMP
+# non-contiguous grads. 8.4.137 trained v3.1 cleanly.
+_pipq("--no-deps", "ultralytics==8.4.137", "ultralytics-thop", "py-cpuinfo")
 for _m in ("onnx", "onnxslim"):
     try:
         __import__(_m)
@@ -127,7 +130,7 @@ try:
     m = YOLO(base)
     m.train(data="/kaggle/working/data.yaml", epochs=ep, imgsz=1024,
             batch=(16 if DEV == 0 else 6), device=DEV, workers=4,
-            patience=35, close_mosaic=15,
+            optimizer="AdamW", patience=35, close_mosaic=15,
             fliplr=0.0, flipud=0.0, degrees=0.0, shear=0.0, perspective=0.0,
             mosaic=0.5, hsv_h=0.0, hsv_s=0.3, hsv_v=0.35, translate=0.06, scale=0.35,
             project="/kaggle/working/runs", name="v3", exist_ok=True)
