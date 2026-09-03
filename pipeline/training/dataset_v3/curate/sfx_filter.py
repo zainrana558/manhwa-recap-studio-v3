@@ -17,7 +17,7 @@ import numpy as np
 import onnxruntime as ort
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ONNX = os.path.join(HERE, "..", "..", "models", "koharu-layout", "rfdetr-seg-2xlarge.onnx")
+ONNX = os.path.join(HERE, "..", "..", "..", "models", "koharu-layout", "rfdetr-seg-2xlarge.onnx")
 SFX_COV = 0.45
 SESS = ort.InferenceSession(ONNX, providers=["CPUExecutionProvider"]) if os.path.exists(ONNX) else None
 

@@ -1,17 +1,14 @@
 {
-  "id": "zainrana1122/panel-train-v34",
-  "title": "panel-train-v34",
-  "code_file": "train_v34.py",
+  "id": "zainrana1122/panel-train-v34-rfdetr",
+  "title": "panel-train-v34-rfdetr",
+  "code_file": "train_rfdetr.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": [
-    "zainrana1122/webtoon-yolo",
-    "btlam0507/manga109"
-  ],
+  "dataset_sources": ["zainrana1122/webtoon-yolo", "btlam0507/manga109"],
   "competition_sources": [],
   "kernel_sources": []
 }

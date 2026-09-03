@@ -71,9 +71,54 @@ for sp in ("train", "val"):
         open(f"{ROOT}/labels/{sp}/{stem}.txt", "w").write("\n".join(lines))
         N += 1
 
+# --- Manga109: 109 volumes, ~10k human-labelled pages, <frame> boxes -> rect(0)
+import xml.etree.ElementTree as ET  # noqa: E402
+
+m109 = _find("Manga109") or _find("manga109")
+mg_added = 0
+if m109:
+    andir = next((p for p in glob.glob(m109 + "/**/annotations", recursive=True)
+                  if os.path.isdir(p)), None)
+    imroot = next((p for p in glob.glob(m109 + "/**/images", recursive=True)
+                   if os.path.isdir(p)), None)
+    if andir and imroot:
+        import random as _r
+        _r.seed(2)
+        for xf in glob.glob(andir + "/*.xml"):
+            title = os.path.splitext(os.path.basename(xf))[0]
+            try:
+                root = ET.parse(xf).getroot()
+            except Exception:
+                continue
+            for pg in root.iter("page"):
+                idx = pg.get("index")
+                W = float(pg.get("width", 0))
+                H = float(pg.get("height", 0))
+                if not (W and H):
+                    continue
+                fr = [f for f in pg.iter("frame")]
+                if not fr:
+                    continue
+                ip = f"{imroot}/{title}/{int(idx):03d}.jpg"
+                if not os.path.exists(ip):
+                    continue
+                sp = "val" if _r.random() < 0.05 else "train"
+                nm = f"m109_{title}_{int(idx):03d}"
+                shutil.copy(ip, f"{ROOT}/images/{sp}/{nm}.jpg")
+                with open(f"{ROOT}/labels/{sp}/{nm}.txt", "w") as fo:
+                    for f in fr:
+                        x1, y1 = float(f.get("xmin")), float(f.get("ymin"))
+                        x2, y2 = float(f.get("xmax")), float(f.get("ymax"))
+                        if x2 - x1 < 8 or y2 - y1 < 8:
+                            continue
+                        fo.write(f"0 {(x1+x2)/2/W:.6f} {(y1+y2)/2/H:.6f} "
+                                 f"{(x2-x1)/W:.6f} {(y2-y1)/H:.6f}\n")
+                mg_added += 1
+print(f"Manga109 pages added: {mg_added}", flush=True)
+
 nt = len(glob.glob(f"{ROOT}/images/train/*"))
 nv = len(glob.glob(f"{ROOT}/images/val/*"))
-print(f"MERGED {N} | train {nt} | val {nv}", flush=True)
+print(f"MERGED {N}+m109 | train {nt} | val {nv}", flush=True)
 assert nt > 800 and nv > 80
 
 yaml.safe_dump({"path": ROOT, "train": "images/train", "val": "images/val",

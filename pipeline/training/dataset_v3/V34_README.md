@@ -52,3 +52,32 @@ for w in 0 1 2; do WCV2_NO_FACE=1 python sfx_filter.py ../yolo_final3 ../yolo_fi
 - koharu classes: `0 text · 1 onomatopoeia · 2 bubble · 3 panel`. Decode = sigmoid(labels), bbox from `mask > 0`.
 - Held-out val series: `tbate` + 20% of the Roboflow webtoon pages.
 - v3.3 (`panel-train-v33`, yolo11s, 2-class panel+bubble) is the current baseline — compare v3.4 against it and prod before installing.
+
+---
+## v3.4 — updated after the worldwide search (2026-09-03)
+
+**MangaSeg dataset** (700k masks, CVPR 2025) is **gated** on HF — request access at
+`huggingface.co/datasets/MS92/MangaSegmentation` (auto-approves for research).
+Until then we use **Manga109 directly** (`btlam0507/manga109`, has the original
+`<frame>` box XMLs — ~10k human-labelled manga pages) — folded into BOTH kernels.
+
+**koharu onomatopoeia** was tested for SFX-panel cleanup — it is Manga109-trained
+so it recognises Japanese katakana SFX but **not Korean/English webtoon SFX**
+(1/4 hit rate on our pages). `sfx_filter.py` kept for the manga tier only; not
+run on webtoon labels.
+
+### Two kernels now, both push-ready:
+| kernel | arch | why |
+|---|---|---|
+| `kaggle/train_v34/` | **YOLO11m**, 3-class + Manga109 | safe known-good baseline |
+| `kaggle/train_v34_rfdetr/` | **RF-DETR-base** (DINOv2 ViT), 3-class + Manga109, COCO auto-convert | DETR queries + no-NMS beat YOLO on crowded/tall pages (CoMix); the Chinese community moved to RF-DETR for tall vertical text |
+
+RF-DETR-seg (polygon masks for diagonal/outbound panels) still needs polygon
+labels → blocked on MangaSeg access. Kept as v3.5.
+
+### Launch (after v3.3 frees the GPU)
+```bash
+cd pipeline/training/dataset_v3/_train_ds && kaggle datasets version -p . -m 'v3.4' --dir-mode zip --delete-old-versions
+cd ../kaggle/train_v34        && kaggle kernels push -p .    # YOLO
+cd ../train_v34_rfdetr        && kaggle kernels push -p .    # RF-DETR (run after / on 2nd GPU quota)
+```
