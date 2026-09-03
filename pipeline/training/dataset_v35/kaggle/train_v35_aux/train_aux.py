@@ -53,25 +53,38 @@ def find(*frags):
 
 
 def _get_ds():
-    """webtoon-yolo / webtoon-panels-v35 as a Kaggle dataset if present, else
-    wget the tar straight from the box (Kaggle dataset versioning kept hanging)."""
+    """webtoon dataset from a Kaggle mount if present, else fetch the tar from
+    the box (Kaggle dataset ops kept hanging server-side)."""
     import glob, os, subprocess, tarfile
-    ex = "/kaggle/tmp/ds35"
+    for base in ("/kaggle/tmp", "/kaggle/working"):
+        try:
+            os.makedirs(base, exist_ok=True)
+            ex, src = base + "/ds35", base + "/webtoon_v35.tar"
+            break
+        except Exception:
+            continue
     if os.path.isdir(ex + "/images"):
         return ex
     d = find("webtoon-yolo") or find("webtoon-panels-v35")
     if d and os.path.isdir(d + "/images"):
         return d
     tar = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True) if d else []
-    src = tar[0] if tar else None
-    if not src:
-        src = "/kaggle/tmp/webtoon_v35.tar"
-        if not os.path.exists(src):
-            subprocess.run(["wget", "-q", "--tries=4", "--timeout=60", "-O", src,
-                            "http://80.225.248.230/slicer/dl/webtoon_v35.tar"], check=True)
+    if tar:
+        src = tar[0]
+    elif not os.path.exists(src):
+        url = "http://80.225.248.230/slicer/dl/webtoon_v35.tar"
+        r = subprocess.run(["curl", "-fL", "--retry", "5", "--retry-delay", "5",
+                            "--connect-timeout", "30", "--max-time", "1800", "-o", src, url])
+        if r.returncode != 0 or not os.path.exists(src) or os.path.getsize(src) < 1e8:
+            raise SystemExit(f"dataset fetch failed rc={r.returncode}")
     os.makedirs(ex, exist_ok=True)
     with tarfile.open(src) as t:
         t.extractall(ex)
+    try:
+        os.remove(src)
+    except Exception:
+        pass
+    print("dataset ->", ex, flush=True)
     return ex
 
 
