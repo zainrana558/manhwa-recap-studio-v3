@@ -123,3 +123,9 @@ pipeline/training/dataset_v3/qwen_out/
 /master_merged.mp4
 /Caddyfile.prod
 mini-services/pipeline-service/data/
+pipeline/training/dataset_v3/yolo_gdrive/
+pipeline/training/dataset_v3/yolo_webtoon_cascade/
+pipeline/training/dataset_v3/yolo_webtoon_cascade_qc/
+pipeline/training/dataset_v3/yolo_curated/
+pipeline/training/dataset_v3/manga109-yolo/
+pipeline/training/dataset_v3/anime-face/

@@ -182,7 +182,7 @@ def _protected_rows(im, H, W):
                and 22 < h < 0.55 * W and ar / float(w * h) >= 0.42:
                 bub[y:y + h] = True
 
-    tf = _get_sess(_MANGA109_ONNX)
+    tf = None if os.environ.get("WCV2_NO_FACE") else _get_sess(_MANGA109_ONNX)
     if tf is not None:
         for a, b in spans:                       # model is batch-1 only
             try:
