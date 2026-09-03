@@ -130,3 +130,5 @@ pipeline/training/dataset_v35/label_set/
 pipeline/training/dataset_v35/slicer/output/
 pipeline/training/dataset_v35/slicer/cuts/
 pipeline/training/dataset_v35/strips/
+pipeline/training/dataset_v35/_serve/
+pipeline/training/dataset_v35/_v35_tar/

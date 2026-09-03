@@ -31,22 +31,30 @@ def find(*frags):
     return None
 
 
-def _untar_ds(d):
-    import glob, os, tarfile
-    if not d:
-        return d
-    t = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True)
-    if not t:
-        return d
+def _get_ds():
+    """webtoon-yolo / webtoon-panels-v35 as a Kaggle dataset if present, else
+    wget the tar straight from the box (Kaggle dataset versioning kept hanging)."""
+    import glob, os, subprocess, tarfile
     ex = "/kaggle/tmp/ds35"
-    if not os.path.isdir(ex + "/images"):
-        os.makedirs(ex, exist_ok=True)
-        with tarfile.open(t[0]) as tf:
-            tf.extractall(ex)
+    if os.path.isdir(ex + "/images"):
+        return ex
+    d = find("webtoon-yolo") or find("webtoon-panels-v35")
+    if d and os.path.isdir(d + "/images"):
+        return d
+    tar = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True) if d else []
+    src = tar[0] if tar else None
+    if not src:
+        src = "/kaggle/tmp/webtoon_v35.tar"
+        if not os.path.exists(src):
+            subprocess.run(["wget", "-q", "--tries=4", "--timeout=60", "-O", src,
+                            "http://80.225.248.230/slicer/dl/webtoon_v35.tar"], check=True)
+    os.makedirs(ex, exist_ok=True)
+    with tarfile.open(src) as t:
+        t.extractall(ex)
     return ex
 
 
-DS = _untar_ds(find("webtoon-yolo") or find("webtoon-panels-v35"))
+DS = _get_ds()
 print("dataset:", DS, flush=True)
 for sp in ("train", "val"):
     os.makedirs(f"{ROOT}/images/{sp}", exist_ok=True)

@@ -268,6 +268,23 @@ class H(BaseHTTPRequestHandler):
         try:
             if p in ("", "index.html"):
                 return self._send(200, HTML, "text/html; charset=utf-8")
+            if p.startswith("dl/"):                       # static file drop (kernel wget fallback)
+                fp = os.path.abspath(os.path.join(HERE, "..", "_serve", os.path.basename(p)))
+                if not (fp.startswith(os.path.abspath(os.path.join(HERE, "..", "_serve"))) and os.path.isfile(fp)):
+                    return self._send(404, "no")
+                sz = os.path.getsize(fp)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(sz))
+                self.end_headers()
+                if self.command != "HEAD":
+                    with open(fp, "rb") as f:
+                        while True:
+                            b = f.read(1 << 20)
+                            if not b:
+                                break
+                            self.wfile.write(b)
+                return
             if p == "api/chapters":
                 out = []
                 for c in chapters():

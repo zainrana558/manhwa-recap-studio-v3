@@ -8,7 +8,7 @@
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": ["zainrana1122/webtoon-yolo", "btlam0507/manga109", "zainrana1122/panel-detector-onnx"],
+  "dataset_sources": ["btlam0507/manga109", "zainrana1122/panel-detector-onnx"],
   "competition_sources": [],
   "kernel_sources": []
 }
