@@ -26,9 +26,11 @@ def sh(*a):
 
 sh("opencv-python-headless")
 import cv2                                   # noqa: E402
+# Kaggle's stock onnxruntime-gpu wants CUDA 13 / cuDNN 9 (P100 image is CUDA 12);
+# 1.19.2 is the last build that runs on CUDA 12. Falls back to CPU otherwise.
 ort = None
 ORT_GPU = False
-for attempt in (("onnxruntime-gpu",), ("onnxruntime",)):
+for attempt in (("onnxruntime-gpu==1.19.2",), ("onnxruntime",)):
     try:
         sh(*attempt)
         import onnxruntime as ort             # noqa: F811
@@ -156,7 +158,7 @@ cls_hist = {k: 0 for k in PANEL}
 aux_hist = {k: 0 for k in AUX}
 
 # ============ 1. copy the local src tiers ============
-SRC = find("webtoon-panels-v35-src") or find("webtoon-panels-v35")
+SRC = find("webtoon-yolo") or find("webtoon-panels-v35-src") or find("webtoon-panels-v35")
 print("src:", SRC, flush=True)
 for sp in ("train", "val"):
     for ip in glob.glob(f"{SRC}/images/{sp}/*"):

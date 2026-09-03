@@ -9,7 +9,7 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "zainrana1122/webtoon-panels-v35-src",
+    "zainrana1122/webtoon-yolo",
     "btlam0507/manga109",
     "zainrana1122/panel-detector-onnx"
   ],

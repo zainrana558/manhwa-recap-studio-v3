@@ -1,7 +1,7 @@
 # v3.5 alt arch: RF-DETR (DINOv2 ViT backbone), 5-class panels.
 # DETR queries + no-NMS beat YOLO on tall/crowded pages (CoMix benchmark).
 # Same webtoon-panels-v35 dataset; YOLO 7-class -> 5-class -> COCO on the fly.
-import glob, json, os, subprocess, sys
+import glob, json, os, random, subprocess, sys, xml.etree.ElementTree as ET
 from PIL import Image
 
 
@@ -38,7 +38,8 @@ def coco_split(src_sp, out_sp):
     os.makedirs(d, exist_ok=True)
     images, anns = [], []
     aid = 1
-    for iid, ip in enumerate(sorted(glob.glob(f"{DS}/images/{src_sp}/*")), 1):
+    iid = 0
+    for ip in sorted(glob.glob(f"{DS}/images/{src_sp}/*")):
         st = os.path.splitext(os.path.basename(ip))[0]
         lp = f"{DS}/labels/{src_sp}/{st}.txt"
         if not os.path.exists(lp):
@@ -47,6 +48,7 @@ def coco_split(src_sp, out_sp):
             im = Image.open(ip).convert("RGB")
         except Exception:
             continue
+        iid += 1
         W, H = im.size
         fn = f"{iid:07d}.jpg"
         im.save(f"{d}/{fn}", quality=88)
@@ -61,6 +63,47 @@ def coco_split(src_sp, out_sp):
                          "bbox": [(cx - bw / 2) * W, (cy - bh / 2) * H, bw * W, bh * H],
                          "area": bw * W * bh * H, "iscrowd": 0})
             aid += 1
+    # Manga109 <frame> -> rectangle / square, appended to the same COCO split
+    if out_sp == "train":
+        m109 = next((p for p in glob.glob(f"{IN}/**", recursive=True)
+                     if os.path.isdir(p) and "manga109" in p.lower()), None)
+        andir = next((p for p in glob.glob(f"{m109}/**/annotations", recursive=True)
+                      if os.path.isdir(p)), None) if m109 else None
+        imroot = next((p for p in glob.glob(f"{m109}/**/images", recursive=True)
+                       if os.path.isdir(p)), None) if m109 else None
+        pages = []
+        for xf in sorted(glob.glob(f"{andir}/*.xml")) if andir else []:
+            base = os.path.splitext(os.path.basename(xf))[0]
+            try:
+                root = ET.parse(xf).getroot()
+            except Exception:
+                continue
+            for pg in root.iter("page"):
+                W2, H2 = float(pg.get("width", 0)), float(pg.get("height", 0))
+                ip2 = f"{imroot}/{base}/{int(pg.get('index')):03d}.jpg"
+                fr = list(pg.iter("frame"))
+                if W2 and H2 and fr and os.path.exists(ip2):
+                    pages.append((ip2, W2, H2, fr))
+        random.seed(5)
+        random.shuffle(pages)
+        for ip2, W2, H2, fr in pages[:3000]:
+            iid += 1
+            try:
+                Image.open(ip2).convert("RGB").save(f"{d}/{iid:07d}.jpg", quality=85)
+            except Exception:
+                continue
+            images.append({"id": iid, "file_name": f"{iid:07d}.jpg", "width": int(W2), "height": int(H2)})
+            for f in fr:
+                x1, y1 = float(f.get("xmin")), float(f.get("ymin"))
+                x2, y2 = float(f.get("xmax")), float(f.get("ymax"))
+                fw, fh = (x2 - x1) / W2, (y2 - y1) / H2
+                if fw < 0.02 or fh < 0.02:
+                    continue
+                ar = fw / max(1e-6, fh)
+                c = 1 if (0.80 <= ar <= 1.25 and fw * fh < 0.22) else 0
+                anns.append({"id": aid, "image_id": iid, "category_id": c + 1,
+                             "bbox": [x1, y1, x2 - x1, y2 - y1], "area": (x2 - x1) * (y2 - y1), "iscrowd": 0})
+                aid += 1
     json.dump({"images": images, "annotations": anns, "categories": CATS},
               open(f"{d}/_annotations.coco.json", "w"))
     print(f"{out_sp}: {len(images)} imgs / {len(anns)} anns", flush=True)
