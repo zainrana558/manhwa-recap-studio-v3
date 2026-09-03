@@ -137,3 +137,8 @@ pipeline/training/dataset_v3/yolo_final3/
 pipeline/training/dataset_v3/yolo_final4/
 pipeline/training/dataset_v3/yolo_curated_FINAL/
 pipeline/training/dataset_v3/yolo_curated2/
+pipeline/training/dataset_v3/roboflow_webtoon/
+pipeline/training/dataset_v3/_v34_trainset/
+pipeline/training/dataset_v3/yolo_magi/
+pipeline/training/dataset_v3/yolo_final3_sfx/
+pipeline/models/koharu-layout/
