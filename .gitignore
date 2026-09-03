@@ -129,3 +129,6 @@ pipeline/training/dataset_v3/yolo_webtoon_cascade_qc/
 pipeline/training/dataset_v3/yolo_curated/
 pipeline/training/dataset_v3/manga109-yolo/
 pipeline/training/dataset_v3/anime-face/
+pipeline/training/dataset_v3/yolo_curated2/
+pipeline/training/dataset_v3/yolo_curated_final/
+pipeline/training/dataset_v3/yolo_final/
