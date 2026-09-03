@@ -126,3 +126,7 @@ upload/
 yarn-debug.log*
 yarn-error.log*
 yolov8n.pt
+pipeline/training/dataset_v35/label_set/
+pipeline/training/dataset_v35/slicer/output/
+pipeline/training/dataset_v35/slicer/cuts/
+pipeline/training/dataset_v35/strips/
