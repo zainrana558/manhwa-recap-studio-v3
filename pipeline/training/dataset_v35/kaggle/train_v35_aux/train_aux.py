@@ -52,7 +52,22 @@ def find(*frags):
     return None
 
 
-DS = find("webtoon-yolo") or find("webtoon-panels-v35")
+def _untar_ds(d):
+    import glob, os, tarfile
+    if not d:
+        return d
+    t = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True)
+    if not t:
+        return d
+    ex = "/kaggle/tmp/ds35"
+    if not os.path.isdir(ex + "/images"):
+        os.makedirs(ex, exist_ok=True)
+        with tarfile.open(t[0]) as tf:
+            tf.extractall(ex)
+    return ex
+
+
+DS = _untar_ds(find("webtoon-yolo") or find("webtoon-panels-v35"))
 ONNX = find("panel-detector-onnx")
 M109 = find("manga109") or find("Manga109")
 print("dataset:", DS, "onnx:", ONNX, "m109:", M109, flush=True)

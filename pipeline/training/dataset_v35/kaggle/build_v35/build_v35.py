@@ -59,6 +59,21 @@ def find(*frags, isdir=True):
     return None
 
 
+def _untar_ds(d):
+    import glob, os, tarfile
+    if not d:
+        return d
+    t = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True)
+    if not t:
+        return d
+    ex = "/kaggle/tmp/ds35"
+    if not os.path.isdir(ex + "/images"):
+        os.makedirs(ex, exist_ok=True)
+        with tarfile.open(t[0]) as tf:
+            tf.extractall(ex)
+    return ex
+
+
 # ---------- shape geometry (compact classify_shape) ----------
 def _hull(p):
     pts = sorted(range(len(p)), key=lambda i: (float(p[i][0]), float(p[i][1])))
@@ -158,7 +173,7 @@ cls_hist = {k: 0 for k in PANEL}
 aux_hist = {k: 0 for k in AUX}
 
 # ============ 1. copy the local src tiers ============
-SRC = find("webtoon-yolo") or find("webtoon-panels-v35-src") or find("webtoon-panels-v35")
+SRC = _untar_ds(find("webtoon-yolo") or find("webtoon-panels-v35-src") or find("webtoon-panels-v35"))
 print("src:", SRC, flush=True)
 for sp in ("train", "val"):
     for ip in glob.glob(f"{SRC}/images/{sp}/*"):

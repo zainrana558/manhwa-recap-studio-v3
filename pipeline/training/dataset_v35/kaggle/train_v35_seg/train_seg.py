@@ -41,7 +41,22 @@ def find(*frags):
     return None
 
 
-DS = find("webtoon-yolo") or find("webtoon-panels-v35")
+def _untar_ds(d):
+    import glob, os, tarfile
+    if not d:
+        return d
+    t = glob.glob(f"{d}/**/webtoon_v35.tar", recursive=True)
+    if not t:
+        return d
+    ex = "/kaggle/tmp/ds35"
+    if not os.path.isdir(ex + "/images"):
+        os.makedirs(ex, exist_ok=True)
+        with tarfile.open(t[0]) as tf:
+            tf.extractall(ex)
+    return ex
+
+
+DS = _untar_ds(find("webtoon-yolo") or find("webtoon-panels-v35"))
 print("dataset:", DS, flush=True)
 for sp in ("train", "val"):
     os.makedirs(f"{ROOT}/images/{sp}", exist_ok=True)
@@ -127,7 +142,7 @@ yaml.safe_dump({"path": ROOT, "train": "images/train", "val": "images/val",
 m = YOLO("yolo11m-seg.pt")
 m.train(
     data=f"{ROOT}/data.yaml", task="segment",
-    epochs=200, imgsz=1024, batch=10, optimizer="AdamW", lr0=1e-3,
+    epochs=200, imgsz=1024, batch=8, optimizer="AdamW", lr0=1e-3,
     cos_lr=True, warmup_epochs=4, patience=40,
     degrees=8.0, translate=0.06, scale=0.45, shear=2.0, perspective=0.0002,
     fliplr=0.5, flipud=0.0, mosaic=0.6, close_mosaic=20, mixup=0.05,
