@@ -55,14 +55,41 @@ def cuts_path(ch):
     return os.path.join(CUTDIR, ch + ".json")
 
 
-def load_cuts(ch):
+def load_state(ch):
+    """-> (cuts, skips).  skips = y markers; a slice containing one is dropped."""
     p = cuts_path(ch)
     if os.path.exists(p):
         try:
-            return sorted(int(v) for v in json.load(open(p)))
+            d = json.load(open(p))
+            if isinstance(d, list):                       # old format
+                return sorted(int(v) for v in d), []
+            return (sorted(int(v) for v in d.get("cuts", [])),
+                    sorted(int(v) for v in d.get("skips", [])))
         except Exception:
-            return []
-    return []
+            return [], []
+    return [], []
+
+
+def is_blank(crop):
+    """a gutter / empty band -> auto-drop on export.
+
+    catches white webtoon gutters and thin light manga gutters (mostly white,
+    maybe a border line) without dropping real minimal panels (a mostly-black
+    impact panel keeps a lot of dark pixels; a near-empty panel with a bubble
+    has text pixels).
+    """
+    if crop is None or crop.size == 0:
+        return True
+    h = crop.shape[0]
+    if h < 12:
+        return True
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    content = float((g < 232).mean())          # fraction of non-white pixels
+    if content < 0.045:                        # basically an empty white band
+        return True
+    if h < 320 and content < 0.14:             # thin + sparse -> gutter w/ a line
+        return True
+    return False
 
 
 def strip_rows(ch, y0, y1):
@@ -80,7 +107,7 @@ def strip_rows(ch, y0, y1):
 
 
 def rebuild_zip(ch):
-    cuts = load_cuts(ch)
+    cuts, skips = load_state(ch)
     meta, H, W = seg_meta(ch)
     bounds, last = [], 0
     for c in cuts:
@@ -90,18 +117,22 @@ def rebuild_zip(ch):
     if last < H - 4:
         bounds.append((last, H))
     zp = os.path.join(OUTDIR, ch + ".zip")
+    kept = 0
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, (a, b) in enumerate(bounds, 1):
-            crop = strip_rows(ch, a, b)
-            if crop is None or crop.shape[0] < 2:
+        for a, b in bounds:
+            if any(a < s < b for s in skips):               # user marked it a gap
                 continue
-            if crop.shape[0] <= 65000:                       # JPEG dimension cap
+            crop = strip_rows(ch, a, b)
+            if crop is None or crop.shape[0] < 2 or is_blank(crop):   # auto-drop gutters
+                continue
+            kept += 1
+            if crop.shape[0] <= 65000:
                 ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                z.writestr(f"{ch}__p{i:03d}.jpg", buf.tobytes())
+                z.writestr(f"{ch}__p{kept:03d}.jpg", buf.tobytes())
             else:
                 ok, buf = cv2.imencode(".png", crop)
-                z.writestr(f"{ch}__p{i:03d}.png", buf.tobytes())
-    return len(bounds)
+                z.writestr(f"{ch}__p{kept:03d}.png", buf.tobytes())
+    return kept
 
 
 def zip_all():
@@ -129,30 +160,34 @@ button:hover{background:#484848}button:disabled{opacity:.4;cursor:default}
 #hint{color:#999;padding:4px 12px;background:#252525;font-size:12px}
 #wrap{position:relative;margin:14px auto;width:max-content;cursor:crosshair}
 #wrap img{display:block;width:var(--w)}
-.line{position:absolute;left:0;width:100%;height:0;border-top:2px solid #ff0055;cursor:ns-resize}
+.line{position:absolute;left:0;width:100%;height:0;border-top:2px solid #ff0055;cursor:ns-resize;z-index:3}
 .line span{position:absolute;left:4px;top:-18px;background:#ff0055;color:#fff;font-size:11px;padding:0 4px;border-radius:3px}
 .line:hover{border-top-color:#ff5599}
+.skip{position:absolute;left:0;width:100%;z-index:2;cursor:pointer;
+ background:repeating-linear-gradient(45deg,rgba(120,120,120,.55) 0 8px,rgba(60,60,60,.55) 8px 16px);
+ border-top:1px dashed #999;border-bottom:1px dashed #999}
+.skip span{position:absolute;left:6px;top:4px;background:#555;color:#fff;font-size:11px;padding:1px 5px;border-radius:3px}
 </style></head><body>
 <div id=bar>
  <button id=prev>&#9664; Prev</button>
  <select id=sel></select>
  <button id=next>Next &#9654;</button>
  <span id=info></span>
- <button id=clear>Clear lines</button>
+ <button id=clear>Clear</button>
  <span id=saved></span>
  <a id=dlch style="margin-left:auto"><button>Download this chapter</button></a>
  <a id=dl href="api/zip_all"><button>Download ALL panels</button></a>
 </div>
-<div id=hint>Left-click = add cut &nbsp;|&nbsp; drag a line = move &nbsp;|&nbsp; right-click a line = delete &nbsp;|&nbsp; every change auto-saves the chapter's panel .zip on the server</div>
+<div id=hint>click = add cut &nbsp;·&nbsp; drag a line = move &nbsp;·&nbsp; right-click a line = delete &nbsp;·&nbsp; <b>Shift-click a band = mark it a gap</b> (excluded) &nbsp;·&nbsp; blank gutters are auto-dropped &nbsp;·&nbsp; auto-saves</div>
 <div id=wrap></div>
 <script>
-const B="";let chs=[],ci=0,meta=null,cuts=[],scale=1,drag=null;
+const B="";let chs=[],ci=0,meta=null,cuts=[],skips=[],scale=1,drag=null;
 const wrap=document.getElementById('wrap'),sel=document.getElementById('sel'),
 info=document.getElementById('info'),saved=document.getElementById('saved');
 async function j(u,o){const r=await fetch(B+u,o);return r.json();}
 async function init(){chs=await j('api/chapters');sel.innerHTML=chs.map((c,i)=>`<option value=${i}>${c.id}</option>`).join('');load(0);}
 async function load(i){ci=Math.max(0,Math.min(chs.length-1,i));sel.value=ci;
- meta=await j('api/strip/'+chs[ci].id);cuts=meta.cuts.slice();
+ meta=await j('api/strip/'+chs[ci].id);cuts=meta.cuts.slice();skips=(meta.skips||[]).slice();
  const W=Math.min(720,meta.width);scale=W/meta.width;
  wrap.style.setProperty('--w',W+'px');
  wrap.innerHTML=meta.segments.map(s=>`<img src="seg/${chs[ci].id}/${s.name}" loading=lazy>`).join('');
@@ -163,34 +198,50 @@ async function load(i){ci=Math.max(0,Math.min(chs.length-1,i));sel.value=ci;
  info.textContent=`${ci+1}/${chs.length}  ·  ${chs[ci].id}  ·  ${meta.height}px`;
  render();}
 let suppressClick=false;
+function bounds(){const b=[0,...cuts.slice().sort((a,b)=>a-b),meta.height];
+ const o=[];for(let k=0;k<b.length-1;k++)o.push([b[k],b[k+1]]);return o;}
 function render(){
- [...wrap.querySelectorAll('.line')].forEach(e=>e.remove());
- cuts.sort((a,b)=>a-b);
+ wrap.querySelectorAll('.line,.skip').forEach(e=>e.remove());
+ cuts.sort((a,b)=>a-b);skips.sort((a,b)=>a-b);
+ bounds().forEach(([a,c])=>{ if(!skips.some(s=>s>a&&s<c))return;
+  const d=document.createElement('div');d.className='skip';
+  d.style.top=(a*scale)+'px';d.style.height=((c-a)*scale)+'px';
+  d.innerHTML='<span>GAP — not exported (shift-click to keep)</span>';
+  d.onclick=e=>{e.stopPropagation();skips=skips.filter(s=>!(s>a&&s<c));render();save();};
+  wrap.appendChild(d);});
  cuts.forEach((y,k)=>{const d=document.createElement('div');d.className='line';
   d.style.top=(y*scale)+'px';d.innerHTML=`<span>#${k+1} · ${y}px</span>`;
   d.onmousedown=e=>{e.preventDefault();e.stopPropagation();drag=k;};
   d.onclick=e=>e.stopPropagation();
   d.oncontextmenu=e=>{e.preventDefault();e.stopPropagation();cuts.splice(k,1);render();save();};
   wrap.appendChild(d);});
- saved.textContent=`${cuts.length+1} panels`;}
+ const skipped=bounds().filter(([a,c])=>skips.some(s=>s>a&&s<c)).length;
+ saved.textContent=`~${cuts.length+1-skipped} slices`;}
 wrap.addEventListener('click',e=>{
  if(drag!==null||suppressClick){suppressClick=false;return;}
  const r=wrap.getBoundingClientRect();
  const y=Math.round((e.clientY-r.top)/scale);
- if(y>2&&y<meta.height-2){cuts.push(y);render();save();}});
+ if(y<=2||y>=meta.height-2)return;
+ if(e.shiftKey){                                   // mark the band around y as a gap
+  const bd=bounds().find(([a,c])=>y>a&&y<c);if(!bd)return;
+  if(skips.some(s=>s>bd[0]&&s<bd[1]))skips=skips.filter(s=>!(s>bd[0]&&s<bd[1]));
+  else skips.push(Math.round((bd[0]+bd[1])/2));
+  render();save();return;}
+ cuts.push(y);render();save();});
 window.addEventListener('mousemove',e=>{if(drag===null)return;
  const r=wrap.getBoundingClientRect();let y=Math.round((e.clientY-r.top)/scale);
  y=Math.max(2,Math.min(meta.height-2,y));cuts[drag]=y;render();});
 window.addEventListener('mouseup',()=>{if(drag!==null){drag=null;suppressClick=true;
  cuts.sort((a,b)=>a-b);render();save();}});
-let t=null;function save(){clearTimeout(t);saved.textContent='saving…';
- t=setTimeout(async()=>{const r=await j('api/save/'+chs[ci].id,{method:'POST',
-  headers:{'content-type':'application/json'},body:JSON.stringify({cuts})});
-  saved.textContent=`✓ ${r.panels} panels saved`;},350);}
+let t=null;function save(){clearTimeout(t);
+ t=setTimeout(async()=>{saved.textContent='saving…';
+  const r=await j('api/save/'+chs[ci].id,{method:'POST',
+  headers:{'content-type':'application/json'},body:JSON.stringify({cuts,skips})});
+  saved.textContent=`✓ ${r.panels} panels`;},350);}
 document.getElementById('prev').onclick=()=>load(ci-1);
 document.getElementById('next').onclick=()=>load(ci+1);
 sel.onchange=()=>load(+sel.value);
-document.getElementById('clear').onclick=()=>{cuts=[];render();save();};
+document.getElementById('clear').onclick=()=>{cuts=[];skips=[];render();save();};
 init();
 </script></body></html>"""
 
@@ -221,13 +272,15 @@ class H(BaseHTTPRequestHandler):
                 out = []
                 for c in chapters():
                     _, hh, _w = seg_meta(c)
-                    out.append({"id": c, "height": hh, "cuts": len(load_cuts(c))})
+                    cu, _sk = load_state(c)
+                    out.append({"id": c, "height": hh, "cuts": len(cu)})
                 return self._send(200, json.dumps(out))
             if p.startswith("api/strip/"):
                 ch = p[len("api/strip/"):]
                 meta, hh, w = seg_meta(ch)
+                cu, sk = load_state(ch)
                 return self._send(200, json.dumps({
-                    "width": w, "height": hh, "cuts": load_cuts(ch),
+                    "width": w, "height": hh, "cuts": cu, "skips": sk,
                     "segments": [{"name": n, "y": y, "h": h} for n, y, h in meta]}))
             if p.startswith("seg/"):
                 _, ch, name = p.split("/", 2)
@@ -273,8 +326,9 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("api/save/"):
             ch = p[len("api/save/"):]
             cuts = sorted({int(v) for v in body.get("cuts", []) if 0 < int(v)})
+            skips = sorted({int(v) for v in body.get("skips", []) if 0 < int(v)})
             with _lock:
-                json.dump(cuts, open(cuts_path(ch), "w"))
+                json.dump({"cuts": cuts, "skips": skips}, open(cuts_path(ch), "w"))
                 panels = rebuild_zip(ch)
             return self._send(200, json.dumps({"panels": panels}))
         return self._send(404, "no")
