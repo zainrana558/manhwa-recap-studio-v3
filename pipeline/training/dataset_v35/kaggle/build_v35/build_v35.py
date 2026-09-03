@@ -281,7 +281,13 @@ for k, (title, idx, W, H, ip, frames, faces, texts) in enumerate(m109_pages):
     pane = []           # (cid, poly[px in image space])
     for (x1, y1, x2, y2) in frames:
         q = np.array([[x1*sx, y1*sy], [x2*sx, y1*sy], [x2*sx, y2*sy], [x1*sx, y2*sy]], np.float32)
-        pane.append((classify(q, iw, ih, has_border=True), q))
+        fw, fh = (x2 - x1) * sx, (y2 - y1) * sy
+        # Manga109 frames are axis-aligned drawn frames -> only rectangle/square
+        # (bleed/outbound can't be read from a frame box; leave that to koharu +
+        # the Roboflow webtoon labels)
+        ar = fw / max(1.0, fh)
+        cid = 1 if (0.80 <= ar <= 1.25 and fw * fh < 0.22 * iw * ih) else 0
+        pane.append((cid, q))
 
     aux = []
     for (x1, y1, x2, y2) in faces:
@@ -289,13 +295,23 @@ for k, (title, idx, W, H, ip, frames, faces, texts) in enumerate(m109_pages):
     for (x1, y1, x2, y2) in texts:
         aux.append((1, np.array([[x1*sx, y1*sy], [x2*sx, y1*sy], [x2*sx, y2*sy], [x1*sx, y2*sy]], np.float32)))
 
+    def _iou_bb(a, b):
+        ax1, ay1, ax2, ay2 = a[:, 0].min(), a[:, 1].min(), a[:, 0].max(), a[:, 1].max()
+        bx1, by1, bx2, by2 = b[:, 0].min(), b[:, 1].min(), b[:, 0].max(), b[:, 1].max()
+        iw_ = max(0, min(ax2, bx2) - max(ax1, bx1))
+        ih_ = max(0, min(ay2, by2) - max(ay1, by1))
+        inter = iw_ * ih_
+        ua = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+        return inter / ua if ua > 0 else 0.0
+
     if KO is not None and k in koharu_set:
         try:
             for kc, poly in koharu_page(im):
                 if kc == 3:                     # panel
                     cid = classify(poly, iw, ih, has_border=True)
-                    # keep koharu panel only if it adds a non-rect shape or no frame overlaps
-                    if cid in (3, 4):
+                    # add only genuine non-rect shapes koharu found that the
+                    # axis-aligned frame boxes could not represent
+                    if cid in (3, 4) and not any(_iou_bb(poly, fp) > 0.55 for _, fp in pane):
                         pane.append((cid, poly))
                 elif kc == 2:
                     aux.append((0, poly))       # bubble
