@@ -113,6 +113,10 @@ pipeline/training/dataset_v3/yolo_webtoon_cascade/
 pipeline/training/dataset_v3/yolo_webtoon_cascade_qc/
 pipeline/training/dataset_v3/yolo_webtoon_cv/
 pipeline/training/dataset_v3/yolo_webtoon_slicer/
+pipeline/training/dataset_v35/dataset_v35/
+pipeline/training/dataset_v35/synth/
+pipeline/training/dataset_v35/ext_annotations/
+pipeline/training/dataset_v35/**/__pycache__/
 pipeline/training/twatf_v3/
 pipeline/voices/
 prompt

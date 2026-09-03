@@ -1,0 +1,18 @@
+{
+  "id": "zainrana1122/build-v35",
+  "title": "build-v35",
+  "code_file": "build_v35.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "zainrana1122/webtoon-panels-v35-src",
+    "btlam0507/manga109",
+    "zainrana1122/panel-detector-onnx"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

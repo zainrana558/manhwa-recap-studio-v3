@@ -1,0 +1,14 @@
+{
+  "id": "zainrana1122/panel-train-v35-det",
+  "title": "panel-train-v35-det",
+  "code_file": "train_det.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["zainrana1122/webtoon-panels-v35"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
