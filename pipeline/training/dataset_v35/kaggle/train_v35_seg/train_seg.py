@@ -160,6 +160,24 @@ print(f"manga109 pages added: {n_m}", flush=True)
 yaml.safe_dump({"path": ROOT, "train": "images/train", "val": "images/val",
                 "nc": 5, "names": NAMES}, open(f"{ROOT}/data.yaml", "w"), sort_keys=False)
 
+
+# --- sanity guard: v3.3 silently trained on bubble-only labels (0 panels) and
+#     still reported mAP .98. Refuse to train on a degenerate label set. ---
+import collections as _co, glob as _g
+_h = _co.Counter()
+for _lp in _g.glob(f"{ROOT}/labels/train/*.txt"):
+    for _ln in open(_lp):
+        _p = _ln.split()
+        if _p:
+            _h[int(_p[0])] += 1
+_ni = len(_g.glob(f"{ROOT}/images/train/*"))
+print(f"SANITY  train_images={_ni}  label_instances_by_class={dict(sorted(_h.items()))}", flush=True)
+assert _ni > 400, f"only {_ni} training images -- dataset fetch/prep broke"
+assert sum(_h.values()) > 3000, f"only {sum(_h.values())} label instances -- labels missing"
+assert _h.get(0, 0) > 150 and _h.get(2, 0) > 150, \
+    f"degenerate class balance {dict(_h)} -- need rectangle(0) and noborder(2) both present"
+print("SANITY OK", flush=True)
+
 m = YOLO("yolo11m-seg.pt")
 m.train(
     data=f"{ROOT}/data.yaml", task="segment",

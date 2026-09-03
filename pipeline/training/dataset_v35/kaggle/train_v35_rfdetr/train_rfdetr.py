@@ -148,6 +148,15 @@ def coco_split(src_sp, out_sp):
 coco_split("train", "train")
 coco_split("val", "valid")
 
+import collections as _co
+
+import json as _j
+_tr = _j.load(open(f"{ROOT}/train/_annotations.coco.json"))
+_hc = _co.Counter(a["category_id"] for a in _tr["annotations"]) if _tr["annotations"] else _co.Counter()
+print(f"SANITY  coco train imgs={len(_tr['images'])} anns={len(_tr['annotations'])} by_cat={dict(sorted(_hc.items()))}", flush=True)
+assert len(_tr["images"]) > 400 and len(_tr["annotations"]) > 3000 and _hc.get(1,0) > 150 and _hc.get(3,0) > 150, "degenerate COCO set"
+print("SANITY OK", flush=True)
+
 from rfdetr import RFDETRBase  # noqa: E402
 
 model = RFDETRBase()

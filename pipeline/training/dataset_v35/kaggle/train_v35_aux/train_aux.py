@@ -249,6 +249,19 @@ print("manga109 aux pages:", n_m, flush=True)
 yaml.safe_dump({"path": ROOT, "train": "images/train", "val": "images/val",
                 "nc": 4, "names": NAMES}, open(f"{ROOT}/data.yaml", "w"), sort_keys=False)
 
+
+import collections as _co, glob as _g
+_h = _co.Counter()
+for _lp in _g.glob(f"{ROOT}/labels/train/*.txt"):
+    for _ln in open(_lp):
+        _p = _ln.split()
+        if _p:
+            _h[int(_p[0])] += 1
+_ni = len(_g.glob(f"{ROOT}/images/train/*"))
+print(f"SANITY  train_images={_ni}  aux_instances_by_class={dict(sorted(_h.items()))}", flush=True)
+assert _ni > 300 and sum(_h.values()) > 2000 and len(_h) >= 3, f"degenerate aux set {_ni} {dict(_h)}"
+print("SANITY OK", flush=True)
+
 m = YOLO("yolo11s-seg.pt")
 m.train(data=f"{ROOT}/data.yaml", task="segment", epochs=120, imgsz=1024, batch=16,
         optimizer="AdamW", lr0=1e-3, cos_lr=True, patience=30,
