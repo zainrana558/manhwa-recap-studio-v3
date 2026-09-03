@@ -31,7 +31,7 @@ IN = "/kaggle/input"
 ROOT = "/kaggle/tmp/v35seg"
 MAP = {0: 0, 1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 6: 4}
 NAMES = ["rectangle", "square", "noborder", "irregular", "outbound"]
-MANGA_CAP = 3000
+MANGA_CAP = 1500
 
 
 def find(*frags):
@@ -181,7 +181,7 @@ print("SANITY OK", flush=True)
 m = YOLO("yolo11m-seg.pt")
 m.train(
     data=f"{ROOT}/data.yaml", task="segment",
-    epochs=200, imgsz=1024, batch=8, optimizer="AdamW", lr0=1e-3,
+    epochs=260, imgsz=1152, batch=6, optimizer="AdamW", lr0=1e-3,
     cos_lr=True, warmup_epochs=4, patience=40,
     degrees=8.0, translate=0.06, scale=0.45, shear=2.0, perspective=0.0002,
     fliplr=0.5, flipud=0.0, mosaic=0.6, close_mosaic=20, mixup=0.05,
@@ -190,7 +190,7 @@ m.train(
 )
 best = "/kaggle/working/v35_seg/weights/best.pt"
 try:
-    YOLO(best).export(format="onnx", imgsz=1024, opset=13, simplify=True)
+    YOLO(best).export(format="onnx", imgsz=1152, opset=13, simplify=True)
 except Exception as e:
     print("export onnx:", e)
 print("DONE", best, flush=True)

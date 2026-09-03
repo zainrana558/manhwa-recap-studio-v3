@@ -132,3 +132,7 @@ pipeline/training/dataset_v35/slicer/cuts/
 pipeline/training/dataset_v35/strips/
 pipeline/training/dataset_v35/_serve/
 pipeline/training/dataset_v35/_v35_tar/
+pipeline/training/dataset_v3/yolo_final3_strict/
+pipeline/training/dataset_v3/yolo_roboflow_strict/
+pipeline/training/dataset_v3/yolo_restitch/
+pipeline/training/dataset_v3/yolo_restitch_strict/

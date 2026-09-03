@@ -49,9 +49,14 @@ MAP_7_TO_5 = {0: 0, 1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 6: 4}
 AUX = ["bubble", "text", "onomatopoeia", "face"]
 RBW_TO_OURS = {0: 3, 1: 4, 2: 2, 3: 6, 4: 0, 5: 5, 6: 1}   # Roboflow order -> ours
 VAL_SERIES = {"tbate"}
-# keep the webtoon tiers (T1+T2, ~2.8k) the majority of the pool; comic/manga
-# are regularisation + the only source of clean bordered rectangles
-CAPS = {"T3_comic_human": 1000, "T4_manga_cv": 600}
+# LEAN build: only labels we can vouch for.
+#   T2 human webtoon (95, x6)      -- perfect, multi-panel
+#   T1s strict-QC'd cascade (635)  -- verified clean edges (mostly single-panel)
+#   T3s strict-QC'd comic (80)     -- verified clean edges
+#   Manga109 <frame>               -- human, added in the train kernels
+# dropped: raw cascade, kumiko CV, raw roboflow, restitch  (gutter-bleed / noise)
+HUMAN_OVERSAMPLE = 3
+CAPS = {}
 
 
 def phash(im):
@@ -68,15 +73,18 @@ def series_of(stem):
 def collect():
     out = []
     for sub, tier, remap, dedup in [
-        ("yolo_final3", "T1_webtoon_cascade", lambda k: 2, True),
         ("roboflow_webtoon/_merged", "T2_webtoon_human", lambda k: RBW_TO_OURS.get(k, 0), False),
-        ("yolo_roboflow", "T3_comic_human", lambda k: 0, True),
-        ("yolo_kumiko", "T4_manga_cv", lambda k: 0, True),
+        ("yolo_final3_strict", "T1s_webtoon_cascade", lambda k: 2, True),
+        ("yolo_roboflow_strict", "T3s_comic_human", lambda k: 0, True),
     ]:
         for ip in sorted(glob.glob(str(D3 / sub / "images" / "*"))):
             lp = D3 / sub / "labels" / (Path(ip).stem + ".txt")
             if lp.exists():
-                out.append((tier, series_of(Path(ip).stem), ip, str(lp), remap, dedup))
+                out.append((tier, series_of(Path(ip).stem), ip, str(lp), remap, dedup, ""))
+    # oversample the only truly-accurate webtoon labels (95 human pages)
+    for extra in range(1, HUMAN_OVERSAMPLE):
+        for r in [c for c in out if c[0] == "T2_webtoon_human"]:
+            out.append((r[0], r[1], r[2], r[3], r[4], False, f"_ov{extra}"))
     return out
 
 
@@ -103,7 +111,8 @@ def main():
     iid = 0
     manifest = [("image", "tier", "series", "split", "n_panels")]
 
-    for tier, ser, ip, lp, remap, dedup in cands:
+    for tier, ser, ip, lp, remap, dedup, *rest in cands:
+        suf = rest[0] if rest else ""
         if tier in CAPS and per_tier[tier] >= CAPS[tier]:
             continue
         im = cv2.imread(ip)
@@ -138,10 +147,12 @@ def main():
         per_tier[tier] += 1
         iid += 1
         is_val = (ser in VAL_SERIES
-                  or (tier == "T2_webtoon_human" and rng.random() < 0.15)
+                  or (tier == "T2_webtoon_human" and not suf and rng.random() < 0.15)
                   or rng.random() < 0.05)
+        if suf:
+            is_val = False                      # oversample copies stay in train
         sp = "val" if is_val else "train"
-        stem = Path(ip).stem[:112]
+        stem = (Path(ip).stem[:112] + suf)
         fn = f"{stem}.jpg"
         cv2.imwrite(str(OUT / "images" / sp / fn), im, [cv2.IMWRITE_JPEG_QUALITY, 92])
 

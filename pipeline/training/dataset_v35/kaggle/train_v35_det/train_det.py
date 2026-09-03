@@ -21,7 +21,7 @@ IN = "/kaggle/input"
 ROOT = "/kaggle/tmp/v35det"
 MAP = {0: 0, 1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 6: 4}
 NAMES = ["rectangle", "square", "noborder", "irregular", "outbound"]
-MANGA_CAP = 3000
+MANGA_CAP = 1500
 
 
 def find(*frags):

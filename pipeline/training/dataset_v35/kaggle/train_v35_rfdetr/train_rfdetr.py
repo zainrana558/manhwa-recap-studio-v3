@@ -122,7 +122,7 @@ def coco_split(src_sp, out_sp):
                     pages.append((ip2, W2, H2, fr))
         random.seed(5)
         random.shuffle(pages)
-        for ip2, W2, H2, fr in pages[:3000]:
+        for ip2, W2, H2, fr in pages[:1500]:
             iid += 1
             try:
                 Image.open(ip2).convert("RGB").save(f"{d}/{iid:07d}.jpg", quality=85)
