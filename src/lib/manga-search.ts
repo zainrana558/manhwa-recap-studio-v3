@@ -275,8 +275,23 @@ function normalizeTitle(title: string): string {
     .toLowerCase()
     .normalize("NFKD") // strip accents
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
+    // collapse ALL non-alphanumerics (incl. spaces): "Nanhao And Shangfeng" and
+    // "nan hao and shang feng" both -> "nanhaoandshangfeng" so tokenisation
+    // differences between sources don't defeat exact/substring matching.
+    .replace(/[^a-z0-9]+/g, "")
     .trim();
+}
+
+// words of a title/query, accent- and punctuation-stripped, for token-set matching
+function titleWords(s: string): string[] {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
 export interface MangaSearchSources {
@@ -396,13 +411,18 @@ export async function searchAllManga(
     anilist: 10,
   };
   const qNorm = normalizeTitle(query);
+  const qWords = titleWords(query);
   function relevance(title: string): number {
     const t = normalizeTitle(title);
-    if (!qNorm) return 3;
-    if (t === qNorm) return 0; // exact match
-    if (t.startsWith(qNorm)) return 1; // starts with query
-    if (t.includes(qNorm)) return 2; // contains query
-    return 3; // no direct match (keyword/alt-title hit)
+    if (!qNorm) return 4;
+    if (t === qNorm) return 0; // exact match (whitespace-insensitive)
+    if (t.startsWith(qNorm) || qNorm.startsWith(t)) return 1; // one is a prefix of the other
+    if (t.includes(qNorm) || qNorm.includes(t)) return 2; // one contains the other
+    // every query word appears somewhere in the title (any order) — e.g.
+    // "nan hao and shang feng" vs an alt title "Nan Hao & Shang Feng: ..."
+    const tw = new Set(titleWords(title));
+    if (qWords.length >= 2 && qWords.every((w) => tw.has(w))) return 3;
+    return 4; // keyword / alt-title hit only
   }
   deduped.sort((a, b) => {
     const ra = relevance(a.title);
@@ -412,9 +432,14 @@ export async function searchAllManga(
     const sb = sourceOrder[b.source ?? "mangahere"] ?? 99;
     return sa - sb;
   });
+  // If there's at least one solid title match (relevance <= 3), drop the pure
+  // keyword-noise tail so the user isn't shown 13 unrelated webtoons above the
+  // series they searched for.
+  const hasSolid = deduped.some((m) => relevance(m.title) <= 3);
+  const ranked = hasSolid ? deduped.filter((m) => relevance(m.title) <= 3) : deduped;
 
   return {
-    manga: deduped,
+    manga: ranked,
     sources: {
       mangahere: mangahere.length,
       fanfox: fanfox.length,

@@ -907,6 +907,38 @@ export async function getComickImages(_slug: string, chapterHid: string): Promis
 // Has English-translated content from scanlation groups.
 // ---------------------------------------------------------------------------
 
+// Human-readable series title for a MangaDex id (search gives it, but
+// /api/manga/[id] loads by id and would otherwise show the raw UUID).
+export async function getMangaDexTitle(mangaId: string): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.mangadex.org/manga/${mangaId}`,
+      {},
+      10000
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as {
+      data?: { attributes?: { title?: Record<string, string>; altTitles?: Array<Record<string, string>> } };
+    };
+    const t = j.data?.attributes?.title ?? {};
+    const alts = (j.data?.attributes?.altTitles ?? []).reduce(
+      (acc, o) => ({ ...acc, ...o }),
+      {} as Record<string, string>
+    );
+    return (
+      t.en ||
+      alts.en ||
+      t["ja-ro"] ||
+      alts["ja-ro"] ||
+      Object.values(t)[0] ||
+      Object.values(alts)[0] ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
 export async function getMangaDexChapters(mangaId: string): Promise<ScrapedChapter[]> {
   // MangaDex caps `limit` at 500 per request. A single unpaginated call
   // silently truncated any manga with more than 500 English chapters

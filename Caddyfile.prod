@@ -16,6 +16,13 @@
                 reverse_proxy localhost:3001
         }
 
+        @slicer {
+                path /slicer /slicer/*
+        }
+        handle @slicer {
+                reverse_proxy localhost:8899
+        }
+
         handle {
                 reverse_proxy localhost:3000
         }

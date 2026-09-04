@@ -4,6 +4,7 @@ import {
   getSlugFromId,
   getChaptersForSource,
   getWeebCentralSeriesTitle,
+  getMangaDexTitle,
 } from "@/lib/scrapers";
 
 export const dynamic = "force-dynamic";
@@ -63,7 +64,9 @@ export async function GET(
       ? id // Webtoons doesn't have a slug, use the titleNo
       : source === "weebcentral"
       ? (await getWeebCentralSeriesTitle(slug)) ?? slug // slug is the ULID
-      : slug.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+      : source === "mangadex"
+      ? (await getMangaDexTitle(slug)) ?? slug // slug is the UUID
+      : slug.replace(/[-_]/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const baseUrls: Record<string, string> = {
       mangahere: `https://www.mangahere.cc/manga/${slug}/`,
@@ -88,7 +91,7 @@ export async function GET(
       availableTranslatedLanguages: ["en"],
       tags: [],
       contentRating: "safe",
-      lastChapter: chaptersRaw[0]?.chapterNum ?? null,
+      lastChapter: chaptersRaw[chaptersRaw.length - 1]?.chapterNum ?? null,
       source,
       externalUrl: baseUrls[source],
     };
