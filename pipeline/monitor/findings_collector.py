@@ -246,7 +246,7 @@ def write_report(job):
         L.append(f"**scrape:** {len(counts)} chapters · images/chapter "
                  f"min {min(counts)} / median {sorted(counts)[len(counts)//2]} / max {max(counts)} · "
                  f"total ~{sum(counts)} source images"
-                 + (f" · {thin} chapters have <8 images (AsuraScans long-strip format — few very tall images, not a failure)" if thin else "")
+                 + (f" · {thin} chapters have <8 images (often a long-strip source serving a few very tall images, not a failure)" if thin else "")
                  + (f" · ⚠ **{zero} chapters scraped 0 images**" if zero else ""))
         L.append("")
     if tl:
