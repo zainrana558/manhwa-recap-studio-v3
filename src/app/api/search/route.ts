@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 // Increase the max duration for this API route since it calls multiple external sources.
 export const maxDuration = 30;
 
-const VALID_SOURCES = ["mangahere", "fanfox", "webtoons", "asurascans", "mangadex", "mangapill", "toonily", "mal", "anilist"] as const;
+const VALID_SOURCES = ["mangahere", "fanfox", "webtoons", "asurascans", "mangadex", "mangapill", "toonily", "comick", "weebcentral", "mal", "anilist"] as const;
 type ValidSource = (typeof VALID_SOURCES)[number];
 
 function isSource(s: string): s is ValidSource {

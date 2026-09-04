@@ -1,0 +1,14 @@
+{
+  "id": "zainrana1122/label-magi",
+  "title": "label-magi",
+  "code_file": "label_magi.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["zainrana1122/webtoon-manhwa-raw"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

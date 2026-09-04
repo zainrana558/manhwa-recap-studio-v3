@@ -89,7 +89,9 @@ def test_narrated_frames_remain_synchronized_with_audio_timing():
     assert timings[1][1] > audio_dur
 
 
-def test_verbatim_mode_explicitly_logged(tmp_path, caplog):
+def test_verbatim_style_returns_raw_words(tmp_path):
+    """narration_style='verbatim' (the default) returns the OCR's own words
+    unchanged — no LLM, no translation, regardless of narration_provider."""
     cfg = PipelineConfig(
         input_dir=tmp_path / "input",
         output_path=tmp_path / "output.mp4",
@@ -97,9 +99,6 @@ def test_verbatim_mode_explicitly_logged(tmp_path, caplog):
         narration_provider="none",
     )
     cfg.ensure_dirs()
-
-    with caplog.at_level(logging.WARNING):
-        res = rephrase_text(cfg, "Verbatim OCR text", "test_tag", "")
-
+    assert cfg.narration_style == "verbatim"
+    res = rephrase_text(cfg, "Verbatim OCR text", "test_tag", "")
     assert res == "Verbatim OCR text"
-    assert "[RAW/VERBATIM MODE ACTIVE]" in caplog.text

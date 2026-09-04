@@ -21,7 +21,26 @@ const PIPELINE_SERVICE_URL = process.env.PIPELINE_SERVICE_URL || "http://localho
 // Next.js side to send it). Without it every call here got a 401,
 // notifyPipeline returned false, and the job was reported as "Pipeline
 // service is not running" even when the service was up and healthy.
-const PIPELINE_SECRET = process.env.PIPELINE_SECRET || "";
+//
+// start.sh writes the shared secret to $PROJECT_ROOT/.pipeline-secret and
+// exports PIPELINE_SECRET for both processes — but the env var doesn't always
+// survive the setsid/systemd hop to the standalone server. Fall back to the
+// file (same value pipeline-service uses) so the two sides can't drift.
+function resolvePipelineSecret(): string {
+  const env = process.env.PIPELINE_SECRET;
+  if (env) return env;
+  try {
+    const root = process.env.PROJECT_ROOT || process.cwd();
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs") as typeof import("fs");
+    const p = `${root}/.pipeline-secret`;
+    if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
+  } catch {
+    /* ignore */
+  }
+  return "";
+}
+const PIPELINE_SECRET = resolvePipelineSecret();
 
 /**
  * POST to the pipeline service with a short timeout.
@@ -100,6 +119,9 @@ export async function POST(req: NextRequest) {
     const chapterIds = body.chapterIds ?? null;
     const voice = body.voice || "en-US-AndrewNeural";
     const translate = body.translate === true;
+    // Narration is on by default; pass narrate:false to speak the raw
+    // transcribed panel text verbatim instead of an LLM-rewritten recap.
+    const narrate = body.narrate !== false;
     const bgmPath = body.bgmPath ?? null;
     const useBgm = body.useBgm !== false;
 
@@ -197,6 +219,7 @@ export async function POST(req: NextRequest) {
         voice,
         chapterLimit,
         translate,
+        narrate,
         bgmPath,
         useBgm,
         chapters: {

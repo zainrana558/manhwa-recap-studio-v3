@@ -51,6 +51,7 @@ type JobRow = {
   voice: string;
   chapterLimit: number;
   translate: boolean;
+  narrate?: boolean;
   bgmPath: string | null;
   useBgm: boolean;
   createdAt: Date;
@@ -100,6 +101,7 @@ export function mapJob(job: JobRow): JobDetail {
     voice: job.voice,
     chapterLimit: job.chapterLimit,
     translate: job.translate,
+    narrate: job.narrate ?? true,
     bgmPath: job.bgmPath ?? null,
     useBgm: job.useBgm ?? true,
     createdAt: job.createdAt.toISOString(),

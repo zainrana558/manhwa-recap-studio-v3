@@ -3,6 +3,8 @@ import {
   getSourceFromId,
   getSlugFromId,
   getChaptersForSource,
+  getWeebCentralSeriesTitle,
+  getMangaDexTitle,
 } from "@/lib/scrapers";
 
 export const dynamic = "force-dynamic";
@@ -60,7 +62,11 @@ export async function GET(
     // Build a minimal manga object.
     const title = source === "webtoons"
       ? id // Webtoons doesn't have a slug, use the titleNo
-      : slug.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+      : source === "weebcentral"
+      ? (await getWeebCentralSeriesTitle(slug)) ?? slug // slug is the ULID
+      : source === "mangadex"
+      ? (await getMangaDexTitle(slug)) ?? slug // slug is the UUID
+      : slug.replace(/[-_]/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const baseUrls: Record<string, string> = {
       mangahere: `https://www.mangahere.cc/manga/${slug}/`,
@@ -70,6 +76,8 @@ export async function GET(
       mangadex: `https://mangadex.org/title/${slug}`,
       mangapill: `https://mangapill.com/manga/${slug}`,
       toonily: `https://toonily.com/serie/${slug}/`,
+      comick: `https://comick.io/comic/${slug}`,
+      weebcentral: `https://weebcentral.com/series/${slug}`,
     };
 
     const manga = {
@@ -83,7 +91,7 @@ export async function GET(
       availableTranslatedLanguages: ["en"],
       tags: [],
       contentRating: "safe",
-      lastChapter: chaptersRaw[0]?.chapterNum ?? null,
+      lastChapter: chaptersRaw[chaptersRaw.length - 1]?.chapterNum ?? null,
       source,
       externalUrl: baseUrls[source],
     };

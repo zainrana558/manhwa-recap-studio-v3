@@ -63,6 +63,10 @@ python-multipart==0.0.18
 Pillow>=10.4.0,<12.0.0
 numpy>=1.24.4,<2.0.0
 opencv-python-headless>=4.10.0,<4.11.0
+# Splits run-together words the OCR glued into one box ("BURNEDWHOLE" ->
+# "BURNED WHOLE"). Pure-Python, bundles its own ~1MB wordlist, no native
+# deps. Optional: main.py degrades gracefully if the import fails.
+wordninja==2.0.0
 # Shapely is also a rapidocr dependency (see the --no-deps note above),
 # but paddleocr/paddlepaddle have no opinion on it, so it can be resolved
 # together with everything else here rather than in the separate

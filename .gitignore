@@ -1,92 +1,139 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# dependencies
-node_modules
-/.pnp
-.pnp.*
-.yarn/*
 !.yarn/patches
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# env files (can opt-in for committing if needed)
-.env*
-
-# generated shared secret for pipeline-service auth (see start.sh) — must
-# never be committed, one is generated per-deployment on first run
-.pipeline-secret
-
-# lock file for start-services.sh's flock guard against overlapping runs
-.start-services.lock
-
-# vercel
-.vercel
-
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-local-*
-.claude
-.z-ai-config
-*.log
-dev.log
-dev.out.log
-test
-prompt
-
-server.log
-# Skills directory
-/skills/
+# Build artifacts
+# Log directory (created by setup.sh tmux fallback)
 # Pipeline job data + SQLite database (runtime-generated, not source)
+# Python virtual environment (created by setup.sh)
+# Runtime artifacts
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Skills directory
+# ad-hoc QA/verification screenshots (agent-generated, not source)
+# dataset-v3 build: large scraped/annotated data (scripts tracked, data not)
+# dataset-v3: secret + more large data (added after gitignore was reverted mid-session)
+# debug
+# dependencies
+# env files (can opt-in for committing if needed)
+# generated shared secret for pipeline-service auth (see start.sh) — must
+# lock file for start-services.sh's flock guard against overlapping runs
+# misc
+# never be committed, one is generated per-deployment on first run
+# next.js
+# production
+# stray media / scratch
+# testing
+# typescript
+# vercel
+*.log
+*.pem
+*.pyc
+*.tsbuildinfo
+.DS_Store
+.claude
+.env*
+.pipeline-secret
+.pnp.*
+.pnpm-debug.log*
+.start-services.lock
+.venv/
+.vercel
+.yarn/*
+.z-ai-config
+.zscripts/dev.pid
+/.next/
+/.pnp
+/Caddyfile.prod
+/FETCH_HEAD
+/build
+/chap_001.mp4
+/coverage
 /data/
 /db/
 /download/
-/upload/
-/tool-results/
-
-# Build artifacts
+/master_merged.mp4
 /mini-services-dist/
-upload/
-pipeline/models/
-pipeline/piper/
-pipeline/voices/
-pipeline/models/
-data/cache/
-
-# Runtime artifacts
-.zscripts/dev.pid
-pipeline/__pycache__/
-
-# Python virtual environment (created by setup.sh)
-.venv/
-
-# Log directory (created by setup.sh tmux fallback)
-logs/
-*.pyc
-yolov8n.pt
-
-# ad-hoc QA/verification screenshots (agent-generated, not source)
+/out/
 /qa-*.png
+/skills/
+/tool-results/
+/upload/
 /verify-*.png
+__pycache__/
+data/cache/
+dev.log
+dev.out.log
+local-*
+logs/
+mini-services/pipeline-service/data/
+next-env.d.ts
+node_modules
+npm-debug.log*
+pipeline/__pycache__/
+pipeline/models/
+pipeline/models/koharu-layout/
+pipeline/piper/
+pipeline/training/dataset_v3/*.log
+pipeline/training/dataset_v3/.gemini_key
+pipeline/training/dataset_v3/_deliver/
+pipeline/training/dataset_v3/_kaggle_merge/
+pipeline/training/dataset_v3/_kaggle_upload/
+pipeline/training/dataset_v3/_train_ds/
+pipeline/training/dataset_v3/_v34_trainset/
+pipeline/training/dataset_v3/all_sources.tar.gz
+pipeline/training/dataset_v3/anime-face/
+pipeline/training/dataset_v3/manga109-yolo/
+pipeline/training/dataset_v3/models/
+pipeline/training/dataset_v3/qv4/
+pipeline/training/dataset_v3/qwen7_out/
+pipeline/training/dataset_v3/qwen_out/
+pipeline/training/dataset_v3/qwen_test_out/
+pipeline/training/dataset_v3/recap_selfdistill/
+pipeline/training/dataset_v3/roboflow/
+pipeline/training/dataset_v3/roboflow_webtoon/
+pipeline/training/dataset_v3/sources/
+pipeline/training/dataset_v3/train_ready/
+pipeline/training/dataset_v3/yolo/
+pipeline/training/dataset_v3/yolo_clean/
+pipeline/training/dataset_v3/yolo_curated/
+pipeline/training/dataset_v3/yolo_curated2/
+pipeline/training/dataset_v3/yolo_curated_FINAL/
+pipeline/training/dataset_v3/yolo_curated_final/
+pipeline/training/dataset_v3/yolo_final/
+pipeline/training/dataset_v3/yolo_final2/
+pipeline/training/dataset_v3/yolo_final3/
+pipeline/training/dataset_v3/yolo_final3_sfx/
+pipeline/training/dataset_v3/yolo_final4/
+pipeline/training/dataset_v3/yolo_gdrive/
+pipeline/training/dataset_v3/yolo_kumiko/
+pipeline/training/dataset_v3/yolo_magi/
+pipeline/training/dataset_v3/yolo_roboflow/
+pipeline/training/dataset_v3/yolo_webtoon_cascade/
+pipeline/training/dataset_v3/yolo_webtoon_cascade_qc/
+pipeline/training/dataset_v3/yolo_webtoon_cv/
+pipeline/training/dataset_v3/yolo_webtoon_slicer/
+pipeline/training/dataset_v35/dataset_v35/
+pipeline/training/dataset_v35/synth/
+pipeline/training/dataset_v35/ext_annotations/
+pipeline/training/dataset_v35/**/__pycache__/
+pipeline/training/twatf_v3/
+pipeline/voices/
+prompt
+server.log
+test
+upload/
+yarn-debug.log*
+yarn-error.log*
+yolov8n.pt
+pipeline/training/dataset_v35/label_set/
+pipeline/training/dataset_v35/slicer/output/
+pipeline/training/dataset_v35/slicer/cuts/
+pipeline/training/dataset_v35/strips/
+pipeline/training/dataset_v35/_serve/
+pipeline/training/dataset_v35/_v35_tar/
+pipeline/training/dataset_v3/yolo_final3_strict/
+pipeline/training/dataset_v3/yolo_roboflow_strict/
+pipeline/training/dataset_v3/yolo_restitch/
+pipeline/training/dataset_v3/yolo_restitch_strict/
+pipeline/training/dataset_v35/_ckpt/

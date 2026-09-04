@@ -1,0 +1,17 @@
+{
+  "id": "zainrana1122/webtoon-panel-train",
+  "title": "webtoon-panel-train",
+  "code_file": "train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "zainrana1122/webtoon-yolo",
+    "hieupham154/lie-eater-speech-bubbles",
+    "fatzard/comic-segmentation"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

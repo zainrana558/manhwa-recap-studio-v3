@@ -321,7 +321,9 @@ export function filterJunkTextPanels<T extends { image: string; text: string }>(
 
 // --- Source dispatchers ---
 
-export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex' | 'mangapill' | 'toonily'
+export type ScraperSource =
+  | 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex'
+  | 'mangapill' | 'toonily' | 'comick' | 'weebcentral'
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('mh-')) return 'mangahere'
@@ -331,11 +333,13 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('md-')) return 'mangadex'
   if (id.startsWith('mp-')) return 'mangapill'
   if (id.startsWith('tl-')) return 'toonily'
+  if (id.startsWith('cm-')) return 'comick'
+  if (id.startsWith('wc-')) return 'weebcentral'
   return null
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-)/, '')
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-)/, '')
 }
 
 // --- MangaHere (mangahere.cc) ---
@@ -1216,6 +1220,233 @@ export async function downloadToonilyImage(imageUrl: string, destPath: string): 
   await fs.writeFile(destPath, buf)
 }
 
+// --- Comick (comick.io) — JSON API aggregator, huge manhwa catalogue ---
+//
+// Endpoints (no key):
+//   GET {API}/v1.0/search?q=..&type=comic&limit=N     -> [{ hid, slug, title }]
+//   GET {API}/comic/{slug}/chapters?lang=en&page=N    -> { chapters:[{ hid, chap, title, lang }], total }
+//   GET {API}/chapter/{chapterHid}?tachiyomi=true     -> { chapter:{ md_images:[{ b2key }] } }
+// Images resolve to https://meo.comick.pictures/{b2key}.
+// `cm-` id form is `cm-{slug}` (see getSourceFromId below).
+//
+// NOTE: the API host moved api.comick.fun -> api.comick.dev (the .fun host now
+// 000s from many networks incl. this box). .dev is the live one; keep .fun as a
+// fallback and allow COMICK_API to override.
+
+const COMICK_API = process.env.COMICK_API || 'https://api.comick.dev'
+const COMICK_API_FALLBACK = 'https://api.comick.fun'
+const COMICK_IMG = 'https://meo.comick.pictures'
+const COMICK_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+
+function comickHeaders() {
+  return { 'User-Agent': COMICK_UA, Accept: 'application/json', Referer: 'https://comick.io/' }
+}
+
+export async function fetchComickChapters(
+  slug: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const out: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  for (let page = 1; page <= 40; page++) {
+    const url = `${COMICK_API}/comic/${encodeURIComponent(slug)}/chapters?lang=en&page=${page}&limit=100&chap-order=1`
+    const res = await fetch(url, { headers: comickHeaders() })
+    if (!res.ok) throw new Error(`Comick chapters ${res.status} for ${slug}`)
+    const body = (await res.json()) as {
+      chapters?: Array<{ hid: string; chap?: string | null; title?: string | null; lang?: string }>
+      total?: number
+    }
+    const chaps = body.chapters ?? []
+    if (chaps.length === 0) break
+    for (const c of chaps) {
+      if (!c.hid) continue
+      out.push({
+        mangadexId: c.hid, // dispatchers use this as the chapter identifier
+        chapterNum: c.chap ?? String(out.length + 1),
+        title: c.title ?? null,
+        language: c.lang ?? 'en',
+        pageCount: 0,
+        external: false,
+      })
+    }
+    if (body.total && out.length >= body.total) break
+  }
+  // Comick can return the same chapter number from multiple scan groups —
+  // keep the first (highest-priority) of each number, in ascending order.
+  const seen = new Set<string>()
+  const deduped = out.filter((c) => {
+    const k = c.chapterNum ?? ''
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+  deduped.sort((a, b) => (parseFloat(a.chapterNum || '0') || 0) - (parseFloat(b.chapterNum || '0') || 0))
+  if (deduped.length === 0) throw new Error(`Comick: no English chapters for ${slug}`)
+  return chapterLimit > 0 ? deduped.slice(0, chapterLimit) : deduped
+}
+
+export async function fetchComickChapterImages(
+  _slug: string,
+  chapterHid: string,
+): Promise<string[]> {
+  const url = `${COMICK_API}/chapter/${encodeURIComponent(chapterHid)}?tachiyomi=true`
+  const res = await fetch(url, { headers: comickHeaders() })
+  if (!res.ok) throw new Error(`Comick images ${res.status} for chapter ${chapterHid}`)
+  const body = (await res.json()) as { chapter?: { md_images?: Array<{ b2key?: string }> } }
+  const imgs = (body.chapter?.md_images ?? [])
+    .map((m) => (m.b2key ? `${COMICK_IMG}/${m.b2key}` : null))
+    .filter((u): u is string => Boolean(u))
+  if (imgs.length === 0) throw new Error(`Comick returned no images for chapter ${chapterHid}`)
+  return imgs
+}
+
+export async function downloadComickImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { 'User-Agent': COMICK_UA, Referer: 'https://comick.io/' } })
+  if (!res.ok) throw new Error(`Comick image download ${res.status}: ${imageUrl}`)
+  await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+}
+
+// --- WeebCentral (weebcentral.com) — MangaSee successor, very large catalogue ---
+//
+// HTMX site, no JSON API but every fragment endpoint is a plain GET when
+// `HX-Request: true` is sent:
+//   GET /search/data?text=..&display_mode=Minimal Display  -> <a href=/series/{ULID}/{slug}>
+//   GET /series/{ULID}/full-chapter-list                   -> <a href=/chapters/{ULID}>
+//   GET /chapters/{ULID}/images?reading_style=long_strip   -> <img src=...> in reading order
+// `wc-` id form is `wc-{seriesULID}`; chapterSlug is the chapter ULID.
+
+const WEEBCENTRAL_BASE = 'https://weebcentral.com'
+const WEEBCENTRAL_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+function weebHeaders(referer?: string): Record<string, string> {
+  return {
+    'User-Agent': WEEBCENTRAL_UA,
+    'HX-Request': 'true',
+    Accept: 'text/html',
+    ...(referer ? { Referer: referer } : {}),
+  }
+}
+
+export async function searchWeebCentral(
+  query: string,
+  limit = 8,
+): Promise<Array<{ id: string; title: string; slug: string }>> {
+  const url =
+    `${WEEBCENTRAL_BASE}/search/data?text=${encodeURIComponent(query)}` +
+    `&sort=Best%20Match&order=Descending&official=Any&anime=Any&adult=Any&display_mode=Minimal%20Display`
+  const res = await fetch(url, { headers: weebHeaders() })
+  if (!res.ok) throw new Error(`WeebCentral search ${res.status}`)
+  const html = await res.text()
+  const out: Array<{ id: string; title: string; slug: string }> = []
+  const re = /href="https:\/\/weebcentral\.com\/series\/([0-9A-Z]{26})\/([^"]+)"/g
+  let m: RegExpExecArray | null
+  const seen = new Set<string>()
+  while ((m = re.exec(html)) && out.length < limit) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    out.push({ id: `wc-${m[1]}`, slug: m[2], title: decodeURIComponent(m[2]).replace(/-/g, ' ') })
+  }
+  return out
+}
+
+export async function fetchWeebCentralChapters(
+  seriesId: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const url = `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/full-chapter-list`
+  const res = await fetch(url, { headers: weebHeaders(`${WEEBCENTRAL_BASE}/series/${seriesId}`) })
+  if (!res.ok) throw new Error(`WeebCentral chapters ${res.status} for ${seriesId}`)
+  const html = (await res.text()).replace(/\s+/g, ' ')
+  const out: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  const seen = new Set<string>()
+  // Row label is `<span class="">…</span>` — NOT always "Chapter N": long
+  // webtoons use season prefixes ("S4 - Episode 178", "S3 - Chapter 235").
+  // Grab the label, pull its trailing number, fall back to list position.
+  const re = /\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span class="">\s*([^<]+?)\s*<\/span>/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html))) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    const label = m[2]
+    const numM = label.match(/(?:Chapter|Episode)\s+([\d.]+)/i) || label.match(/([\d.]+)\s*$/)
+    out.push({
+      mangadexId: m[1],
+      chapterNum: numM ? numM[1] : null,
+      title: label,
+      language: 'en',
+      pageCount: 0,
+      external: false,
+    })
+  }
+  // full-chapter-list is newest-first — flip to ascending
+  out.reverse()
+  out.forEach((c, i) => {
+    if (!c.chapterNum) c.chapterNum = String(i + 1)
+  })
+  return chapterLimit > 0 ? out.slice(0, chapterLimit) : out
+}
+
+export async function fetchWeebCentralChapterImages(
+  _seriesId: string,
+  chapterId: string,
+): Promise<string[]> {
+  const url =
+    `${WEEBCENTRAL_BASE}/chapters/${encodeURIComponent(chapterId)}/images` +
+    `?is_prev=False&current_page=1&reading_style=long_strip`
+  const res = await fetch(url, {
+    headers: weebHeaders(`${WEEBCENTRAL_BASE}/chapters/${chapterId}`),
+  })
+  if (!res.ok) throw new Error(`WeebCentral images ${res.status} for chapter ${chapterId}`)
+  const html = await res.text()
+  const imgs: string[] = []
+  const re = /<img[^>]+src="(https:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html))) imgs.push(m[1])
+  if (imgs.length === 0) throw new Error(`WeebCentral returned no images for chapter ${chapterId}`)
+  return imgs
+}
+
+export async function downloadWeebCentralImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, {
+    headers: { 'User-Agent': WEEBCENTRAL_UA, Referer: `${WEEBCENTRAL_BASE}/` },
+  })
+  if (!res.ok) throw new Error(`WeebCentral image download ${res.status}: ${imageUrl}`)
+  await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+}
+
 // --- Unified dispatchers ---
 
 export async function fetchChaptersForSource(
@@ -1239,6 +1470,10 @@ export async function fetchChaptersForSource(
       return fetchMangaPillChapters(slug, chapterLimit)
     case 'toonily':
       return fetchToonilyChapters(slug, chapterLimit)
+    case 'comick':
+      return fetchComickChapters(slug, chapterLimit)
+    case 'weebcentral':
+      return fetchWeebCentralChapters(slug, chapterLimit)
   }
 }
 
@@ -1266,6 +1501,10 @@ export async function fetchImagesForSource(
       return fetchMangaPillChapterImages(slug, chapterSlug)
     case 'toonily':
       return fetchToonilyChapterImages(slug, chapterSlug)
+    case 'comick':
+      return fetchComickChapterImages(slug, chapterSlug)
+    case 'weebcentral':
+      return fetchWeebCentralChapterImages(slug, chapterSlug)
   }
 }
 
@@ -1289,6 +1528,10 @@ export async function downloadImageForSource(
       return downloadMangaPillImage(imageUrl, destPath)
     case 'toonily':
       return downloadToonilyImage(imageUrl, destPath)
+    case 'comick':
+      return downloadComickImage(imageUrl, destPath)
+    case 'weebcentral':
+      return downloadWeebCentralImage(imageUrl, destPath)
   }
 }
 

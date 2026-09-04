@@ -728,7 +728,9 @@ export type ScraperSource =
   | "asurascans"
   | "mangadex"
   | "mangapill"
-  | "toonily";
+  | "toonily"
+  | "comick"
+  | "weebcentral";
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mh-")) return "mangahere";
@@ -738,11 +740,13 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("md-")) return "mangadex";
   if (id.startsWith("mp-")) return "mangapill";
   if (id.startsWith("tl-")) return "toonily";
+  if (id.startsWith("cm-")) return "comick";
+  if (id.startsWith("wc-")) return "weebcentral";
   return null;
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-)/, "");
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-)/, "");
 }
 
 export async function getChaptersForSource(
@@ -764,6 +768,10 @@ export async function getChaptersForSource(
       return getMangaPillChapters(slug);
     case "toonily":
       return getToonilyChapters(slug);
+    case "comick":
+      return getComickChapters(slug);
+    case "weebcentral":
+      return getWeebCentralChapters(slug);
   }
 }
 
@@ -787,7 +795,110 @@ export async function getImagesForSource(
       return getMangaPillImages(slug, chapterId);
     case "toonily":
       return getToonilyImages(slug, chapterId);
+    case "comick":
+      return getComickImages(slug, chapterId);
+    case "weebcentral":
+      return getWeebCentralImages(slug, chapterId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// COMICK (comick.io) — JSON API aggregator. Large manhwa/manhua catalogue,
+// no API key. `cm-{slug}` id form. See mini-services/pipeline-service/lib.ts
+// for the matching job-time scraper (this file drives search + the chapter
+// list shown at job creation).
+// ---------------------------------------------------------------------------
+
+// The API host moved api.comick.fun -> api.comick.dev (the .fun host now 000s
+// from many networks). Allow COMICK_API to override.
+const COMICK_API = process.env.COMICK_API || "https://api.comick.dev";
+const COMICK_IMG = "https://meo.comick.pictures";
+const COMICK_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const comickHeaders = () => ({
+  "User-Agent": COMICK_UA,
+  Accept: "application/json",
+  Referer: "https://comick.io/",
+});
+
+export async function searchComick(query: string, limit = 10): Promise<MangadexManga[]> {
+  const url = `${COMICK_API}/v1.0/search?q=${encodeURIComponent(query)}&type=comic&limit=${limit}&page=1`;
+  const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+  if (!res.ok) throw new Error(`Comick search ${res.status}`);
+  const data = (await res.json()) as Array<{
+    hid: string;
+    slug: string;
+    title: string;
+    desc?: string;
+    country?: string;
+    status?: number;
+    year?: number | null;
+    md_covers?: Array<{ b2key?: string }>;
+    last_chapter?: number | string | null;
+  }>;
+  return (Array.isArray(data) ? data : []).map((m) => ({
+    id: `cm-${m.slug}`,
+    title: m.title || m.slug,
+    description: m.desc || "",
+    coverUrl: m.md_covers?.[0]?.b2key ? `${COMICK_IMG}/${m.md_covers[0].b2key}` : null,
+    status:
+      m.status === 2 ? "Completed" : m.status === 1 ? "Ongoing" : m.status === 3 ? "Cancelled" : null,
+    year: m.year ?? null,
+    originalLanguage: m.country ?? null,
+    availableTranslatedLanguages: ["en"],
+    tags: [],
+    contentRating: "safe" as const,
+    lastChapter: m.last_chapter != null ? String(m.last_chapter) : null,
+    source: "comick" as unknown as "mangadex",
+    externalUrl: `https://comick.io/comic/${m.slug}`,
+  }));
+}
+
+export async function getComickChapters(slug: string): Promise<ScrapedChapter[]> {
+  const out: ScrapedChapter[] = [];
+  for (let page = 1; page <= 40; page++) {
+    const url = `${COMICK_API}/comic/${encodeURIComponent(slug)}/chapters?lang=en&page=${page}&limit=100&chap-order=1`;
+    const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+    if (!res.ok) throw new Error(`Comick chapters ${res.status} for ${slug}`);
+    const body = (await res.json()) as {
+      chapters?: Array<{ hid: string; chap?: string | null; title?: string | null; lang?: string }>;
+      total?: number;
+    };
+    const chaps = body.chapters ?? [];
+    if (chaps.length === 0) break;
+    for (const c of chaps) {
+      if (!c.hid) continue;
+      out.push({
+        id: c.hid,
+        chapterNum: c.chap ?? String(out.length + 1),
+        title: c.title ?? null,
+        language: c.lang ?? "en",
+      });
+    }
+    if (body.total && out.length >= body.total) break;
+  }
+  const seen = new Set<string>();
+  const deduped = out.filter((c) => (seen.has(c.chapterNum) ? false : (seen.add(c.chapterNum), true)));
+  deduped.sort((a, b) => (parseFloat(a.chapterNum) || 0) - (parseFloat(b.chapterNum) || 0));
+  if (deduped.length === 0) throw new Error(`Comick: no English chapters for ${slug}`);
+  return deduped;
+}
+
+export async function getComickImages(_slug: string, chapterHid: string): Promise<ScrapedImage[]> {
+  const url = `${COMICK_API}/chapter/${encodeURIComponent(chapterHid)}?tachiyomi=true`;
+  const res = await fetchWithTimeout(url, { headers: comickHeaders() }, 15000);
+  if (!res.ok) throw new Error(`Comick images ${res.status} for chapter ${chapterHid}`);
+  const body = (await res.json()) as { chapter?: { md_images?: Array<{ b2key?: string }> } };
+  const imgs = (body.chapter?.md_images ?? [])
+    .map((m) => m.b2key)
+    .filter((k): k is string => Boolean(k))
+    .map((k, i) => ({
+      url: `${COMICK_IMG}/${k}`,
+      referer: "https://comick.io/",
+      filename: `${String(i + 1).padStart(3, "0")}.${k.split(".").pop() || "jpg"}`,
+    }));
+  if (imgs.length === 0) throw new Error(`Comick returned no images for chapter ${chapterHid}`);
+  return imgs;
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +906,38 @@ export async function getImagesForSource(
 // Source: api.mangadex.org — the gold standard for manga APIs.
 // Has English-translated content from scanlation groups.
 // ---------------------------------------------------------------------------
+
+// Human-readable series title for a MangaDex id (search gives it, but
+// /api/manga/[id] loads by id and would otherwise show the raw UUID).
+export async function getMangaDexTitle(mangaId: string): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.mangadex.org/manga/${mangaId}`,
+      {},
+      10000
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as {
+      data?: { attributes?: { title?: Record<string, string>; altTitles?: Array<Record<string, string>> } };
+    };
+    const t = j.data?.attributes?.title ?? {};
+    const alts = (j.data?.attributes?.altTitles ?? []).reduce(
+      (acc, o) => ({ ...acc, ...o }),
+      {} as Record<string, string>
+    );
+    return (
+      t.en ||
+      alts.en ||
+      t["ja-ro"] ||
+      alts["ja-ro"] ||
+      Object.values(t)[0] ||
+      Object.values(alts)[0] ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
 
 export async function getMangaDexChapters(mangaId: string): Promise<ScrapedChapter[]> {
   // MangaDex caps `limit` at 500 per request. A single unpaginated call
@@ -1056,5 +1199,136 @@ export async function getToonilyImages(
     throw new Error("Toonily returned no images for this chapter");
   }
 
+  return images;
+}
+
+// ---------------------------------------------------------------------------
+// WEEBCENTRAL (weebcentral.com) — large manga/manhwa catalogue, HTMX site.
+// All fragment endpoints respond to plain GETs with an `HX-Request: true`
+// header. `wc-{ULID}` id form. Series + chapter ids are 26-char ULIDs.
+// See mini-services/pipeline-service/lib.ts for the matching job-time scraper.
+// ---------------------------------------------------------------------------
+
+const WEEBCENTRAL_BASE = "https://weebcentral.com";
+const WEEBCENTRAL_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const weebHeaders = (referer?: string): Record<string, string> => ({
+  "User-Agent": WEEBCENTRAL_UA,
+  "HX-Request": "true",
+  Accept: "text/html",
+  ...(referer ? { Referer: referer } : {}),
+});
+
+export async function searchWeebCentral(query: string, limit = 10): Promise<MangadexManga[]> {
+  const url =
+    `${WEEBCENTRAL_BASE}/search/data?text=${encodeURIComponent(query)}` +
+    `&sort=Best%20Match&order=Descending&official=Any&anime=Any&adult=Any&display_mode=Minimal%20Display`;
+  const res = await fetchWithTimeout(url, { headers: weebHeaders() }, 15000);
+  if (!res.ok) throw new Error(`WeebCentral search ${res.status}`);
+  const html = await res.text();
+  const out: MangadexManga[] = [];
+  const seen = new Set<string>();
+  const re = /href="https:\/\/weebcentral\.com\/series\/([0-9A-Z]{26})\/([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) && out.length < limit) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    const slug = m[2];
+    out.push({
+      id: `wc-${m[1]}`,
+      title: decodeURIComponent(slug).replace(/-/g, " "),
+      description: "",
+      coverUrl: `https://temp.compsci88.com/cover/normal/${m[1]}.webp`,
+      status: null,
+      year: null,
+      originalLanguage: null,
+      availableTranslatedLanguages: ["en"],
+      tags: [],
+      contentRating: "safe",
+      lastChapter: null,
+      source: "weebcentral",
+      externalUrl: `${WEEBCENTRAL_BASE}/series/${m[1]}/${slug}`,
+    });
+  }
+  return out;
+}
+
+/** Series ULID -> human title (the search slug is the ULID, not a readable name). */
+export async function getWeebCentralSeriesTitle(seriesId: string): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/x`,
+      { headers: { "User-Agent": WEEBCENTRAL_UA } },
+      10000
+    );
+    if (!res.ok) return null;
+    const html = await res.text();
+    const m = html.match(/<title>([^<]+?)\s*\|\s*Weeb Central<\/title>/i);
+    return m ? m[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getWeebCentralChapters(seriesId: string): Promise<ScrapedChapter[]> {
+  const url = `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/full-chapter-list`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: weebHeaders(`${WEEBCENTRAL_BASE}/series/${seriesId}`) },
+    15000
+  );
+  if (!res.ok) throw new Error(`WeebCentral chapters ${res.status} for ${seriesId}`);
+  const html = (await res.text()).replace(/\s+/g, " ");
+  const out: ScrapedChapter[] = [];
+  const seen = new Set<string>();
+  // Row label lives in `<span class="">…</span>`. It is NOT always "Chapter N":
+  // long webtoons use season prefixes ("S4 - Episode 178", "S3 - Chapter 235").
+  // Grab the label, then pull the trailing number; fall back to list position.
+  const re =
+    /\/chapters\/([0-9A-Z]{26})"[\s\S]*?<span class="">\s*([^<]+?)\s*<\/span>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    const label = m[2];
+    const numM =
+      label.match(/(?:Chapter|Episode)\s+([\d.]+)/i) || label.match(/([\d.]+)\s*$/);
+    out.push({ id: m[1], chapterNum: numM ? numM[1] : null, title: label, language: "en" });
+  }
+  if (out.length === 0) throw new Error(`WeebCentral returned no chapters for ${seriesId}`);
+  out.reverse(); // full-chapter-list is newest-first
+  out.forEach((c, i) => {
+    if (!c.chapterNum) c.chapterNum = String(i + 1);
+  });
+  return out;
+}
+
+export async function getWeebCentralImages(
+  _seriesId: string,
+  chapterId: string
+): Promise<ScrapedImage[]> {
+  const url = `${WEEBCENTRAL_BASE}/chapters/${encodeURIComponent(chapterId)}/images?is_prev=False&current_page=1&reading_style=long_strip`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: weebHeaders(`${WEEBCENTRAL_BASE}/chapters/${chapterId}`) },
+    15000
+  );
+  if (!res.ok) throw new Error(`WeebCentral images ${res.status} for chapter ${chapterId}`);
+  const html = await res.text();
+  const images: ScrapedImage[] = [];
+  const re = /<img[^>]+src="(https:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi;
+  let m: RegExpExecArray | null;
+  let page = 1;
+  while ((m = re.exec(html)) !== null) {
+    const ext = m[1].match(/\.(jpg|jpeg|png|webp)/i)?.[1] || "jpg";
+    images.push({
+      url: m[1],
+      referer: `${WEEBCENTRAL_BASE}/`,
+      filename: `${String(page).padStart(3, "0")}.${ext}`,
+      headers: { "User-Agent": WEEBCENTRAL_UA, Referer: `${WEEBCENTRAL_BASE}/` },
+    });
+    page++;
+  }
+  if (images.length === 0) throw new Error(`WeebCentral returned no images for chapter ${chapterId}`);
   return images;
 }

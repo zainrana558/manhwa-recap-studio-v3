@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Download, Film, CheckCircle2, Share2, Image as ImageIcon, BookOpen, Clock, Cloud, CloudUpload, Loader2, HardDrive, Youtube } from "lucide-react";
+import { useState } from "react";
+import { Download, Film, CheckCircle2, Share2, Image as ImageIcon, BookOpen, Clock, Cloud, CloudUpload, Loader2, HardDrive } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import type { JobDetail } from "@/types/pipeline";
@@ -17,71 +17,6 @@ export function VideoResult({ job }: VideoResultProps) {
   const [archiveProvider, setArchiveProvider] = useState<string | null>(
     job.archiveProvider ?? null
   );
-  const [ytMetadata, setYtMetadata] = useState<{
-    title: string;
-    description: string;
-    tags: string[];
-    hashtags: string[];
-  } | null>(null);
-  const [ytLoading, setYtLoading] = useState(false);
-
-  // Fetch YouTube metadata when the video result loads
-  useEffect(() => {
-    fetch(`/api/jobs/${job.id}/youtube-metadata`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data?.metadata) {
-          setYtMetadata(data.metadata);
-        }
-      })
-      .catch(() => {});
-  }, [job.id]);
-
-  const handleCopyMetadata = async () => {
-    if (!ytMetadata) {
-      setYtLoading(true);
-      try {
-        const res = await fetch(`/api/jobs/${job.id}/youtube-metadata`);
-        const data = await res.json();
-        if (data?.metadata) {
-          setYtMetadata(data.metadata);
-        } else {
-          throw new Error(data?.error || "Not generated yet");
-        }
-      } catch (e) {
-        toast({
-          title: "Metadata not available",
-          description: e instanceof Error ? e.message : "YouTube metadata hasn't been generated yet",
-          variant: "destructive",
-        });
-        setYtLoading(false);
-        return;
-      }
-      setYtLoading(false);
-    }
-
-    const text = `TITLE:\n${ytMetadata?.title || ""}\n\nDESCRIPTION:\n${ytMetadata?.description || ""}\n\nTAGS:\n${(ytMetadata?.tags || []).join(", ")}\n\nHASHTAGS:\n${(ytMetadata?.hashtags || []).join(" ")}`;
-
-    try {
-      await navigator.clipboard.writeText(text);
-      toast({ title: "Copied!", description: "YouTube metadata copied to clipboard" });
-    } catch {
-      // Fallback: create a textarea and select it
-      const textarea = document.createElement("textarea");
-      textarea.value = text;
-      textarea.style.position = "fixed";
-      textarea.style.opacity = "0";
-      document.body.appendChild(textarea);
-      textarea.select();
-      try {
-        document.execCommand("copy");
-        toast({ title: "Copied!", description: "YouTube metadata copied to clipboard" });
-      } catch {
-        toast({ title: "Copy failed", description: "Please copy manually from the metadata file", variant: "destructive" });
-      }
-      document.body.removeChild(textarea);
-    }
-  };
 
   const handleShare = async () => {
     const url = `${window.location.origin}/api/download/${job.id}`;
@@ -233,60 +168,6 @@ export function VideoResult({ job }: VideoResultProps) {
             {archiving ? "Archiving…" : "Archive to cloud"}
           </Button>
         )}
-      </div>
-
-      {/* YouTube-ready section — SEO optimized */}
-      <div className="p-4 rounded-lg border border-red-500/20 bg-red-500/5 space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Youtube className="h-4 w-4 text-red-500" />
-            <span className="text-sm font-medium">YouTube-Ready (SEO Optimized)</span>
-          </div>
-          <button
-            onClick={handleCopyMetadata}
-            disabled={ytLoading}
-            className="text-xs px-2 py-1 rounded bg-red-500/10 text-red-400 hover:bg-red-500/20 transition border border-red-500/20 disabled:opacity-50"
-          >
-            {ytLoading ? "Loading..." : ytMetadata ? "Copy Metadata ✓" : "Copy Metadata"}
-          </button>
-        </div>
-
-        {/* Feature badges */}
-        <div className="flex flex-wrap gap-2 text-xs">
-          <span className="px-2 py-1 rounded bg-card/50 border border-border">🎬 H.264 1080p + faststart</span>
-          <span className="px-2 py-1 rounded bg-card/50 border border-border">🖼️ High-CTR thumbnail</span>
-          <span className="px-2 py-1 rounded bg-card/50 border border-border">📝 SEO title + description</span>
-          <span className="px-2 py-1 rounded bg-card/50 border border-border">🏷️ 15+ optimized tags</span>
-          <span className="px-2 py-1 rounded bg-card/50 border border-border">⏱️ Auto timestamps</span>
-        </div>
-
-        {/* Metadata preview (when loaded) */}
-        {ytMetadata && (
-          <div className="p-3 rounded-lg bg-card/50 border border-border space-y-1 text-xs">
-            <p className="font-medium text-foreground">Title:</p>
-            <p className="text-muted-foreground">{ytMetadata.title}</p>
-            <p className="font-medium text-foreground mt-2">Tags ({ytMetadata.tags?.length || 0}):</p>
-            <p className="text-muted-foreground text-[11px]">{(ytMetadata.tags || []).join(", ")}</p>
-          </div>
-        )}
-
-        {/* SEO tips */}
-        <div className="text-[11px] text-muted-foreground space-y-1">
-          <p className="font-medium text-foreground/70">📈 Algorithm tips for max views:</p>
-          <ul className="ml-4 space-y-0.5 text-muted-foreground">
-            <li>• Upload <code>youtube_ready.mp4</code> (optimized encoding survives YT compression)</li>
-            <li>• Set <code>thumbnail.jpg</code> as custom thumbnail (high-contrast, bold text)</li>
-            <li>• Copy title + description from <code>youtube_metadata.json</code> (keywords front-loaded)</li>
-            <li>• Add all tags — they help discovery in YouTube search</li>
-            <li>• Publish as <strong>private</strong> first, check everything, then make public</li>
-            <li>• First 15 seconds matter most for watch time — the thumbnail + title set expectations</li>
-          </ul>
-        </div>
-
-        <p className="text-[10px] text-muted-foreground">
-          Files in <code className="text-muted-foreground">output/youtube/</code> directory.
-          All generated with free tools (ffmpeg + PIL).
-        </p>
       </div>
 
       <p className="text-xs text-muted-foreground">

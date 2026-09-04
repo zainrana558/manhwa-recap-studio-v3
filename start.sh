@@ -201,7 +201,7 @@ echo ""
 # same "degrade, don't crash" pattern as the Piper download above.
 TEXT_DETECTOR_DIR="$PROJECT_DIR/pipeline/models/comic-text-and-bubble-detector"
 if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/null)" ]; then
-    echo "  Downloading comic text/bubble detector (RT-DETR-v2, ~170MB)..."
+    echo "  Downloading comic text/bubble detector (RT-DETR-v2)..."
     mkdir -p "$TEXT_DETECTOR_DIR"
     # Capturing output to a variable first, THEN checking $? explicitly,
     # rather than `if cmd | tail -5; then` -- without `set -o pipefail`
@@ -222,9 +222,14 @@ if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/nu
     # earlier in this same script's kill_service()/kill_port() functions
     # and the Next.js readiness check.
     set +e
+    # Fetch only what the pipeline uses: the ~11MB INT8 ONNX (fast onnxruntime
+    # path, _get_text_detector_onnx) + the config/preprocessor + safetensors
+    # (torch fallback, _get_text_detector). Skip the two big redundant ONNX
+    # exports (detector.onnx ~168MB, detector_int8.onnx ~44MB).
     DOWNLOAD_OUTPUT=$("$PROJECT_DIR/.venv/bin/python3" -c "
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR')
+snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR',
+                  ignore_patterns=['detector.onnx', 'detector_int8.onnx'])
 " 2>&1)
     DOWNLOAD_STATUS=$?
     set -e
@@ -237,6 +242,49 @@ snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$T
     fi
 else
     echo "  ✅ Comic text/bubble detector already present: $TEXT_DETECTOR_DIR"
+fi
+
+# --- Manga panel detector (YOLO26-nano fine-tuned on Manga109-s, ONNX,
+# Apache-2.0, ~10MB). Primary panel splitter for reference-style framing
+# (pipeline/master_pipeline.py::_detect_page_panels). Single-file curl, not
+# snapshot_download — it's one small .onnx. Degrades to flood-fill panel
+# detection if absent, same "degrade, don't crash" pattern as above.
+PANEL_YOLO_DIR="$PROJECT_DIR/pipeline/models/manga-panel-yolo"
+PANEL_YOLO_FILE="$PANEL_YOLO_DIR/manga_panel_detector_fp32_1024.onnx"
+if [ ! -s "$PANEL_YOLO_FILE" ]; then
+    echo "  Downloading manga panel detector (YOLO26n ONNX, ~10MB)..."
+    mkdir -p "$PANEL_YOLO_DIR"
+    set +e
+    curl -fsSL -m 120 -o "$PANEL_YOLO_FILE" \
+        "https://huggingface.co/mednasserallah/manga-panel-detector-yolo26n-onnx/resolve/main/manga_panel_detector_fp32_1024.onnx"
+    if [ $? -eq 0 ] && [ -s "$PANEL_YOLO_FILE" ]; then
+        echo "  ✅ Manga panel detector downloaded"
+    else
+        echo "  ⚠️  Manga panel detector download failed — falling back to flood-fill panel detection"
+        rm -f "$PANEL_YOLO_FILE"
+    fi
+    set -e
+else
+    echo "  ✅ Manga panel detector already present: $PANEL_YOLO_FILE"
+fi
+
+# --- RapidOCR PP-OCRv5 mobile models (det ~5MB + EN rec ~8MB). PRIMARY OCR
+# recognition path — picked by a hand-transcribed bake-off over PP-OCRv6 /
+# PP-OCRv4 (see mini-services/paddleocr-service/main.py::_init_rapidocr).
+# RapidOCR auto-downloads these from modelscope.cn on first init; this
+# pre-fetch just makes a cold first request fast and survives a flaky
+# mirror. If it fails the service still starts (falls back to stock v6).
+RAPIDOCR_MODELS_DIR="$PROJECT_DIR/.venv/lib/python3.11/site-packages/rapidocr/models"
+if [ -d "$RAPIDOCR_MODELS_DIR" ] && [ ! -s "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx" ]; then
+    echo "  Pre-fetching RapidOCR PP-OCRv5 mobile models..."
+    set +e
+    RO_BASE="https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv5"
+    curl -fsSL -m 120 -o "$RAPIDOCR_MODELS_DIR/ch_PP-OCRv5_det_mobile.onnx" "$RO_BASE/det/ch_PP-OCRv5_det_mobile.onnx" \
+      && curl -fsSL -m 120 -o "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx" "$RO_BASE/rec/en_PP-OCRv5_rec_mobile.onnx" \
+      && echo "  ✅ RapidOCR PP-OCRv5 models pre-fetched" \
+      || { echo "  ⚠️  PP-OCRv5 pre-fetch failed — RapidOCR will retry at init, or fall back to stock v6"; \
+           rm -f "$RAPIDOCR_MODELS_DIR/ch_PP-OCRv5_det_mobile.onnx" "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx"; }
+    set -e
 fi
 
 echo ""

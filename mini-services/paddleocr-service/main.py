@@ -130,19 +130,23 @@ MODEL_READY = False  # type: bool
 SERVICE_STATE = ServiceState.INITIALIZING  # type: str
 INIT_ERROR = None  # type: Optional[str]
 
-# RapidOCR (PP-OCRv6 via ONNXRuntime) — PRIMARY engine as of this session.
+# RapidOCR (PP-OCRv5 mobile det + PP-OCRv5-EN mobile rec, via ONNXRuntime)
+# — PRIMARY engine.
 # Runs through ONNXRuntime with no PaddlePaddle framework involved at all,
 # which sidesteps the CPU-only inference crash history (SIGSEGV, and a
 # documented ~43GB OOM regression as recent as April 2026) that keeps the
-# PaddleOCR engine below pinned to paddleocr==2.9.1/paddlepaddle==2.6.2 —
-# PP-OCRv5/v6 are unavailable on that line natively. Verified directly
-# against the actual production failure mode: a wide-tracked bold word
-# ("HUNTER") that PP-OCRv4's detector split into six single-letter boxes
-# (narrated "H U N T E R") is correctly merged into one box by RapidOCR's
-# bundled PP-OCRv6 model. PaddleOCR PP-OCRv4 (below) is kept as a fallback
-# tier, not removed, since RapidOCR hasn't yet been validated against a
-# large volume of real manhwa panels — only the specific diagnosed bug.
-RAPIDOCR_MODEL_NAME = "RapidOCR-PPOCRv6"
+# PaddleOCR engine below pinned to paddleocr==2.9.1/paddlepaddle==2.6.2.
+# Verified against the actual production failure mode: a wide-tracked bold
+# word ("HUNTER") that PP-OCRv4's detector split into six single-letter
+# boxes (narrated "H U N T E R") stays one box here.
+# The PP-OCRv5-mobile det+rec pair was picked by a hand-transcribed 10-panel
+# bake-off (see scratchpad/bench/run_bench.py) over the stock PP-OCRv6
+# det+rec, PP-OCRv4, and every v5/v6 mix — best word recall (0.99), best
+# precision, best char-sim, and it recovers whole bubbles the v6 detector
+# dropped. `RAPIDOCR_STOCK=1` reverts to the untuned RapidOCR() default.
+# Post-OCR spelling repair + garbage removal is in _repair_and_denoise.
+# PaddleOCR PP-OCRv4 (below) is kept as a fallback tier.
+RAPIDOCR_MODEL_NAME = "RapidOCR-PPOCRv5mobile-EN"
 rapidocr_engine = None  # type: Any
 RAPIDOCR_READY = False  # type: bool
 RAPIDOCR_ERROR = None  # type: Optional[str]
@@ -178,8 +182,9 @@ def _run_warmup(ocr_obj: Any) -> bool:
 
 
 def _init_rapidocr() -> None:
-    """Initialize RapidOCR (PP-OCRv6, ONNXRuntime backend) — the PRIMARY
-    OCR engine. Mirrors _init_ocr()'s structure (init lock, real-inference
+    """Initialize RapidOCR (PP-OCRv5 mobile det + PP-OCRv5-EN mobile rec, ONNXRuntime
+    backend) — the PRIMARY OCR engine.
+    Mirrors _init_ocr()'s structure (init lock, real-inference
     warmup before trusting the engine) but has no retry/backoff loop of
     its own here: it's covered by the same _background_retry_loop as
     PaddleOCR, at module scope below.
@@ -191,7 +196,32 @@ def _init_rapidocr() -> None:
         RAPIDOCR_ERROR = None
         try:
             from rapidocr import RapidOCR
-            engine = RapidOCR()
+            # Detection + recognition head: PP-OCRv5 mobile (det) + the
+            # dedicated English PP-OCRv5 mobile rec (`en_PP-OCRv5_rec_mobile`).
+            # Chosen by a 10-panel hand-transcribed bake-off (see
+            # scratchpad/bench): word RECALL 0.99 vs 0.97 for the stock
+            # PP-OCRv6 det+rec, precision 0.97 vs 0.96, char-sim 0.98 vs 0.97
+            # — it wins every metric AND recovers whole speech bubbles the v6
+            # detector missed (the "missing text" problem). It must be the
+            # matched v5 *mobile* family: v5 SERVER detection over-segments and
+            # scrambles reading order, and a v5-en rec bolted onto a v6
+            # detector (tried earlier) underperforms. `RAPIDOCR_STOCK=1`
+            # reverts to the untuned RapidOCR() default.
+            engine = None
+            if not os.environ.get("RAPIDOCR_STOCK"):
+                try:
+                    from rapidocr import LangRec, ModelType, OCRVersion
+                    engine = RapidOCR(params={
+                        "Det.ocr_version": OCRVersion.PPOCRV5,
+                        "Det.model_type": ModelType.MOBILE,
+                        "Rec.ocr_version": OCRVersion.PPOCRV5,
+                        "Rec.model_type": ModelType.MOBILE,
+                        "Rec.lang_type": LangRec.EN,
+                    })
+                except Exception as _e:
+                    logger.warning("RapidOCR PP-OCRv5 mobile unavailable (%s) — using stock", _e)
+            if engine is None:
+                engine = RapidOCR()
             # Real inference warmup, not just "the constructor didn't
             # raise" — same reasoning as _run_warmup below.
             dummy_img = np.zeros((32, 32, 3), dtype=np.uint8)
@@ -199,7 +229,11 @@ def _init_rapidocr() -> None:
                 engine(dummy_img)
             rapidocr_engine = engine
             RAPIDOCR_READY = True
-            logger.info("RapidOCR (PP-OCRv6, ONNXRuntime) initialized and warmed up successfully")
+            logger.info(
+                "RapidOCR initialized and warmed up successfully (%s, ONNXRuntime)",
+                "PP-OCRv6 stock det+rec" if os.environ.get("RAPIDOCR_STOCK")
+                else "PP-OCRv5 mobile det + PP-OCRv5-EN mobile rec",
+            )
         except Exception as exc:
             rapidocr_engine = None
             RAPIDOCR_READY = False
@@ -346,14 +380,18 @@ def _recompute_service_state() -> None:
         INIT_ERROR = f"rapidocr: {RAPIDOCR_ERROR}; paddleocr: {INIT_ERROR}"
 
 
-if os.environ.get("SKIP_OCR_INIT") != "1":
+_SKIP_OCR_INIT = os.environ.get("SKIP_OCR_INIT") == "1"
+if not _SKIP_OCR_INIT:
     _init_rapidocr()
     _init_ocr()  # _init_ocr() sets SERVICE_STATE itself; reconcile below
     _recompute_service_state()
 
 # If startup init failed outright for BOTH engines, run background retry
-# loop until at least one comes up.
-if SERVICE_STATE != ServiceState.READY:
+# loop until at least one comes up. Never under SKIP_OCR_INIT (test mode):
+# the retry thread would wake after 60s and run the REAL model init anyway,
+# silently loading heavy engines into the module and polluting any test
+# session that outlasts the backoff.
+if not _SKIP_OCR_INIT and SERVICE_STATE != ServiceState.READY:
     def _background_retry_loop():
         # type: () -> None
         backoff_sec = 60
@@ -378,7 +416,7 @@ if SERVICE_STATE != ServiceState.READY:
 
 app = FastAPI(
     title="OCR Service",
-    description="OCR engine for manhwa/manga recap pipeline. Primary: RapidOCR (PP-OCRv6, ONNXRuntime). Fallback: PaddleOCR PP-OCRv4.",
+    description="OCR engine for manhwa/manga recap pipeline. Primary: RapidOCR (PP-OCRv5 mobile det+rec, ONNXRuntime) + post-OCR spelling repair. Fallback: PaddleOCR PP-OCRv4.",
     version="2.0.0",
 )
 
@@ -445,10 +483,12 @@ class OCROptions(BaseModel):
         description="Binarization threshold for DB detector.",
     )
     det_db_box_thresh: float = Field(
-        default=0.5,
+        default=0.4,
         ge=0.1,
         le=0.9,
-        description="Box score threshold for DB detector.",
+        description="Box score threshold for DB detector. 0.4 (was 0.5) after "
+                    "a param sweep on PP-OCRv5 — lifts word recall ~2pts with "
+                    "no precision cost; unclip 1.8 stays optimal (2.2 merges lines).",
     )
 
 
@@ -509,7 +549,7 @@ class HealthResponse(BaseModel):
     ready: bool
     state: str = Field(default=ServiceState.INITIALIZING, description="Service readiness state")
     error: Optional[str] = Field(default=None, description="Initialization error if any")
-    rapidocr_ready: bool = Field(default=False, description="Whether the primary RapidOCR (PP-OCRv6) engine is ready")
+    rapidocr_ready: bool = Field(default=False, description="Whether the primary RapidOCR (PP-OCRv5) engine is ready")
     paddleocr_ready: bool = Field(default=False, description="Whether the fallback PaddleOCR (PP-OCRv4) engine is ready")
 
 
@@ -615,11 +655,323 @@ def _detect_ui_card_or_borders(img: np.ndarray) -> bool:
         return False
 
 
+try:
+    import wordninja as _wordninja
+    _WORDCOST = getattr(_wordninja.DEFAULT_LANGUAGE_MODEL, "_wordcost", {})
+except Exception:  # pragma: no cover
+    _wordninja = None
+    _WORDCOST = {}
+
+
+def _is_dict_word(w):
+    # type: (str) -> bool
+    wl = w.lower()
+    return wl in ("a", "i") or (len(wl) >= 2 and wl in _WORDCOST)
+
+
+# --- OCR spelling repair + garbage denoise -------------------------------
+# Fix genuine mis-recognitions ("dunngoeoon" -> "dungeon", "absollte" ->
+# "absolute") WITHOUT paraphrasing, drop pure garbage the detector
+# hallucinated out of texture/hatching ("OO NN N WN T T R", "^^^"), and
+# KEEP sound effects verbatim ("FWOOSH", "BOOOM", "KRA-KOOM").
+try:
+    from rapidfuzz import process as _rf_process
+    from rapidfuzz.distance import Indel as _rf_Indel, JaroWinkler as _rf_JW
+except Exception:  # pragma: no cover
+    _rf_process = None
+
+# Onomatopoeia / vocal noises that show up in these comics — never
+# "corrected" to a dictionary word and never dropped as garbage.
+_SFX_WORDS = {
+    "boom", "booom", "kaboom", "kraboom", "krakoom", "bang", "crash", "krash",
+    "crack", "krak", "crackle", "smash", "slam", "wham", "bam", "pow", "thud",
+    "thump", "thunk", "clang", "clank", "clink", "clunk", "ding", "dong", "buzz",
+    "bzzt", "hiss", "sizzle", "fizz", "hum", "rumble", "roar", "growl", "snarl",
+    "screech", "shriek", "splash", "sploosh", "drip", "plop", "splat", "swish",
+    "swoosh", "fwoosh", "vwoosh", "whoosh", "hwoosh", "woosh", "swoop", "flash",
+    "poof", "puff", "tap", "rap", "knock", "click", "clack", "clatter", "rustle",
+    "crunch", "stomp", "thwack", "whack", "smack", "slap", "grr", "grrr", "argh",
+    "gah", "ugh", "gasp", "pant", "huff", "sigh", "groan", "moan", "gulp", "slurp",
+    "beep", "boop", "ring", "brring", "tick", "tock", "vroom", "zoom", "zap", "zip",
+    "shing", "clash", "twang", "boing", "sproing", "rattle", "shatter", "whir",
+    "whirr", "fwip", "fwsh", "shff", "shf", "ksss", "fwoom", "vwoom", "krsh",
+    "tmp", "thmp", "step", "steps", "screee", "skrrt", "nyoom", "fwm", "vwm",
+    # laughter + vocal reactions (2 distinct letters, so the garbage filter
+    # would otherwise eat them)
+    "haha", "hahaha", "hahahaha", "hehe", "hehehe", "heehee", "hoho", "hohoho",
+    "muahaha", "mwahaha", "bwahaha", "kekeke", "heh", "hah", "huh", "hmph",
+    "hmm", "hmmm", "mmm", "tch", "tsk", "pfft", "psst", "shh", "shhh", "aha",
+    "aah", "ahh", "ooh", "ohh", "eek", "whew", "phew", "uwah", "waah", "wah",
+    "gwah", "kya", "kyaa", "nng", "nngh", "hnng", "urgh", "blegh", "ack", "gack",
+    "humph", "hmph", "hmp", "harrumph", "pff", "pfft", "meh", "bah", "psh", "feh",
+}
+_SFX_TAIL_RE = re.compile(r"^[A-Z]*(?:SH|OSH|OOSH|OM|OOM|NG|ANG|ONG|CK|MP|ZZ|RR)$")
+_SFX_SYLLABLE_RE = re.compile(r"(?:ha|he|hi|ho|hu|ja|ka|ke|na|la|da|ba|wa|nya|mwa|bwa)+$", re.I)
+
+
+def _is_probable_sfx(tok):
+    # type: (str) -> bool
+    core = re.sub(r"[^A-Za-z]", "", tok)
+    if len(core) < 2:
+        return False
+    if core.lower() in _SFX_WORDS:
+        return True
+    # a stretched letter is the signature of a shout / crash ("BOOOM",
+    # "AAARGH", "GRRR", "NOOO", "HMMM")
+    if re.search(r"(.)\1{2,}", core):
+        return True
+    # repeated CV syllable = laughter / chant ("HAHA", "NANANA", "KEKEKE")
+    if len(core) >= 4 and _SFX_SYLLABLE_RE.fullmatch(core.lower()):
+        return True
+    # short all-caps blob ending like an impact sound, not a real word
+    if core.isupper() and 3 <= len(core) <= 9 and _SFX_TAIL_RE.match(core) \
+            and not _is_dict_word(core):
+        return True
+    return False
+
+
+_REAL_SHORT_WORDS = {
+    "a", "i", "am", "an", "as", "at", "be", "by", "do", "go", "he", "hi", "if",
+    "in", "is", "it", "me", "my", "no", "of", "oh", "ok", "on", "or", "ox", "so",
+    "to", "up", "us", "we", "ye", "ah", "ha", "um", "ow", "eh", "yo", "aw", "mr",
+    "ms", "dr",
+}
+_DICT_BUCKETS = {}  # len -> [candidate words], built lazily
+_SPELL_CACHE = {}
+
+
+def _spell_candidates(n):
+    # type: (int) -> list
+    b = _DICT_BUCKETS.get(n)
+    if b is None:
+        # OCR mis-recognitions add stray characters far more often than they
+        # drop them ("dunngoeoon" is 3 longer than "dungeon"), so the window
+        # reaches further BELOW the observed length than above.
+        lo, hi = n - 4, n + 2
+        b = [w for w, c in _WORDCOST.items()
+             if lo <= len(w) <= hi and c <= 13.6 and w.isalpha()]
+        _DICT_BUCKETS[n] = b
+    return b
+
+
+def _correct_token(tok):
+    # type: (str) -> str
+    """Return a corrected spelling for a single OCR token, or the token
+    unchanged. Only fires on a clearly non-word of length >= 5 that has a
+    very close real-word neighbour — so character names and sound effects
+    (no close dictionary neighbour) pass straight through. Hyphenated /
+    apostrophe'd tokens (stutters "M-MOVE", compounds "LOW-TIER",
+    contractions) are left alone."""
+    if _rf_process is None or not _WORDCOST:
+        return tok
+    if "-" in tok or "'" in tok or "’" in tok:
+        return tok
+    core = re.sub(r"[^A-Za-z]", "", tok)
+    if len(core) < 5 or any(ch.isdigit() for ch in tok):
+        return tok
+    if _is_dict_word(core) or _is_probable_sfx(tok):
+        return tok
+    key = core.lower()
+    if key in _SPELL_CACHE:
+        cand = _SPELL_CACHE[key]
+    else:
+        cand = None
+        best = _rf_process.extractOne(
+            key, _spell_candidates(len(key)),
+            scorer=_rf_Indel.normalized_similarity, score_cutoff=0.80)
+        if best:
+            w = best[0]
+            if abs(len(w) - len(key)) <= max(3, len(key) // 2):
+                indel = best[1]
+                jw = _rf_JW.normalized_similarity(key, w)
+                if indel >= 0.88 or (indel >= 0.80 and jw >= 0.88):
+                    cand = w
+        _SPELL_CACHE[key] = cand
+    if not cand:
+        return tok
+    if core.isupper():
+        repl = cand.upper()
+    elif core[:1].isupper():
+        repl = cand.capitalize()
+    else:
+        repl = cand
+    return tok.replace(core, repl, 1)
+
+
+_SINGLE_LETTER_RUN_RE = re.compile(
+    r"(?:(?<![\w'’\-])[B-HJ-Zb-hj-z](?![\w'’\-])(?:\s+|,\s*)?){2,}")
+_SYMBOL_RUN_RE = re.compile(r"(?<![.!?])([^\w\s.!?'\"()\-’–—])\1{1,}")
+_VOWEL_RE = re.compile(r"[aeiouyAEIOUY]")
+
+
+def _repair_and_denoise(text):
+    # type: (str) -> str
+    """Final pass over a merged panel transcription: strip hallucinated
+    garbage the detector read out of texture/hatching, fix the spelling of
+    genuine mis-recognitions, and keep sound effects + dialogue verbatim.
+    No rephrasing — word order and wording are never changed."""
+    if not text or not text.strip():
+        return text or ""
+    t = text
+    # Is this panel's lettering essentially ALL-CAPS (the norm for these
+    # comics)? If so, a stray all-lowercase blob ("xgex", "ina") is texture
+    # the detector mis-read, not dialogue — real lowercase words would be
+    # rare and are still protected by the dict-word check below.
+    _upper = sum(c.isupper() for c in t)
+    _lower = sum(c.islower() for c in t)
+    allcaps_panel = _upper >= 6 and _upper >= _lower * 4
+    # raw-aggregator site watermark stamped into the panel ("www.baozimh.con",
+    # often with the TLD mis-read). Strip just the URL token.
+    t = re.sub(r"\b(?:https?://)?www\.\S+", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b[a-z][a-z0-9-]{2,}\.(?:com|net|org|con|c0m|xyz|top|io)\b(?=$|\s|[.,!?])",
+               " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(?:baozimh|mangabuddy|manhuaplus|manhuafast|asuracomic|flamescans?)\b",
+               " ", t, flags=re.IGNORECASE)
+    # a caret / backtick / lone star BETWEEN two letters is a mangled
+    # apostrophe ("CAN^T" -> "CAN'T"), not a symbol run
+    t = re.sub(r"([A-Za-z])[\^`*]([A-Za-z])", r"\1'\2", t)
+    # runs of isolated single consonants ("O N N W N", "T T R") = texture noise
+    t = _SINGLE_LETTER_RUN_RE.sub(" ", t)
+    # runs of repeated punctuation / symbols ("^^^", "~~", "***") — but leave
+    # "...", "!!", "?!" alone
+    t = _SYMBOL_RUN_RE.sub(" ", t)
+    t = re.sub(r"[|_~^`<>{}\[\]\\]+", " ", t)
+
+    out = []
+    for tok in t.split():
+        core = re.sub(r"[^A-Za-z0-9]", "", tok)
+        if not core:
+            if re.fullmatch(r"(?:\.{2,}|!+|\?+|[!?]{2,}|[-–—]+|,)", tok):
+                out.append("..." if tok.startswith("..") else tok)
+            continue
+        # a real dictionary word is always kept as-is (protects "TOO",
+        # "SEE", "ALL", "OFF" from the low-distinct-letter garbage rule).
+        # wordninja's list is polluted with 2-letter corpus cruft ("oo",
+        # "nn", "mm"), so require length >= 3 unless it's a genuine short
+        # word / interjection.
+        if (len(core) >= 3 and _is_dict_word(core)) or core.lower() in _REAL_SHORT_WORDS:
+            out.append(tok)
+            continue
+        if _is_probable_sfx(tok):
+            out.append(tok)
+            continue
+        letters = re.sub(r"[^A-Za-z]", "", core)
+        nset = len(set(letters.lower()))
+        # --- pure garbage the detector hallucinated ---
+        if len(letters) >= 2 and nset == 1:                       # "OO", "NNN"
+            continue
+        if len(letters) >= 4 and nset == 2 and not _VOWEL_RE.search(letters):  # "WNWN"
+            continue
+        if 0 < len(letters) <= 4 and not _VOWEL_RE.search(letters) \
+                and letters.upper() not in ("MR", "MRS", "DR", "ST", "TV", "HP", "MP"):
+            continue                                              # "WN", "TTR"
+        if len(core) == 1 and core not in ("I", "A", "a") and not core.isdigit():
+            continue
+        # lowercase shard in an otherwise all-caps panel = mis-read texture
+        if allcaps_panel and core.isalpha() and core.islower() and len(core) <= 6 \
+                and not _is_dict_word(core):
+            continue
+        out.append(_correct_token(tok))
+
+    # a trailing junk token whose case clashes with an otherwise all-caps
+    # line ("...THAT IS?  Djinni", "...HAIL!  inen") is the watermark strip /
+    # texture the detector tacked onto the end — drop it
+    if len(out) >= 3:
+        body_upper = sum(c.isupper() for c in " ".join(out[:-1]))
+        body_lower = sum(c.islower() for c in " ".join(out[:-1]))
+        last = re.sub(r"[^A-Za-z]", "", out[-1])
+        if (body_upper >= 6 and body_upper >= body_lower * 3 and 3 <= len(last) <= 8
+                and not last.isupper() and not _is_dict_word(last)
+                and not _is_probable_sfx(out[-1])):
+            out = out[:-1]
+
+    t = " ".join(out)
+    t = re.sub(r"\s+([,.!?;:])", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    # a panel whose ENTIRE transcription is one short lower-case non-word
+    # ("winz", "inen", "ina") is the detector reading hatching/texture in an
+    # art panel — no dialogue, drop it
+    lone = re.sub(r"[^A-Za-z]", "", t)
+    if t and lone == t.strip(".,!?:;'\"") and len(lone) <= 6 and lone.islower() \
+            and not _is_dict_word(lone) and lone not in _REAL_SHORT_WORDS:
+        return ""
+    return t
+
+
+def _desegment_runon(text):
+    # type: (str) -> str
+    """Split words the OCR glued together ("BURNEDWHOLE" -> "BURNED WHOLE",
+    "THEINTO" -> "THE INTO"). Conservative: a token is only split when
+    wordninja's segmentation is ENTIRELY real dictionary words — so proper
+    names ("SHENYE", "DINGZHOU"), whose syllables aren't dictionary words,
+    are left intact. Original casing/punctuation preserved by slicing the
+    source token at the split lengths. A single junk consonant stuck to a
+    real word ("RTHIS" -> "THIS") is dropped."""
+    if _wordninja is None or not text or not _WORDCOST:
+        return text
+
+    def _cost(w):
+        return _WORDCOST.get(w.lower(), 99.0)
+
+    def _fix(m):
+        tok = m.group(0)
+        if len(tok) < 5 or _is_dict_word(tok):
+            return tok
+        parts = _wordninja.split(tok)
+        if len(parts) < 2 or sum(len(p) for p in parts) != len(tok):
+            return tok
+        # drop a leading 1-char junk shard glued to a real word ("R"+"THIS")
+        if len(parts[0]) == 1 and parts[0].lower() not in ("a", "i") and _is_dict_word(parts[1]):
+            tok, parts = tok[1:], parts[1:]
+            if len(parts) == 1:
+                return tok
+        if not all(_is_dict_word(p) for p in parts):
+            return m.group(0)
+        # Guard against splitting a romanised NAME whose syllables happen to
+        # be rare dictionary words ("SHENYE" -> "SHE NYE", "DINGZHOU"): only
+        # split a short token when EVERY part is a genuinely common word.
+        if len(tok) < 10 and any(_cost(p) > 9.5 for p in parts):
+            return m.group(0)
+        out, i = [], 0
+        for p in parts:
+            out.append(tok[i:i + len(p)])
+            i += len(p)
+        return " ".join(out)
+
+    return re.sub(r"[A-Za-z]{5,}", _fix, text)
+
+
+def _trim_leading_noise(text):
+    # type: (str) -> str
+    """Drop a run of short vowel-less letter shards at the very start of a
+    line ("WN T T R THIS FLAME'S..." -> "THIS FLAME'S...") — leftover flame/
+    texture the detector read as letters and glued onto the real sentence."""
+    toks = text.split()
+    i = 0
+    while i < len(toks) - 1:
+        core = re.sub(r"[^A-Za-z]", "", toks[i])
+        if core in ("I", "A", "a"):
+            break
+        if len(core) <= 3 and not re.search(r"[aeiouyAEIOUY]", core):
+            i += 1
+            continue
+        break
+    # A single leading shard is far more likely a real (mis-OCR'd) word than
+    # texture noise — only trim a RUN of them ("WN T T R" -> 4 shards).
+    return " ".join(toks[i:]) if i >= 2 else text
+
+
 def _clean_and_normalize_ocr_text(text: str) -> str:
     """Normalize ellipses, punctuation, character substitutions, and end cards."""
     if not text:
         return ""
-    t = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', text, flags=re.IGNORECASE)
+    t = _trim_leading_noise(_desegment_runon(text))
+    # OCR frequently drops the space after mid-sentence punctuation when two
+    # bubbles are read in one pass ("SPELL,WANG" -> "SPELL, WANG"). Safe: an
+    # apostrophe/decimal is a letter-adjacent case we exclude.
+    t = re.sub(r'([A-Za-z]{2}),([A-Za-z]{2})', r'\1, \2', t)
+    t = re.sub(r'([A-Za-z]{3})([!?])([A-Za-z]{2})', r'\1\2 \3', t)
+    t = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', t, flags=re.IGNORECASE)
     t = re.sub(r'\.{2,}', '...', t)
 
     t = re.sub(r'\bHO[0O]\b', 'HOO', t)
@@ -631,106 +983,234 @@ def _clean_and_normalize_ocr_text(text: str) -> str:
     t = re.sub(r'^\s*B\s+to\s+be\b(?!\s+continued)', 'To Be Continued', t, flags=re.IGNORECASE)
     t = re.sub(r'\.{2,}', '...', t)
 
+    # Split contractions the OCR broke on the apostrophe ("ISN T" -> "ISN'T",
+    # "WE RE" -> "WE'RE", "I LL" -> "I'LL"). Without this the orphaned
+    # "T"/"RE"/"LL" gets swept away as a stray shard downstream, turning
+    # "isn't" into "isn". Casing of the join follows the surrounding text.
+    def _rejoin(m):
+        joined = (m.group(1) + m.group(2)).replace(" ", "")
+        out = m.group(1).rstrip() + "'" + m.group(2).lstrip()
+        if joined.isupper():
+            return out.upper()
+        if joined.islower():
+            return out.lower()
+        return out
+
+    t = re.sub(r"\b((?:is|was|wer|were|are|has|have|had|does|did|do|would|should|"
+               r"could|ca|wo|ai|might|must|need|dare)n)(\s+t)\b", _rejoin, t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(we|you|they)(\s+re)\b", _rejoin, t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(i|we|you|they|he|she|it|that|there|who|what)(\s+(?:ll|ve|d))\b",
+               _rejoin, t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(he|she|it|that|there|what|who|here|one|thing)(\s+s)\b",
+               _rejoin, t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(i)(\s+m)\b", _rejoin, t, flags=re.IGNORECASE)
+    # "I L TAKE" / "YOU L SEE" — OCR dropped one L of "'LL"
+    t = re.sub(r"\bI\s+L\b(?=\s+[A-Z])", "I'LL", t)
+    t = re.sub(r"\b(You|We|They|He|She)\s+l\b(?=\s+[a-z])", r"\1'll", t)
+
     return t
 
 
 def _sort_regions_reading_order(regions, is_ui_box=False):
     # type: (List[_TextRegion], bool) -> List[_TextRegion]
-    """Sort detected text regions in natural reading order."""
+    """Order detected text regions in natural LTR reading order.
+
+    1. Recursively split on a clean VERTICAL gutter that no region crosses —
+       separates side-by-side speech bubbles / columns, so each bubble is
+       read fully before the next (was being interleaved line-by-line).
+    2. Inside a column, group regions into visual LINES by vertical OVERLAP
+       (not y_min proximity — an ascender/descender or a tall glyph next to
+       a short one used to throw two words of ONE line into different rows,
+       which then got emitted out of order, e.g. "2nd word ... 1st word").
+    3. Lines top-to-bottom, words within a line left-to-right.
+    """
     if not regions:
         return regions
-
-    if is_ui_box:
+    if is_ui_box or len(regions) == 1:
         return sorted(regions, key=lambda r: (r.y_min, r.x_min))
 
-    heights = [r.y_max - r.y_min for r in regions]
-    mean_height = sum(heights) / len(heights) if heights else 20.0
-    vertical_tolerance = max(mean_height * 0.4, 10.0)
+    heights = sorted(max(1.0, r.y_max - r.y_min) for r in regions)
+    med_h = heights[len(heights) // 2]
 
-    remaining = sorted(regions, key=lambda r: r.y_min)
-    rows = []  # type: List[List[_TextRegion]]
-    for r in remaining:
-        placed = False
-        for row in rows:
-            row_y = sum(rr.y_min for rr in row) / len(row)
-            if abs(r.y_min - row_y) < vertical_tolerance:
-                row.append(r)
+    def _group_lines(regs):
+        # Group regions into printed lines. Two regions are on the SAME line
+        # when they overlap vertically AND sit side-by-side horizontally
+        # (little/no x-overlap). Two STACKED lines of one bubble also overlap
+        # vertically — big webtoon lettering has tight leading, so lines
+        # routinely overlap 40-50% — but they overlap horizontally too, which
+        # is the discriminator that stops them being merged and their words
+        # x-sorted out of order.
+        rem = sorted(regs, key=lambda r: (r.y_min, r.x_min))
+        lines = []  # list of dicts {members, y1, y2}
+        for r in rem:
+            rh = max(1.0, r.y_max - r.y_min)
+            rw = max(1.0, r.x_max - r.x_min)
+            placed = False
+            for ln in lines:
+                v_ov = min(r.y_max, ln["y2"]) - max(r.y_min, ln["y1"])
+                if v_ov / min(rh, ln["y2"] - ln["y1"]) < 0.45:
+                    continue
+                h_ov = min(r.x_max, ln["x2"]) - max(r.x_min, ln["x1"])
+                if h_ov / min(rw, ln["x2"] - ln["x1"]) > 0.25:
+                    continue  # stacked, not same line
+                ln["members"].append(r)
+                ln["y1"] = min(ln["y1"], r.y_min); ln["y2"] = max(ln["y2"], r.y_max)
+                ln["x1"] = min(ln["x1"], r.x_min); ln["x2"] = max(ln["x2"], r.x_max)
                 placed = True
                 break
-        if not placed:
-            rows.append([r])
+            if not placed:
+                lines.append({"members": [r], "y1": r.y_min, "y2": r.y_max,
+                              "x1": r.x_min, "x2": r.x_max})
+        lines.sort(key=lambda ln: (ln["y1"] + ln["y2"]) / 2.0)
+        out = []
+        for ln in lines:
+            out.extend(sorted(ln["members"], key=lambda r: r.x_min))
+        return out
 
-    rows.sort(key=lambda row: sum(rr.y_min for rr in row) / len(row))
-    ordered = []  # type: List[_TextRegion]
-    for row in rows:
-        row.sort(key=lambda rr: rr.x_min)
-        ordered.extend(row)
-    return ordered
+    def _cluster_bubbles(regs):
+        # When no clean guillotine cut exists (diagonally-placed speech
+        # bubbles overlap in BOTH x and y), group regions into bubbles by
+        # spatial proximity, order the bubbles top-to-bottom / left-to-right,
+        # then line-group within each bubble.
+        gap = med_h * 1.6
+        parent = list(range(len(regs)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(len(regs)):
+            for j in range(i + 1, len(regs)):
+                a, b = regs[i], regs[j]
+                dx = max(a.x_min - b.x_max, b.x_min - a.x_max, 0.0)
+                dy = max(a.y_min - b.y_max, b.y_min - a.y_max, 0.0)
+                if dx <= gap and dy <= gap:
+                    parent[find(i)] = find(j)
+
+        groups = {}
+        for i in range(len(regs)):
+            groups.setdefault(find(i), []).append(regs[i])
+        clusters = list(groups.values())
+        if len(clusters) <= 1:
+            return _group_lines(regs)
+
+        def key(cl):
+            y0 = min(r.y_min for r in cl)
+            x0 = min(r.x_min for r in cl)
+            return (round(y0 / max(1.0, med_h * 1.5)), x0)  # rows of bubbles, L->R
+
+        clusters.sort(key=key)
+        out = []
+        for cl in clusters:
+            out.extend(_group_lines(cl))
+        return out
+
+    def _split(regs, depth=0):
+        if len(regs) <= 1 or depth > 40:
+            return _group_lines(regs)
+        span_w = max(r.x_max for r in regs) - min(r.x_min for r in regs)
+        xs = sorted(regs, key=lambda r: r.x_min)
+        cur_x2 = xs[0].x_max
+        v_gap, v_at = 0.0, None
+        for r in xs[1:]:
+            g = r.x_min - cur_x2
+            if g > v_gap:
+                v_gap, v_at = g, (cur_x2 + r.x_min) / 2.0
+            cur_x2 = max(cur_x2, r.x_max)
+        if v_at is not None and v_gap >= max(med_h * 1.4, span_w * 0.09):
+            left = [r for r in regs if (r.x_min + r.x_max) / 2.0 < v_at]
+            right = [r for r in regs if (r.x_min + r.x_max) / 2.0 >= v_at]
+            if left and right:
+                return _split(left, depth + 1) + _split(right, depth + 1)
+        return _cluster_bubbles(regs)
+
+    return _split(list(regions))
 
 
-def _merge_regions(regions, is_ui_box=False):
-    # type: (List[_TextRegion], bool) -> Tuple[str, float, int]
-    """Merge sorted text regions into a single coherent string."""
+def _looks_like_ocr_noise(text):
+    # type: (str) -> bool
+    """A detected 'region' that is really flame/speed-line/texture the
+    detector hallucinated letters out of: single stray chars, all-caps
+    consonant clusters, or a run of 1-2 char fragments ("OO NN N WN T T R").
+    Deliberately narrow — real 1-2 letter words (I, a, ok, no) never trip it
+    because they are single tokens, not runs, and they contain vowels."""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if len(s) <= 1:
+        return s not in ("I", "A", "a")
+    if re.fullmatch(r"(.)\1{2,}", s):                       # "OOOO", "!!!!"
+        return True
+    toks = [t for t in re.split(r"\s+", s) if t]
+    letters_only = re.sub(r"[^A-Za-z]", "", s)
+    if not letters_only:
+        return True
+    # a run of short fragments, none of which is a real little word
+    if len(toks) >= 2 and all(len(re.sub(r"[^A-Za-z]", "", t)) <= 2 for t in toks):
+        if not any(t.lower() in ("i", "a", "an", "as", "at", "be", "is", "it", "no",
+                                 "of", "oh", "ok", "on", "or", "so", "to", "up", "us",
+                                 "we", "ah", "hi", "ha", "ho", "uh", "um", "my")
+                   for t in toks):
+            return True
+    # a single short vowel-less alpha blob ("NNW", "TTR", "WN")
+    if len(letters_only) <= 4 and not re.search(r"[aeiouyAEIOUY]", letters_only):
+        return True
+    return False
+
+
+def _merge_regions(regions, is_ui_box=False, engine="paddleocr"):
+    # type: (List[_TextRegion], bool, str) -> Tuple[str, float, int]
+    """Merge sorted text regions into a single coherent string.
+
+    `engine` controls the no-space join heuristic: PP-OCRv4 over-segments
+    bold lettering into per-glyph boxes, RapidOCR's PP-OCRv5 detector does
+    not — so for RapidOCR any positive gap between boxes is a word boundary."""
     if not regions:
         return "", 0.0, 0
 
+    # Filter detector noise, but never down to nothing.
+    filtered = [r for r in regions if not _looks_like_ocr_noise(r.text)]
+    if filtered:
+        regions = filtered
+
     sorted_regions = _sort_regions_reading_order(regions, is_ui_box=is_ui_box)
 
-    lines = []  # type: List[List[_TextRegion]]
-    current_line = [sorted_regions[0]]  # type: List[_TextRegion]
-
-    for region in sorted_regions[1:]:
-        prev = current_line[-1]
-        vertical_gap = abs(region.y_min - prev.y_min)
-        mean_h = (region.y_max - region.y_min + prev.y_max - prev.y_min) / 2
-        threshold = max(mean_h * 0.2, 4.0) if is_ui_box else max(mean_h * 0.5, 10.0)
-
-        if vertical_gap < threshold:
-            current_line.append(region)
-        else:
-            lines.append(current_line)
-            current_line = [region]
-
-    lines.append(current_line)
-
-    text_parts = []  # type: List[str]
+    # Walk the ALREADY-ORDERED regions and join them. Default: one space
+    # between regions. NO space only for a genuine same-line glyph split —
+    # two boxes on the same printed line that physically touch/overlap, or
+    # (PP-OCRv4 only) two 1-2 char fragments abutting each other ("H" "U"
+    # "N" "T" "E" "R"). A large NEGATIVE x-gap means the next region is a new
+    # line that starts further left — that is a word boundary and MUST get a
+    # space ("...FOREST" / "HAS BEEN..." was becoming "FORESTHAS").
+    parts = []  # type: List[str]
     all_confidences = []  # type: List[float]
+    prev = None
+    for r in sorted_regions:
+        t = _clean_and_normalize_ocr_text(r.text.strip())
+        if not t:
+            continue
+        if prev is not None:
+            gap = r.x_min - prev.x_max
+            char_h = max(1.0, ((r.y_max - r.y_min) + (prev.y_max - prev.y_min)) / 2.0)
+            v_ov = min(r.y_max, prev.y_max) - max(r.y_min, prev.y_min)
+            same_line = v_ov / max(1.0, min(r.y_max - r.y_min, prev.y_max - prev.y_min)) > 0.45
+            prev_t = parts[-1].strip()
+            touching = same_line and (-char_h * 0.30 < gap < char_h * 0.08)
+            glyph_split = (
+                engine != "rapidocr" and same_line and gap < char_h * 0.6
+                and len(re.sub(r"[^A-Za-z]", "", prev_t)) <= 2
+                and len(re.sub(r"[^A-Za-z]", "", t)) <= 2
+            )
+            parts.append(t if (touching or glyph_split) else " " + t)
+        else:
+            parts.append(t)
+        prev = r
+        if r.confidence > 0:
+            all_confidences.append(r.confidence)
 
-    for line in lines:
-        line_sorted = sorted(line, key=lambda r: r.x_min)
-        line_parts = []  # type: List[str]
-        prev_region = None
-        for r in line_sorted:
-            t = _clean_and_normalize_ocr_text(r.text.strip())
-            if not t:
-                continue
-            if prev_region is not None:
-                gap = r.x_min - prev_region.x_max
-                char_h = max(1.0, ((r.y_max - r.y_min) + (prev_region.y_max - prev_region.y_min)) / 2.0)
-                # Bold/wide-tracked comic lettering (common in webtoon
-                # dialogue and SFX fonts) makes PaddleOCR's text detector
-                # over-segment single words into one box per glyph. Gluing
-                # every region together with a plain space then spells
-                # words out letter by letter ("H U N T E R"). A real
-                # word-to-word gap is comparable to or wider than a
-                # character's height; letter-level kerning within an
-                # over-segmented word is much tighter — join those with no
-                # space, and only insert a space at a genuine word gap.
-                if gap < char_h * 0.35:
-                    line_parts.append(t)
-                else:
-                    line_parts.append(" " + t)
-            else:
-                line_parts.append(t)
-            prev_region = r
-        line_text = _clean_and_normalize_ocr_text("".join(line_parts))
-        if line_text:
-            text_parts.append(line_text)
-        for r in line_sorted:
-            if r.confidence > 0:
-                all_confidences.append(r.confidence)
-
-    merged_text = _clean_and_normalize_ocr_text(" ".join(text_parts))
+    merged_text = _repair_and_denoise(_clean_and_normalize_ocr_text("".join(parts)))
     avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
@@ -804,7 +1284,7 @@ def parse_ocr_results(result):
 
 def _run_rapidocr_on_image(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> List[_TextRegion]
-    """Run RapidOCR (PP-OCRv6, ONNXRuntime) on a numpy image array.
+    """Run RapidOCR (PP-OCRv5 mobile, ONNXRuntime) on a numpy image array.
 
     Mirrors _run_ocr_on_image's contract (same _TextRegion return shape)
     so the existing _merge_regions/_quality_status pipeline — including
@@ -1118,7 +1598,7 @@ def _run_tesseract_ocr(img):
 
 def _ocr_with_cascade(img, options=None):
     # type: (np.ndarray, Optional[OCROptions]) -> Tuple[str, float, int, str, float, List[dict], str]
-    """Run OCR through an engine cascade: RapidOCR (PP-OCRv6, PRIMARY) ->
+    """Run OCR through an engine cascade: RapidOCR (PP-OCRv5, PRIMARY) ->
     PaddleOCR PP-OCRv4 standard + preprocessing variants (FALLBACK) ->
     Tesseract (LAST RESORT). Every stage's non-empty candidate is tracked
     so the single best-quality result across ALL engines tried wins, even
@@ -1143,11 +1623,11 @@ def _ocr_with_cascade(img, options=None):
         candidates = []  # type: List[dict]
         best_tuple = None  # type: Optional[Tuple[str, float, int, str, float, List[dict], str]]
 
-        # --- PRIMARY: RapidOCR (PP-OCRv6, ONNXRuntime) ---
+        # --- PRIMARY: RapidOCR (PP-OCRv5 mobile, ONNXRuntime) ---
         if rapidocr_engine is not None:
             try:
                 rapid_regions = _run_rapidocr_on_image(img, opts)
-                rapid_text, rapid_conf, rapid_count = _merge_regions(rapid_regions, is_ui_box=is_ui_box)
+                rapid_text, rapid_conf, rapid_count = _merge_regions(rapid_regions, is_ui_box=is_ui_box, engine="rapidocr")
                 rapid_status, rapid_quality, rapid_reason = _quality_status(rapid_text, rapid_conf, rapid_count)
 
                 candidates.append({

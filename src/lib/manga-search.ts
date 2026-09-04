@@ -7,6 +7,8 @@ import {
   searchMangaDex,
   searchMangaPill,
   searchToonily,
+  searchComick,
+  searchWeebCentral,
 } from "./scrapers";
 
 // ---------------------------------------------------------------------------
@@ -273,8 +275,23 @@ function normalizeTitle(title: string): string {
     .toLowerCase()
     .normalize("NFKD") // strip accents
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
+    // collapse ALL non-alphanumerics (incl. spaces): "Nanhao And Shangfeng" and
+    // "nan hao and shang feng" both -> "nanhaoandshangfeng" so tokenisation
+    // differences between sources don't defeat exact/substring matching.
+    .replace(/[^a-z0-9]+/g, "")
     .trim();
+}
+
+// words of a title/query, accent- and punctuation-stripped, for token-set matching
+function titleWords(s: string): string[] {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
 export interface MangaSearchSources {
@@ -287,6 +304,8 @@ export interface MangaSearchSources {
   mangadex: number;
   mangapill: number;
   toonily: number;
+  comick: number;
+  weebcentral: number;
 }
 
 export interface UnifiedSearchResult {
@@ -306,7 +325,7 @@ export async function searchAllManga(
 ): Promise<UnifiedSearchResult> {
   const safeLimit = Math.min(Math.max(limit, 1), 25);
 
-  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, malRes, alRes] = await Promise.allSettled([
+  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, wcRes, malRes, alRes] = await Promise.allSettled([
     searchMangaHere(query, safeLimit),
     searchFanFox(query, safeLimit),
     searchWebtoons(query, safeLimit),
@@ -314,6 +333,8 @@ export async function searchAllManga(
     searchMangaDex(query, safeLimit),
     searchMangaPill(query, safeLimit),
     searchToonily(query, safeLimit),
+    searchComick(query, safeLimit),
+    searchWeebCentral(query, safeLimit),
     searchJikan(query, safeLimit),
     searchAniList(query, safeLimit),
   ]);
@@ -325,6 +346,8 @@ export async function searchAllManga(
   const mangadex = mdRes.status === "fulfilled" ? mdRes.value : [];
   const mangapill = mpRes.status === "fulfilled" ? mpRes.value : [];
   const toonily = tlRes.status === "fulfilled" ? tlRes.value : [];
+  const comick = cmRes.status === "fulfilled" ? cmRes.value : [];
+  const weebcentral = wcRes.status === "fulfilled" ? wcRes.value : [];
   const mal = malRes.status === "fulfilled" ? malRes.value : [];
   const anilist = alRes.status === "fulfilled" ? alRes.value : [];
 
@@ -342,6 +365,8 @@ export async function searchAllManga(
     ...mangadex,
     ...mangapill,
     ...toonily,
+    ...comick,
+    ...weebcentral,
     ...mal,
     ...anilist,
   ]) {
@@ -380,17 +405,31 @@ export async function searchAllManga(
     mangadex: 4,
     mangapill: 5,
     toonily: 6,
-    mal: 7,
-    anilist: 8,
+    comick: 7,
+    weebcentral: 8,
+    mal: 9,
+    anilist: 10,
   };
+  const STOP = new Set(["and", "the", "of", "a", "an", "to", "in", "vs", "or"]);
   const qNorm = normalizeTitle(query);
+  const qWords = titleWords(query).filter((w) => !STOP.has(w));
   function relevance(title: string): number {
     const t = normalizeTitle(title);
-    if (!qNorm) return 3;
-    if (t === qNorm) return 0; // exact match
-    if (t.startsWith(qNorm)) return 1; // starts with query
-    if (t.includes(qNorm)) return 2; // contains query
-    return 3; // no direct match (keyword/alt-title hit)
+    if (!qNorm) return 4;
+    if (t === qNorm) return 0; // exact match (whitespace-insensitive)
+    if (t.startsWith(qNorm) || qNorm.startsWith(t)) return 1; // one is a prefix of the other
+    if (t.includes(qNorm) || qNorm.includes(t)) return 2; // one contains the other
+    // every meaningful query word appears in the title (any order), ignoring
+    // stopwords — "nan hao AND shang feng" still matches "Nán Hào Shàng Fēng".
+    const tw = new Set(titleWords(title).filter((w) => !STOP.has(w)));
+    if (qWords.length >= 2 && qWords.every((w) => tw.has(w))) {
+      // reward tighter matches: title has no extra words -> rank just below "contains"
+      return tw.size <= qWords.length + 2 ? 3 : 3.5;
+    }
+    // majority of query words present -> still a real candidate, keep it visible
+    const hit = qWords.filter((w) => tw.has(w)).length;
+    if (qWords.length >= 3 && hit / qWords.length >= 0.6) return 3.8;
+    return 4; // keyword / alt-title hit only
   }
   deduped.sort((a, b) => {
     const ra = relevance(a.title);
@@ -400,9 +439,18 @@ export async function searchAllManga(
     const sb = sourceOrder[b.source ?? "mangahere"] ?? 99;
     return sa - sb;
   });
+  // If there's at least one solid title match (relevance <= 3), drop the pure
+  // keyword-noise tail so the user isn't shown 13 unrelated webtoons above the
+  // series they searched for.
+  // If there's a strong match (exact/prefix/contains/all-words), drop the pure
+  // keyword-noise tail (relevance 4) so the user isn't shown a wall of
+  // unrelated series above the one they searched for. Partial-word hits
+  // (3.5/3.8) are kept — they're often the right series under an alt title.
+  const hasStrong = deduped.some((m) => relevance(m.title) <= 3);
+  const ranked = hasStrong ? deduped.filter((m) => relevance(m.title) < 4) : deduped;
 
   return {
-    manga: deduped,
+    manga: ranked,
     sources: {
       mangahere: mangahere.length,
       fanfox: fanfox.length,
@@ -411,6 +459,8 @@ export async function searchAllManga(
       mangadex: mangadex.length,
       mangapill: mangapill.length,
       toonily: toonily.length,
+      comick: comick.length,
+      weebcentral: weebcentral.length,
       mal: mal.length,
       anilist: anilist.length,
     },
@@ -423,7 +473,7 @@ export async function searchAllManga(
  */
 export async function searchSingleSource(
   query: string,
-  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily",
+  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick" | "weebcentral",
   limit = 12
 ): Promise<MangadexManga[]> {
   switch (source) {
@@ -441,6 +491,10 @@ export async function searchSingleSource(
       return searchMangaPill(query, limit);
     case "toonily":
       return searchToonily(query, limit);
+    case "comick":
+      return searchComick(query, limit);
+    case "weebcentral":
+      return searchWeebCentral(query, limit);
     case "mal":
       return searchJikan(query, limit);
     case "anilist":

@@ -671,11 +671,26 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     spawnCwd = process.cwd()
   }
 
+  // Slice-only re-slices EVERY chapter (resumable via per-chapter manifest).
+  // The old flat 10-min cap silently killed the pre-slice on any large job
+  // (~1 min/chapter on 2 vCPU), so a 100-chapter run fell back to coarse
+  // full-page OCR. Scale with chapter count, min 30 min; SLICE_TIMEOUT_MS
+  // overrides. Slicing is CPU-bound and bounded, so a long ceiling is safe.
+  let sliceChapterCount = 0
+  try {
+    sliceChapterCount = (await fs.readdir(datasetDir(jobId), { withFileTypes: true }))
+      .filter((e) => e.isDirectory() && /^chapter_/i.test(e.name)).length
+  } catch {
+    // ignore — fall back to the floor below
+  }
+  const sliceTimeoutMs = Number(process.env.SLICE_TIMEOUT_MS)
+    || Math.max(30 * 60 * 1000, sliceChapterCount * 3 * 60 * 1000)
+
   const result = spawnSync(PYTHON_BIN, args, {
     cwd: spawnCwd,
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
     encoding: 'utf8',
-    timeout: 10 * 60 * 1000, // 10 min hard cap
+    timeout: sliceTimeoutMs,
   })
 
   if (result.error) {
@@ -1324,8 +1339,24 @@ async function processJob(jobId: string): Promise<void> {
     '--output', outFile,
     '--work-dir', workDir(jobId),
     '--voice', job.voice,
-    '--narration-provider', 'none',
+    // Narration rewriting. Per-job `narrate` toggle: when false the pipeline
+    // speaks the raw transcribed panel text verbatim (provider 'none'). When
+    // true (default) it uses 'auto' -> first available of OpenAI, Groq, local
+    // Ollama, so the recap gets real narration instead of OCR read aloud.
+    // NARRATION_PROVIDER env overrides the 'auto' choice but not an explicit
+    // narrate:false. The Python side guards every rewrite for faithfulness and
+    // falls back to cleaned source text if the model drifts.
+    '--narration-provider',
+    job.narrate === false ? 'none' : (process.env.NARRATION_PROVIDER || 'auto'),
     '--job-id', jobId,
+    // Reference-recap style: series title on the intro card + a small
+    // channel watermark on every frame. RECAP_WATERMARK overrides the
+    // channel name; RECAP_WATERMARK=0/none disables it.
+    '--recap-title', job.mangaTitle || 'Recap',
+    ...(() => {
+      const wm = process.env.RECAP_WATERMARK ?? 'Denji Recaps'
+      return wm && !['0', 'none', 'false'].includes(wm.toLowerCase()) ? ['--watermark', wm] : []
+    })(),
     ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--progress-file', progressFile,
     '--keep-temp',
@@ -1504,40 +1535,10 @@ async function processJob(jobId: string): Promise<void> {
 
     const outName = path.basename(outFile)
 
-    // -----------------------------
-    // YOUTUBE OPTIMIZATION — generate thumbnail + YouTube-ready encode + metadata.
-    // Runs BEFORE R2/Mega archiving because youtube_optimize.py needs the local file.
-    // -----------------------------
-    try {
-      await emitLog(jobId, 'info', 'done', 'Generating YouTube thumbnail + optimized encode...')
-      const ytScript = path.join(PROJECT_ROOT, 'pipeline', 'youtube_optimize.py')
-      const ytOutputDir = path.join(outputDir(jobId), 'youtube')
-      const ytResult = spawnSync(PYTHON_BIN, [
-        ytScript,
-        '--video', outFile,
-        '--title', job.mangaTitle,
-        '--cover', job.coverUrl || '',
-        '--chapters', String(job.totalChapters),
-        '--images', String(job.totalImages),
-        '--output-dir', ytOutputDir,
-      ], {
-        encoding: 'utf8',
-        timeout: 600000, // 10 min max for re-encode
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      })
-
-      if (ytResult.status === 0) {
-        await emitLog(jobId, 'success', 'done', 'YouTube-ready video + thumbnail + metadata generated')
-        const ytLog = (ytResult.stdout || '').split('\n').filter(l => l.includes('[YT]')).slice(-6)
-        for (const line of ytLog) {
-          await emitLog(jobId, 'info', 'done', line.replace('[YT] ', ''))
-        }
-      } else {
-        await emitLog(jobId, 'warn', 'done', `YouTube optimization failed (non-fatal): ${(ytResult.stderr || '').slice(-200)}`)
-      }
-    } catch (ytErr) {
-      await emitLog(jobId, 'warn', 'done', `YouTube optimization error (non-fatal): ${ytErr instanceof Error ? ytErr.message : ytErr}`)
-    }
+    // YouTube optimization (thumbnail + re-encode + SEO metadata) removed per
+    // user request — it roughly doubled wall time for a deliverable most jobs
+    // never use. The youtube_optimize.py script + /youtube-metadata route are
+    // left dormant so this is a one-block revert if it's wanted back.
 
     // -----------------------------
     // Reclaim disk space: intermediate work/ (sliced frames, per-panel

@@ -2,6 +2,33 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // The /api/download/[id] route does `fs.open(<db-driven path>)` — Next 16's
+  // Turbopack file-tracer can't bound that, decides the route may read ANY
+  // file under the project root, and copies ~233k files (node_modules, the
+  // whole pipeline/ tree, generated .mp4s, datasets) into .next/standalone.
+  // That turned "Finalizing page optimization" into a 6 GB, many-minute step
+  // and left the standalone dir containing the entire repo. Exclude the heavy
+  // non-code trees from every route's trace.
+  outputFileTracingExcludes: {
+    "*": [
+      "pipeline/**",
+      "mini-services/*/models/**",
+      "mini-services/*/.venv/**",
+      ".venv/**",
+      "data/**",
+      "db/**",
+      "logs/**",
+      "examples/**",
+      "agent-ctx/**",
+      "**/*.mp4",
+      "**/*.onnx",
+      "**/*.log",
+      "**/*.tar",
+      "**/*.zip",
+      ".next/cache/**",
+      "node_modules/@next/swc-*/**",
+    ],
+  },
   /* config options here */
   typescript: {
     ignoreBuildErrors: true,
