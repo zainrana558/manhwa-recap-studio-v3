@@ -410,18 +410,25 @@ export async function searchAllManga(
     mal: 9,
     anilist: 10,
   };
+  const STOP = new Set(["and", "the", "of", "a", "an", "to", "in", "vs", "or"]);
   const qNorm = normalizeTitle(query);
-  const qWords = titleWords(query);
+  const qWords = titleWords(query).filter((w) => !STOP.has(w));
   function relevance(title: string): number {
     const t = normalizeTitle(title);
     if (!qNorm) return 4;
     if (t === qNorm) return 0; // exact match (whitespace-insensitive)
     if (t.startsWith(qNorm) || qNorm.startsWith(t)) return 1; // one is a prefix of the other
     if (t.includes(qNorm) || qNorm.includes(t)) return 2; // one contains the other
-    // every query word appears somewhere in the title (any order) — e.g.
-    // "nan hao and shang feng" vs an alt title "Nan Hao & Shang Feng: ..."
-    const tw = new Set(titleWords(title));
-    if (qWords.length >= 2 && qWords.every((w) => tw.has(w))) return 3;
+    // every meaningful query word appears in the title (any order), ignoring
+    // stopwords — "nan hao AND shang feng" still matches "Nán Hào Shàng Fēng".
+    const tw = new Set(titleWords(title).filter((w) => !STOP.has(w)));
+    if (qWords.length >= 2 && qWords.every((w) => tw.has(w))) {
+      // reward tighter matches: title has no extra words -> rank just below "contains"
+      return tw.size <= qWords.length + 2 ? 3 : 3.5;
+    }
+    // majority of query words present -> still a real candidate, keep it visible
+    const hit = qWords.filter((w) => tw.has(w)).length;
+    if (qWords.length >= 3 && hit / qWords.length >= 0.6) return 3.8;
     return 4; // keyword / alt-title hit only
   }
   deduped.sort((a, b) => {
@@ -435,8 +442,12 @@ export async function searchAllManga(
   // If there's at least one solid title match (relevance <= 3), drop the pure
   // keyword-noise tail so the user isn't shown 13 unrelated webtoons above the
   // series they searched for.
-  const hasSolid = deduped.some((m) => relevance(m.title) <= 3);
-  const ranked = hasSolid ? deduped.filter((m) => relevance(m.title) <= 3) : deduped;
+  // If there's a strong match (exact/prefix/contains/all-words), drop the pure
+  // keyword-noise tail (relevance 4) so the user isn't shown a wall of
+  // unrelated series above the one they searched for. Partial-word hits
+  // (3.5/3.8) are kept — they're often the right series under an alt title.
+  const hasStrong = deduped.some((m) => relevance(m.title) <= 3);
+  const ranked = hasStrong ? deduped.filter((m) => relevance(m.title) < 4) : deduped;
 
   return {
     manga: ranked,
