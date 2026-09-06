@@ -723,6 +723,22 @@ export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
 export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
 # Single-box deploy: leave NEXT_PUBLIC_PIPELINE_SERVICE_URL unset so the
 # browser routes the socket through Caddy (?XTransformPort=3001).
+#
+# Write the real secret INTO .env too. pipeline-service's index.ts calls
+# loadDotenv({ override: true }) at module load, so bun's dotenv OVERWRITES
+# the value start.sh exported with whatever .env holds — and .env.example
+# ships PIPELINE_SECRET= blank. Result: pipeline-service boots with a random
+# secret that doesn't match the value baked into the browser bundle here, so
+# every live-progress socket gets 401. Keeping .env in sync closes that.
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    for _k in PIPELINE_SECRET NEXT_PUBLIC_PIPELINE_SECRET; do
+        if grep -q "^${_k}=" "$PROJECT_DIR/.env"; then
+            sed -i "s|^${_k}=.*|${_k}=${PIPELINE_SECRET}|" "$PROJECT_DIR/.env"
+        else
+            echo "${_k}=${PIPELINE_SECRET}" >> "$PROJECT_DIR/.env"
+        fi
+    done
+fi
 
 mkdir -p logs
 if [[ -f ".next/standalone/server.js" ]] \
@@ -780,6 +796,17 @@ else
                 log_warn "Caddy binary install also failed (non-critical — web traffic will use port 3000)"
         }
     fi
+fi
+
+# The caddy .deb (and the COPR rpm) ship an auto-enabled `caddy.service` that
+# binds :80 and the admin :2019 on install. That collides with the
+# `manhwa-caddy.service` STEP 8 installs (which runs our Caddyfile.prod with
+# the ?XTransformPort= routing) — manhwa-caddy then crash-loops on "address
+# already in use" and the site is served by a stock Caddy with no routing.
+# Get the distro unit out of the way before STEP 8.
+if command -v systemctl &>/dev/null; then
+    sudo systemctl disable --now caddy 2>/dev/null || true
+    sudo systemctl mask caddy 2>/dev/null || true
 fi
 
 if command -v caddy &>/dev/null; then

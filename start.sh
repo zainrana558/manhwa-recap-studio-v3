@@ -325,6 +325,22 @@ fi
 export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
 export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
 
+# Keep .env's PIPELINE_SECRET / NEXT_PUBLIC_PIPELINE_SECRET equal to the real
+# value. pipeline-service's index.ts does loadDotenv({ override: true }), so
+# bun's dotenv OVERWRITES the export above with .env's value at module load —
+# and .env.example ships those lines blank. Without this sync, pipeline-service
+# comes up with a mismatched (random) secret and rejects every socket.io
+# connection with 401. .env is gitignored, so this stays per-box.
+if [ -f "$PROJECT_DIR/.env" ]; then
+    for _k in PIPELINE_SECRET NEXT_PUBLIC_PIPELINE_SECRET; do
+        if grep -q "^${_k}=" "$PROJECT_DIR/.env"; then
+            sed -i "s|^${_k}=.*|${_k}=${PIPELINE_SECRET}|" "$PROJECT_DIR/.env"
+        else
+            echo "${_k}=${PIPELINE_SECRET}" >> "$PROJECT_DIR/.env"
+        fi
+    done
+fi
+
 # mini-services/pipeline-service/lib.ts computes
 # `PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd()` at MODULE
 # LOAD TIME (a top-level const). pipeline-service's own index.ts does try

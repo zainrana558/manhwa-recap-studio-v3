@@ -40,7 +40,14 @@
 # situation is left alone rather than restructured; the --no-deps
 # treatment above is scoped specifically to not make it worse by adding
 # a second `opencv-python` on top for RapidOCR's sake too.
-onnxruntime==1.29.0
+# Range, not an exact pin: `onnxruntime==1.29.0` was uninstallable from PyPI
+# (real max is 1.23.2) — it only ever "worked" on one box that had a
+# 1.29.0 build from a non-PyPI source, and `pip install -r` failed outright
+# on every clean checkout (x86 or ARM, py3.10 or py3.11). A clean py3.10
+# venv (Ubuntu 22.04) resolves this to 1.23.2; py3.11+ can go higher. The
+# ORT inference API RapidOCR/the bubble detector use is stable across this
+# whole range.
+onnxruntime>=1.22.0,<1.30.0
 omegaconf==2.3.1
 colorlog==6.12.0
 pyclipper==1.4.0
