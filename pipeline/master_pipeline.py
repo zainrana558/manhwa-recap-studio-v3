@@ -43,10 +43,12 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from collections import Counter
@@ -191,6 +193,18 @@ MAX_FRAMES_PER_PANEL = 4  # Cap frames per source panel (prevents overslicing ta
 # leaves more true-peak headroom before YouTube's own normalization kicks in.
 TARGET_LOUDNESS_LUFS = -16
 BGM_DUCK_DB = -18  # BGM sidechain-ducked by 18dB when voice is active
+
+# edge-tts throttle-wave tracking. Microsoft rate-limits a datacenter IP
+# after sustained heavy use — "No audio was received" arrives in waves
+# lasting hours. Each failed segment otherwise burns ~13-15s (2 attempts x
+# edge-tts's own long internal timeouts) before falling to Piper. When
+# failures cluster past a threshold, skip edge-tts entirely for a cooldown
+# and go straight to Piper (those segments were heading there anyway), then
+# re-probe once the cooldown lapses. Thread-safe: the prewarm pool is 2-way.
+_EDGE_TTS_WAVE = {"consec_fail": 0, "skip_until": 0.0}
+_EDGE_TTS_WAVE_LOCK = threading.Lock()
+_EDGE_TTS_WAVE_THRESHOLD = int(os.environ.get("RECAP_EDGE_TTS_WAVE_THRESHOLD", "6"))
+_EDGE_TTS_WAVE_COOLDOWN = float(os.environ.get("RECAP_EDGE_TTS_WAVE_COOLDOWN", "150"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3135,6 +3149,122 @@ def _generate_ui_card_scroll_frames(crop, num_scroll_frames: int = 4) -> List["I
     return scroll_frames
 
 
+def _content_bbox_corner_floodfill(img_bgr, tol=16, keep_thresh=0.985, min_keep_frac=0.4):
+    """Corner-seeded, fixed-range flood-fill margin trim. See _compose_canvas
+    for the full history/validation notes -- this is the core algorithm,
+    kept separate so it can be unit-tested on its own.
+
+    Returns (x0, y0, x1, y1) -- always a valid box within the image, even on
+    degenerate input (falls back to the whole image rather than raising).
+    """
+    import cv2
+    import numpy as np
+
+    if img_bgr is None or img_bgr.size == 0:
+        h, w = (0, 0) if img_bgr is None else img_bgr.shape[:2]
+        return 0, 0, w, h
+    if img_bgr.ndim == 2:
+        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+    h, w = img_bgr.shape[:2]
+    if h == 0 or w == 0:
+        return 0, 0, w, h
+
+    # margin mask: flood-fill from small zones near each of the 4 corners
+    # only (not the full border -- see history note above), fixed-range
+    # (each pixel compared to its OWN seed's color, not its neighbor's, so
+    # it can't leak arbitrarily far through a smooth gradient the way a
+    # relative flood-fill was found to when this was first tried).
+    smoothed = cv2.medianBlur(img_bgr, 5)
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    flood_img = smoothed.copy()
+    loDiff = upDiff = (tol, tol, tol)
+    zx = max(12, int(w * 0.08))
+    zy = max(12, int(h * 0.08))
+    zx, zy = min(zx, w // 2 or 1), min(zy, h // 2 or 1)
+
+    # Anchor each corner zone to the exact corner pixel's own color, and only
+    # seed from points that still match it. FIXED_RANGE compares every filled
+    # pixel to *its own seed's* color, not to the true corner -- so without
+    # this gate, a seed a few pixels into the zone that happens to land on a
+    # same-colored-but-unrelated flat UI element (e.g. a translator's caption
+    # box whose edge sits inside the zone) becomes its own valid reference
+    # point and floods that entire element as "margin". Confirmed on a real
+    # webtoon page: a caption box's left edge sat at x=40 inside a zx=64
+    # corner zone, a seed landed on the box's own black fill, and the flood
+    # ate the box's internal padding right up to its first line of text.
+    # Requiring color-continuity back to the literal corner pixel closes
+    # this without weakening genuine margins, which by definition are
+    # uniform all the way into the corner (so every candidate seed still
+    # passes trivially).
+    corner_anchor = {
+        'tl': smoothed[0, 0].astype(np.int16),
+        'tr': smoothed[0, w - 1].astype(np.int16),
+        'bl': smoothed[h - 1, 0].astype(np.int16),
+        'br': smoothed[h - 1, w - 1].astype(np.int16),
+    }
+
+    def _matches_anchor(x, y, corner_key):
+        return int(np.abs(smoothed[y, x].astype(np.int16) - corner_anchor[corner_key]).max()) <= tol
+
+    seeds = set()
+    for x in range(0, zx, max(1, zx // 6)):
+        if _matches_anchor(x, 0, 'tl'):
+            seeds.add((x, 0))
+        if _matches_anchor(w - 1 - x, 0, 'tr'):
+            seeds.add((w - 1 - x, 0))
+        if _matches_anchor(x, h - 1, 'bl'):
+            seeds.add((x, h - 1))
+        if _matches_anchor(w - 1 - x, h - 1, 'br'):
+            seeds.add((w - 1 - x, h - 1))
+    for y in range(0, zy, max(1, zy // 6)):
+        if _matches_anchor(0, y, 'tl'):
+            seeds.add((0, y))
+        if _matches_anchor(0, h - 1 - y, 'bl'):
+            seeds.add((0, h - 1 - y))
+        if _matches_anchor(w - 1, y, 'tr'):
+            seeds.add((w - 1, y))
+        if _matches_anchor(w - 1, h - 1 - y, 'br'):
+            seeds.add((w - 1, h - 1 - y))
+    for (x, y) in seeds:
+        if 0 <= x < w and 0 <= y < h and mask[y + 1, x + 1] == 0:
+            cv2.floodFill(flood_img, mask, (x, y), (0, 0, 0), loDiff, upDiff,
+                          flags=4 | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE | (255 << 8))
+    m = mask[1:-1, 1:-1]
+
+    is_margin = m > 0
+    row_frac = is_margin.mean(axis=1)
+    col_frac = is_margin.mean(axis=0)
+
+    y0 = 0
+    while y0 < h and row_frac[y0] >= keep_thresh:
+        y0 += 1
+    y1 = h
+    while y1 > y0 and row_frac[y1 - 1] >= keep_thresh:
+        y1 -= 1
+    x0 = 0
+    while x0 < w and col_frac[x0] >= keep_thresh:
+        x0 += 1
+    x1 = w
+    while x1 > x0 and col_frac[x1 - 1] >= keep_thresh:
+        x1 -= 1
+
+    # degenerate collapse (uniform image, or trim met itself) -- no
+    # reliable content signal at all; keep the whole image rather than let
+    # the min-size backstop re-center around a collapsed coordinate
+    if x0 >= x1 or y0 >= y1:
+        return 0, 0, w, h
+
+    min_w, min_h = max(1, int(w * min_keep_frac)), max(1, int(h * min_keep_frac))
+    if x1 - x0 < min_w:
+        cx = (x0 + x1) // 2
+        x0, x1 = max(0, cx - min_w // 2), min(w, cx + min_w // 2)
+    if y1 - y0 < min_h:
+        cy = (y0 + y1) // 2
+        y0, y1 = max(0, cy - min_h // 2), min(h, cy + min_h // 2)
+
+    return x0, y0, x1, y1
+
+
 def _compose_canvas(crop):
     """Composite `crop` onto a 1920x1080 canvas with a blurred, cover-fit
     copy of the same panel as the background (instead of plain black bars).
@@ -3148,34 +3278,53 @@ def _compose_canvas(crop):
     from PIL import Image, ImageFilter
     import numpy as np
 
-    # Trim white borders from the crop (manhwa pages have white margins)
-    crop_arr = np.array(crop)
-    gray = np.mean(crop_arr, axis=2)
-    h, w = gray.shape
+    # Trim margin from the crop -- corner-seeded, fixed-range flood-fill,
+    # not a plain brightness threshold. Replaces an earlier per-row/column
+    # "% non-white" trim that only handled flat WHITE margins and had no
+    # defense against a piece of real content merely touching an edge.
+    #
+    # Stress-tested (session of 2026-09-05) across 8 real webtoon panel
+    # types (bubbles top+bottom, diagonal composition, borderless/full-bleed,
+    # dark-gradient margin, dense multi-bubble, low-contrast white-on-white,
+    # outbound content escaping a border, plain white margin) plus crash/
+    # degenerate inputs (corrupt file, grayscale, all-black/white, 1x1,
+    # zero-height) and adversarial synthetic cases -- zero cut-throughs in
+    # any of them after two real bugs were found and fixed:
+    #   1. Seeding from the FULL border let a piece of CONTENT that merely
+    #      touches one edge (e.g. a shirt touching the bottom of a
+    #      bust-shot) get flood-filled as "margin" from its own
+    #      border-touching pixels -- confirmed to cut ~300px into a real
+    #      shirt before this fix. Now seeds only from small zones near each
+    #      of the 4 corners (a real margin that surrounds content typically
+    #      extends into the corners; content that merely touches the middle
+    #      of one edge does not).
+    #   2. A fully uniform image (all-black/white, or otherwise
+    #      indistinguishable from its own border) made the independent
+    #      per-axis shrink loops collapse to a corner instead of the center;
+    #      now explicitly detected and treated as "keep the whole image."
+    # One known, accepted limit: a single flat-color block touching all 4
+    # corners can't be told apart from a real margin by color alone (proven
+    # by direct counter-example -- the identical pattern is CORRECT when the
+    # roles are reversed, i.e. real content centered on a dark background,
+    # which is a common composition). Verified rare in practice; this
+    # function's input already comes from _detect_page_panels' bubble/panel
+    # detection above, which is the real safety net for that case -- this
+    # trim only ever shaves further margin off an already-content-safe box.
+    #
+    # IMPORTANT: must only ever receive a single already-detected panel, not
+    # an arbitrary raw strip window -- confirmed during testing that feeding
+    # it a region spanning two unrelated panels produces a technically
+    # "correct" (nothing cut) but useless result mixing both together. That
+    # is a scope contract of the caller, not something this function can
+    # detect on its own.
+    cw0, ch0 = crop.size
+    if cw0 > 0 and ch0 > 0:
+        import cv2
 
-    # A row/column counts as real content only if a meaningful FRACTION of
-    # its pixels are non-white, not merely one. Using np.any() here let a
-    # single stray pixel -- e.g. JPEG compression-ringing noise in an
-    # otherwise blank webtoon margin, which real exported pages always
-    # have -- flag the entire row as "content" and defeat the trim, so a
-    # large near-white gutter margin survived uncut into the final frame
-    # (the visible white gap in the bad output). 1% is a deliberately
-    # small majority-style threshold: real content (text, line art) lights
-    # up far more than 1% of a row/column's pixels, while margin noise
-    # from compression artifacts does not.
-    NON_WHITE_ROW_FRACTION = 0.01
-    non_white_rows = (gray < 240).mean(axis=1) > NON_WHITE_ROW_FRACTION
-    non_white_cols = (gray < 240).mean(axis=0) > NON_WHITE_ROW_FRACTION
-    rows = np.where(non_white_rows)[0]
-    cols = np.where(non_white_cols)[0]
-
-    if len(rows) > 10 and len(cols) > 10:
-        top = max(0, rows[0] - 5)
-        bot = min(h, rows[-1] + 5)
-        left = max(0, cols[0] - 5)
-        right = min(w, cols[-1] + 5)
-        if (bot - top) > 20 and (right - left) > 20:
-            crop = crop.crop((left, top, right, bot))
+        img_bgr = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2BGR)
+        x0, y0, x1, y1 = _content_bbox_corner_floodfill(img_bgr)
+        if (x1 - x0) > 20 and (y1 - y0) > 20:
+            crop = crop.crop((x0, y0, x1, y1))
 
     cw, ch = crop.size
 
@@ -4159,7 +4308,14 @@ def _prewarm_segment_audio(cfg: "PipelineConfig", chapter: "Chapter", segments: 
         todo.append((tag, text))
     if len(todo) < 2:
         return
-    workers = max(2, min(int(os.environ.get("RECAP_TTS_WORKERS", "4")), len(todo)))
+    # Default lowered 4 -> 2 to match this box's 2 vCPUs: 4 concurrent
+    # edge-tts connections (each its own asyncio event loop in a thread)
+    # competing with ffmpeg/PaddleOCR on 2 cores was the leading suspect for
+    # the ~1-in-2-chapters "No audio was received" failures observed on a
+    # 100-chapter run (load averaged 5.5-5.9 throughout render) -- fewer
+    # concurrent connections means less scheduler contention locally AND
+    # less chance of tripping Microsoft's endpoint-side throttling.
+    workers = max(2, min(int(os.environ.get("RECAP_TTS_WORKERS", "2")), len(todo)))
 
     def _one(item):
         try:
@@ -4218,7 +4374,13 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     word_boundaries = []  # type: list
 
     async def _run_edge_tts():
-        communicate = edge_tts.Communicate(text, voice, rate="+5%")
+        # Cap the per-attempt wait: a successful synth streams in ~1-2s, so
+        # 8s connect / 15s receive never bites a real success but stops a
+        # rejected/hung connection from burning edge-tts's 10s/60s defaults
+        # (the difference between a ~6s failed attempt and a ~30-60s one
+        # during a throttle wave).
+        communicate = edge_tts.Communicate(
+            text, voice, rate="+5%", connect_timeout=8, receive_timeout=15)
         submaker = edge_tts.SubMaker()
         with open(raw_path, "wb") as f:
             async for chunk in communicate.stream():
@@ -4243,23 +4405,62 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
             srt_path.write_text(srt_text, encoding="utf-8")
             vtt_path.write_text(_srt_to_vtt(srt_text), encoding="utf-8")
 
-    try:
-        asyncio.run(_run_edge_tts())
-        if not raw_path.exists() or raw_path.stat().st_size < 100:
-            raise RuntimeError("edge-tts produced empty or invalid audio file")
-        raw_dur = get_audio_duration(raw_path)
-        fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
-        seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
-        run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-af", seg_af, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
-        if not _audio_qa(tmp_path, allow_silence=False):
-            raise RuntimeError("edge-tts output failed audio QA")
-        os.replace(tmp_path, final_path)
-        return final_path, False, (word_boundaries or None)
-    except Exception as e:
-        failures.append(f"edge-tts: {e}")
-        log.warning("[%s] edge-tts failed for segment %s (%s) — attempting Piper ONNX fallback", chapter.tag, tag, e)
-    finally:
-        raw_path.unlink(missing_ok=True)
+    # edge-tts's "No audio was received" / connection-drop failures are
+    # usually transient (a flaky websocket round-trip to Microsoft's
+    # endpoint, more so under the CPU contention 4-way concurrent synthesis
+    # puts on a small 2-vCPU box) rather than a real reason to give up on
+    # edge-tts's much better voice quality + word-boundary timestamps.
+    # 1 retry with a short backoff recovers most of these before falling
+    # through to the Piper ONNX cascade, which loses the word-boundary sync
+    # data entirely. Observed on a 100-chapter run: ~1 edge-tts failure per
+    # 2 chapters, all currently falling back to Piper on the first miss.
+    EDGE_TTS_ATTEMPTS = 2
+    # Throttle-wave short-circuit: if edge-tts has been failing in a cluster,
+    # don't even attempt it — go straight to Piper for the cooldown window.
+    with _EDGE_TTS_WAVE_LOCK:
+        _wave_active = time.time() < _EDGE_TTS_WAVE["skip_until"]
+    for attempt in range(1, EDGE_TTS_ATTEMPTS + 1):
+        if _wave_active:
+            failures.append("edge-tts: skipped (throttle-wave cooldown -> Piper)")
+            break
+        try:
+            word_boundaries.clear()
+            asyncio.run(_run_edge_tts())
+            if not raw_path.exists() or raw_path.stat().st_size < 100:
+                raise RuntimeError("edge-tts produced empty or invalid audio file")
+            raw_dur = get_audio_duration(raw_path)
+            fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
+            seg_af = f"afade=t=in:st=0:d={SEGMENT_FADE_IN},afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}"
+            run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-af", seg_af, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+            if not _audio_qa(tmp_path, allow_silence=False):
+                raise RuntimeError("edge-tts output failed audio QA")
+            os.replace(tmp_path, final_path)
+            with _EDGE_TTS_WAVE_LOCK:  # success -> wave is over
+                _EDGE_TTS_WAVE["consec_fail"] = 0
+                _EDGE_TTS_WAVE["skip_until"] = 0.0
+            return final_path, False, (word_boundaries or None)
+        except Exception as e:
+            failures.append(f"edge-tts (attempt {attempt}/{EDGE_TTS_ATTEMPTS}): {e}")
+            _tripped = False
+            with _EDGE_TTS_WAVE_LOCK:
+                _EDGE_TTS_WAVE["consec_fail"] += 1
+                if (_EDGE_TTS_WAVE["consec_fail"] >= _EDGE_TTS_WAVE_THRESHOLD
+                        and _EDGE_TTS_WAVE["skip_until"] < time.time()):
+                    _EDGE_TTS_WAVE["skip_until"] = time.time() + _EDGE_TTS_WAVE_COOLDOWN
+                    _tripped = True
+            if _tripped:
+                log.warning("[%s] edge-tts throttle wave detected (%d consecutive failures) — "
+                            "routing all segments to Piper for %.0fs",
+                            chapter.tag, _EDGE_TTS_WAVE_THRESHOLD, _EDGE_TTS_WAVE_COOLDOWN)
+            if attempt < EDGE_TTS_ATTEMPTS:
+                log.info("[%s] edge-tts attempt %d/%d failed for segment %s (%s) — retrying",
+                          chapter.tag, attempt, EDGE_TTS_ATTEMPTS, tag, e)
+                time.sleep(random.uniform(0.3, 0.9) + 0.4 * attempt)
+            else:
+                log.warning("[%s] edge-tts failed for segment %s after %d attempts (%s) — attempting Piper ONNX fallback",
+                            chapter.tag, tag, EDGE_TTS_ATTEMPTS, e)
+        finally:
+            raw_path.unlink(missing_ok=True)
 
     # Fallback 1: Piper ONNX
     tmp_path.unlink(missing_ok=True)
@@ -5213,7 +5414,25 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         log.warning(
             f"Resource threshold not met at preflight: {preflight.reason} (free disk: "
             f"{preflight.free_disk_bytes / 1e9:.2f}GB, available RAM: "
-            f"{preflight.available_ram_bytes / 1e6:.0f}MB). Proceeding best-effort."
+            f"{preflight.available_ram_bytes / 1e6:.0f}MB, load avg: {preflight.load1:.1f} "
+            f"on {os.cpu_count() or '?'} cores). Proceeding best-effort."
+        )
+    elif preflight.load1 and os.cpu_count() and preflight.load1 > os.cpu_count() * 2:
+        # ResourceGuard deliberately does NOT gate/wait on load average the
+        # way it does disk and RAM (see production.py) — on a small
+        # always-on box the load here is mostly the pipeline's OWN work
+        # (ffmpeg + PaddleOCR + concurrent TTS), not a competing external
+        # process, so "pause until it drops" would just stall every
+        # chapter for the full max_wait_sec with nothing ever recovering.
+        # Just surface it: sustained load this high (observed 5.5-5.9 on a
+        # 2-vCPU box during a 100-chapter run) is the most likely cause of
+        # edge-tts's "No audio was received" failures (event-loop/socket
+        # servicing starved past its own timeout) -- see the retry added in
+        # synthesize_segment_audio, which is the actual mitigation.
+        log.warning(
+            f"Sustained high CPU load at preflight: {preflight.load1:.1f} avg on "
+            f"{os.cpu_count()} cores -- expect more edge-tts timeouts than usual "
+            f"(auto-retried, falls back to Piper ONNX)."
         )
 
     chapters = discover_chapters(cfg)

@@ -273,8 +273,12 @@ class H(BaseHTTPRequestHandler):
                 if not (fp.startswith(os.path.abspath(os.path.join(HERE, "..", "_serve"))) and os.path.isfile(fp)):
                     return self._send(404, "no")
                 sz = os.path.getsize(fp)
+                ct = {".mp4": "video/mp4", ".webm": "video/webm", ".jpg": "image/jpeg",
+                      ".png": "image/png"}.get(os.path.splitext(fp)[1].lower(),
+                                               "application/octet-stream")
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", ct)
+                self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Length", str(sz))
                 self.end_headers()
                 if self.command != "HEAD":

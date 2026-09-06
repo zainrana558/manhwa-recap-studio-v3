@@ -12,6 +12,7 @@ Port: 3002
 import os
 import signal
 import sys
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Prevent OpenMP and C++ thread collisions & PIR interpreter SIGSEGV
@@ -669,6 +670,54 @@ def _is_dict_word(w):
     return wl in ("a", "i") or (len(wl) >= 2 and wl in _WORDCOST)
 
 
+def _load_clean_dict():
+    # type: () -> set
+    """The system spellcheck word list — clean, unlike wordninja's frequency
+    list which is polluted with glued tokens ('atleast', 'bethe') and rare
+    surnames. Used to gate word-splitting so a real merged pair is split but
+    a romanised name is not."""
+    for p in ("/usr/share/dict/american-english", "/usr/share/dict/words"):
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                d = {ln.strip().lower() for ln in f
+                     if ln.strip().isalpha() and len(ln.strip()) >= 2}
+            if len(d) > 20000:
+                return d
+        except OSError:
+            continue
+    return set()
+
+
+_CLEAN_DICT = _load_clean_dict()
+# Short words the clean dict may lack but that are valid split parts.
+_SPLIT_FUNCTION_WORDS = {
+    "a", "i", "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in",
+    "is", "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
+}
+
+
+def _is_common_word(w):
+    # type: (str) -> bool
+    wl = w.lower()
+    if wl in _SPLIT_FUNCTION_WORDS:
+        return True
+    if _CLEAN_DICT:
+        return wl in _CLEAN_DICT
+    return len(wl) >= 2 and _WORDCOST.get(wl, 99.0) <= 11.0
+
+
+# Words the OCR (and its training corpus) frequently glues together, where
+# wordninja either won't split them (it has the glued form in its own list)
+# or a syllable collides with a surname. Whole-token, case-insensitive.
+_GLUED_WORDS = {
+    "atleast": "at least", "alot": "a lot", "aswell": "as well",
+    "infront": "in front", "incase": "in case", "ofcourse": "of course",
+    "eachother": "each other", "nomatter": "no matter", "thankyou": "thank you",
+    "everytime": "every time", "infact": "in fact", "aslong": "as long",
+    "atall": "at all", "bethe": "be the", "asif": "as if",
+}
+
+
 # --- OCR spelling repair + garbage denoise -------------------------------
 # Fix genuine mis-recognitions ("dunngoeoon" -> "dungeon", "absollte" ->
 # "absolute") WITHOUT paraphrasing, drop pure garbage the detector
@@ -739,6 +788,13 @@ _REAL_SHORT_WORDS = {
 _DICT_BUCKETS = {}  # len -> [candidate words], built lazily
 _SPELL_CACHE = {}
 
+# short grammatical words that are never validly said twice in a row — an
+# adjacent repeat is an OCR double-read, not emphasis
+_DEDUPE_FUNCTION_WORDS = {
+    "the", "to", "of", "and", "a", "is", "in", "it", "that", "at", "on",
+    "for", "was", "with", "his", "her", "your", "my", "be", "he", "she",
+}
+
 
 def _spell_candidates(n):
     # type: (int) -> list
@@ -754,20 +810,110 @@ def _spell_candidates(n):
     return b
 
 
-def _correct_token(tok):
-    # type: (str) -> str
+# Small (4.4M param) masked-LM, domain-fine-tuned on ~55k verified
+# narration sentences (comic-dialogue register), used ONLY to break a
+# genuine tie between two spell-correction candidates that score
+# identically by edit distance (e.g. "likes" vs "lakes" for corrupted
+# "lkes") -- something no dictionary size can resolve, since the ambiguity
+# is inherent to the edit-distance metric itself, not a coverage gap.
+# Lazily loaded so a missing/not-yet-trained checkpoint just disables this
+# one feature (falls back to the pre-existing deterministic top-1 pick)
+# instead of failing service startup.
+_MLM_MODEL_PATH = Path(__file__).parent / "models" / "ocr_correction_mlm"
+_mlm_tokenizer = None
+_mlm_model = None
+_MLM_LOAD_ATTEMPTED = False
+
+
+def _get_mlm():
+    global _mlm_tokenizer, _mlm_model, _MLM_LOAD_ATTEMPTED
+    if _MLM_LOAD_ATTEMPTED:
+        return _mlm_tokenizer, _mlm_model
+    _MLM_LOAD_ATTEMPTED = True
+    if not _MLM_MODEL_PATH.exists():
+        logger.info("OCR-correction disambiguation MLM not found at %s -- disambiguation disabled", _MLM_MODEL_PATH)
+        return None, None
+    try:
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+        tok = AutoTokenizer.from_pretrained(str(_MLM_MODEL_PATH))
+        model = AutoModelForMaskedLM.from_pretrained(str(_MLM_MODEL_PATH))
+        model.eval()
+        _mlm_tokenizer, _mlm_model = tok, model
+        logger.info("OCR-correction disambiguation MLM loaded from %s", _MLM_MODEL_PATH)
+    except Exception as e:
+        logger.warning("OCR-correction MLM failed to load (%s) -- disambiguation disabled", e)
+    return _mlm_tokenizer, _mlm_model
+
+
+def _disambiguate_tie(context_tokens, idx, candidates):
+    # type: (List[str], int, List[str]) -> Optional[str]
+    """Pick between 2 tied spell-correction candidates using the sentence
+    they actually appear in, via a masked-LM cloze prediction, instead of
+    an arbitrary (effectively random) tie-break. Returns the chosen
+    candidate's exact string (lowercase), or None if the model isn't
+    available or gives no usable signal -- callers should fall back to the
+    existing deterministic behavior in that case, never guess further."""
+    tok, model = _get_mlm()
+    if tok is None:
+        return None
+    try:
+        import torch
+        masked = list(context_tokens)
+        masked[idx] = tok.mask_token
+        sentence = " ".join(masked)
+        inputs = tok(sentence, return_tensors="pt", truncation=True, max_length=64)
+        mask_positions = (inputs.input_ids[0] == tok.mask_token_id).nonzero(as_tuple=True)[0]
+        if len(mask_positions) == 0:
+            return None
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        probs = torch.softmax(logits[0, mask_positions[0]], dim=-1)
+        scored = []
+        for c in candidates:
+            cid = tok.convert_tokens_to_ids(c.lower())
+            if cid is None or cid == tok.unk_token_id:
+                continue
+            scored.append((c.lower(), probs[cid].item()))
+        if not scored:
+            return None
+        return max(scored, key=lambda x: x[1])[0]
+    except Exception as e:
+        logger.debug("MLM disambiguation failed (%s) -- falling back", e)
+        return None
+
+
+def _correct_token(tok, context_tokens=None, idx=None):
+    # type: (str, Optional[List[str]], Optional[int]) -> str
     """Return a corrected spelling for a single OCR token, or the token
     unchanged. Only fires on a clearly non-word of length >= 5 that has a
     very close real-word neighbour — so character names and sound effects
     (no close dictionary neighbour) pass straight through. Hyphenated /
     apostrophe'd tokens (stutters "M-MOVE", compounds "LOW-TIER",
-    contractions) are left alone."""
+    contractions) are left alone.
+
+    context_tokens/idx (the full token list this token came from, and its
+    position in it) are used ONLY to break a genuine tie between two
+    similarly-scored candidates via a small masked-LM (see
+    _disambiguate_tie) — e.g. "lkes" is equidistant from both "likes" and
+    "lakes" by edit distance alone (proven: identical indel/JW scores), and
+    picking one is a coin flip without the surrounding sentence. Callers
+    that don't have context (or during tests) can omit these and get the
+    exact pre-existing single-best-candidate behavior."""
     if _rf_process is None or not _WORDCOST:
         return tok
     if "-" in tok or "'" in tok or "’" in tok:
         return tok
     core = re.sub(r"[^A-Za-z]", "", tok)
-    if len(core) < 5 or any(ch.isdigit() for ch in tok):
+    # Floor was 5 -- verified (real 4-letter substitution pairs: than/then,
+    # chat/that, ever/even, were/here, wave/gave, warm/worm, best/rest,
+    # fast/last all score indel=0.75, safely below the 0.80 gate below) that
+    # dropping to 4 doesn't let same-length substitutions merge distinct
+    # real words. It's specifically needed for a DELETION dropping a
+    # 5-letter word to 4 chars ("likes" -> "lkes", indel=0.89/jw=0.94 --
+    # comfortably clears both gates and is nothing like the substitution
+    # pairs above). Below 4, single-letter words get too ambiguous either
+    # way to risk it.
+    if len(core) < 4 or any(ch.isdigit() for ch in tok):
         return tok
     if _is_dict_word(core) or _is_probable_sfx(tok):
         return tok
@@ -776,19 +922,70 @@ def _correct_token(tok):
         cand = _SPELL_CACHE[key]
     else:
         cand = None
-        best = _rf_process.extractOne(
+        tie_candidate = None
+        # top-2, not top-1: need the runner-up to detect a genuine tie.
+        results = _rf_process.extract(
             key, _spell_candidates(len(key)),
-            scorer=_rf_Indel.normalized_similarity, score_cutoff=0.80)
-        if best:
-            w = best[0]
+            scorer=_rf_Indel.normalized_similarity, score_cutoff=0.80, limit=2)
+        if results:
+            w, indel, _score_idx = results[0]
             if abs(len(w) - len(key)) <= max(3, len(key) // 2):
-                indel = best[1]
                 jw = _rf_JW.normalized_similarity(key, w)
-                if indel >= 0.88 or (indel >= 0.80 and jw >= 0.88):
+
+                def _gate(cw, ind):
+                    # Only ever correct TO a clean-dictionary word (never to
+                    # wordninja-list junk like "muri"), and:
+                    #  - near-identical  -> typo, fix it
+                    #  - close + strong prefix match  -> OCR letter swap
+                    #  - a pure adjacent transposition ("escpae"->"escape")
+                    #  - looser, but only if the OCR token itself looks
+                    #    mangled ("dunngoeoon" - 4 vowels in a row)
+                    # A romanised name ('SUNBAE','GONGJA','JAIHUAN') sits one
+                    # substitution (indel ~0.83) from a real word but has
+                    # clean phonotactics and a non-word target -> never fires.
+                    if not _is_common_word(cw):
+                        return False
+                    jwx = _rf_JW.normalized_similarity(key, cw)
+                    transposed = (len(key) == len(cw) and sorted(key) == sorted(cw)
+                                  and 0 < sum(a != b for a, b in zip(key, cw)) <= 2)
+                    return (ind >= 0.90
+                            or (ind >= 0.86 and jwx >= 0.90)
+                            or transposed
+                            or (ind >= 0.80 and jwx >= 0.88 and _looks_corrupted(key)))
+
+                if _gate(w, indel):
                     cand = w
+                    if len(results) > 1:
+                        w2, indel2, _ = results[1]
+                        jw2 = _rf_JW.normalized_similarity(key, w2)
+                        gate2 = _gate(w2, indel2)
+                        # "tie" = both candidates clear the safety gate AND
+                        # score within 0.02 of each other (indel is 0-1) --
+                        # e.g. likes/lakes score IDENTICALLY here.
+                        if gate2 and w2.lower() != w.lower() and abs(indel - indel2) < 0.02:
+                            tie_candidate = w2
+        # A tied result is context-dependent (the same corrupted token can
+        # resolve differently in different sentences), so it must NOT go
+        # into _SPELL_CACHE the way a clean single-winner does -- caching it
+        # would freeze whichever sentence asked first as the answer for
+        # every future occurrence of this token regardless of its own
+        # context. Only cache the non-tied path.
+        if tie_candidate is not None and context_tokens is not None and idx is not None:
+            resolved = _disambiguate_tie(context_tokens, idx, [cand, tie_candidate])
+            if resolved:
+                return _apply_case(tok, core, resolved)
+            # model unavailable/inconclusive -- fall through to the
+            # deterministic top-1 below, same as if there'd been no tie
         _SPELL_CACHE[key] = cand
     if not cand:
         return tok
+    return _apply_case(tok, core, cand)
+
+
+def _apply_case(tok, core, cand):
+    # type: (str, str, str) -> str
+    """Re-apply tok's original casing (all-caps / title-case / lower) to
+    the chosen replacement word `cand`, and substitute it into `tok`."""
     if core.isupper():
         repl = cand.upper()
     elif core[:1].isupper():
@@ -802,6 +999,27 @@ _SINGLE_LETTER_RUN_RE = re.compile(
     r"(?:(?<![\w'’\-])[B-HJ-Zb-hj-z](?![\w'’\-])(?:\s+|,\s*)?){2,}")
 _SYMBOL_RUN_RE = re.compile(r"(?<![.!?])([^\w\s.!?'\"()\-’–—])\1{1,}")
 _VOWEL_RE = re.compile(r"[aeiouyAEIOUY]")
+
+
+def _looks_corrupted(s):
+    # type: (str) -> bool
+    """Heuristic: does this look like an OCR mangling rather than a clean
+    (if unfamiliar) name? Used to gate fuzzy spell-correction in the risky
+    mid-similarity band — a romanised name ('SUNBAE', 'GONGJA', 'JAIHUAN')
+    has clean phonotactics and must never be 'corrected' to a real word,
+    whereas a genuine garble ('dunngoeoon', 'absollte', 'lkes') carries a
+    visible signature."""
+    sl = re.sub(r"[^a-z]", "", s.lower())
+    if len(sl) < 4:
+        return False
+    if re.search(r"(.)\1\1", sl):                       # 3+ same char in a row
+        return True
+    if re.search(r"[aeiouy]{3,}", sl):                  # 3+ vowels in a row
+        return True
+    v = sum(c in "aeiouy" for c in sl)
+    if v / len(sl) < 0.30:                              # very consonant-heavy
+        return True
+    return False
 
 
 def _repair_and_denoise(text):
@@ -838,11 +1056,17 @@ def _repair_and_denoise(text):
     t = re.sub(r"[|_~^`<>{}\[\]\\]+", " ", t)
 
     out = []
-    for tok in t.split():
+    _tokens = t.split()
+    for _idx, tok in enumerate(_tokens):
         core = re.sub(r"[^A-Za-z0-9]", "", tok)
         if not core:
             if re.fullmatch(r"(?:\.{2,}|!+|\?+|[!?]{2,}|[-–—]+|,)", tok):
                 out.append("..." if tok.startswith("..") else tok)
+            continue
+        # ordinal ("3RD", "2ND", "1ST", "4TH") — keep intact; the "RD"/"ND"/
+        # "TH" tail would otherwise be dropped by the vowel-less-shard rule
+        if re.fullmatch(r"\d+(?:st|nd|rd|th)", core, re.IGNORECASE):
+            out.append(tok)
             continue
         # a real dictionary word is always kept as-is (protects "TOO",
         # "SEE", "ALL", "OFF" from the low-distinct-letter garbage rule).
@@ -871,7 +1095,7 @@ def _repair_and_denoise(text):
         if allcaps_panel and core.isalpha() and core.islower() and len(core) <= 6 \
                 and not _is_dict_word(core):
             continue
-        out.append(_correct_token(tok))
+        out.append(_correct_token(tok, _tokens, _idx))
 
     # a trailing junk token whose case clashes with an otherwise all-caps
     # line ("...THAT IS?  Djinni", "...HAIL!  inen") is the watermark strip /
@@ -884,6 +1108,30 @@ def _repair_and_denoise(text):
                 and not last.isupper() and not _is_dict_word(last)
                 and not _is_probable_sfx(out[-1])):
             out = out[:-1]
+
+    # mid-word case flip in an all-caps panel ("WEll" -> "WELL", "RiGHT",
+    # "iNDiViDUAL", "So" -> "SO", "oF" -> "OF"): the detector wobbled on a
+    # glyph's case, not the letter. Only when uppercase already dominates the
+    # token, so a genuine lower-case word is left alone.
+    if allcaps_panel:
+        for _k, _w in enumerate(out):
+            _wl = re.sub(r"[^A-Za-z]", "", _w)
+            if (len(_wl) >= 2 and not _w.isupper() and not _w.islower()
+                    and sum(c.isupper() for c in _wl) >= sum(c.islower() for c in _wl)
+                    and not _is_probable_sfx(_w)):
+                out[_k] = _w.upper()
+
+    # adjacent duplicate of a short function word ("TO TO THE", "OF OF THE") —
+    # an OCR double-read across a line wrap, never real emphasis for these.
+    if len(out) >= 2:
+        _deduped = [out[0]]
+        for _w in out[1:]:
+            _c = re.sub(r"[^a-z]", "", _w.lower())
+            if (_c in _DEDUPE_FUNCTION_WORDS
+                    and re.sub(r"[^a-z]", "", _deduped[-1].lower()) == _c):
+                continue
+            _deduped.append(_w)
+        out = _deduped
 
     t = " ".join(out)
     t = re.sub(r"\s+([,.!?;:])", r"\1", t)
@@ -910,27 +1158,35 @@ def _desegment_runon(text):
     if _wordninja is None or not text or not _WORDCOST:
         return text
 
-    def _cost(w):
-        return _WORDCOST.get(w.lower(), 99.0)
+    def _glued(m):
+        tok = m.group(0)
+        repl = _GLUED_WORDS.get(tok.lower())
+        if not repl or _is_probable_sfx(tok):
+            return tok
+        return repl.upper() if tok.isupper() else repl
+
+    text = re.sub(r"\b[A-Za-z]{4,}\b", _glued, text)
+
+    def _splittable_part(p, short_token):
+        # every part must be a clean-dictionary word; for a short source token
+        # (< 8 chars) also require each part to be >= 3 chars OR a function
+        # word, so a romanised name ("GARAM" -> "GAR AM", "SEOLAH" -> "SEOL
+        # AH") is never split even though its syllables are dictionary words.
+        if not _is_common_word(p):
+            return False
+        if short_token and len(p) < 3 and p.lower() not in _SPLIT_FUNCTION_WORDS:
+            return False
+        return True
 
     def _fix(m):
         tok = m.group(0)
-        if len(tok) < 5 or _is_dict_word(tok):
+        if len(tok) < 5 or _is_common_word(tok) or _is_probable_sfx(tok):
             return tok
         parts = _wordninja.split(tok)
         if len(parts) < 2 or sum(len(p) for p in parts) != len(tok):
             return tok
-        # drop a leading 1-char junk shard glued to a real word ("R"+"THIS")
-        if len(parts[0]) == 1 and parts[0].lower() not in ("a", "i") and _is_dict_word(parts[1]):
-            tok, parts = tok[1:], parts[1:]
-            if len(parts) == 1:
-                return tok
-        if not all(_is_dict_word(p) for p in parts):
-            return m.group(0)
-        # Guard against splitting a romanised NAME whose syllables happen to
-        # be rare dictionary words ("SHENYE" -> "SHE NYE", "DINGZHOU"): only
-        # split a short token when EVERY part is a genuinely common word.
-        if len(tok) < 10 and any(_cost(p) > 9.5 for p in parts):
+        short_token = len(tok) < 8
+        if not all(_splittable_part(p, short_token) for p in parts):
             return m.group(0)
         out, i = [], 0
         for p in parts:
@@ -1007,6 +1263,13 @@ def _clean_and_normalize_ocr_text(text: str) -> str:
     # "I L TAKE" / "YOU L SEE" — OCR dropped one L of "'LL"
     t = re.sub(r"\bI\s+L\b(?=\s+[A-Z])", "I'LL", t)
     t = re.sub(r"\b(You|We|They|He|She)\s+l\b(?=\s+[a-z])", r"\1'll", t)
+
+    # possessive / contraction 's split off the word by a stray space around
+    # the apostrophe ("DEMON' S" / "DRAGON 'S" -> "DEMON'S" / "DRAGON'S").
+    # Without this the orphaned "S" is swept away as a 1-char shard later.
+    t = re.sub(r"\b([A-Za-z]{2,})'\s+([Ss])\b", r"\1'\2", t)
+    t = re.sub(r"\b([A-Za-z]{2,})\s+'([Ss])\b", r"\1'\2", t)
+    t = re.sub(r"\b([A-Za-z]{2,})\s+'\s+([Ss])\b", r"\1'\2", t)
 
     return t
 

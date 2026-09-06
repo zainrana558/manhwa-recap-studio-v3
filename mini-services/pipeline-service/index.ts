@@ -686,25 +686,61 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
   const sliceTimeoutMs = Number(process.env.SLICE_TIMEOUT_MS)
     || Math.max(30 * 60 * 1000, sliceChapterCount * 3 * 60 * 1000)
 
-  const result = spawnSync(PYTHON_BIN, args, {
+  // NOTE: this used to be spawnSync, which blocks Node's single-threaded
+  // event loop for the ENTIRE slice phase (measured ~43min on a 100-chapter
+  // job) — during that window the whole web app was unreachable: every
+  // health check, /internal/start call, and Socket.IO heartbeat to the
+  // frontend went unanswered, surfacing to users as "Pipeline service
+  // unreachable" even though the service was alive and busy. Switched to
+  // async spawn (same pattern the render phase already uses below) so the
+  // event loop stays free for other jobs/requests while this one slices.
+  // Also registers into childProcesses so a slice-phase job can actually be
+  // cancelled (spawnSync offered no way to kill it mid-run).
+  let stdoutBuf = ''
+  let stderrBuf = ''
+  const child = spawn(PYTHON_BIN, args, {
     cwd: spawnCwd,
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
-    encoding: 'utf8',
-    timeout: sliceTimeoutMs,
   })
+  childProcesses.set(jobId, child)
 
-  if (result.error) {
-    await emitLog(jobId, 'error', 'slice', `Slice step failed to spawn: ${result.error.message}`)
+  let timedOut = false
+  const killTimer = setTimeout(() => {
+    timedOut = true
+    try {
+      child.kill('SIGTERM')
+      setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* ignore */ }
+      }, 3000)
+    } catch { /* ignore */ }
+  }, sliceTimeoutMs)
+
+  child.stdout?.on('data', (d) => { stdoutBuf += d.toString() })
+  child.stderr?.on('data', (d) => { stderrBuf += d.toString() })
+
+  const { code, spawnError } = await new Promise<{ code: number; spawnError?: Error }>((resolve) => {
+    child.on('exit', (c) => resolve({ code: c ?? -1 }))
+    child.on('error', (err) => resolve({ code: -1, spawnError: err }))
+  })
+  clearTimeout(killTimer)
+  childProcesses.delete(jobId)
+
+  if (spawnError) {
+    await emitLog(jobId, 'error', 'slice', `Slice step failed to spawn: ${spawnError.message}`)
     return false
   }
-  if (result.status !== 0) {
-    const tail = (result.stderr || result.stdout || '').slice(-500)
-    await emitLog(jobId, 'error', 'slice', `Slice step exited ${result.status}: ${tail}`)
+  if (timedOut) {
+    await emitLog(jobId, 'error', 'slice', `Slice step timed out after ${Math.round(sliceTimeoutMs / 1000)}s and was killed`)
+    return false
+  }
+  if (code !== 0) {
+    const tail = (stderrBuf || stdoutBuf || '').slice(-500)
+    await emitLog(jobId, 'error', 'slice', `Slice step exited ${code}: ${tail}`)
     return false
   }
 
   // Log the last few stdout lines so the user sees per-chapter frame counts.
-  const lines = (result.stdout || '').split('\n').filter((l) => l.trim()).slice(-6)
+  const lines = stdoutBuf.split('\n').filter((l) => l.trim()).slice(-6)
   for (const line of lines) {
     await emitLog(jobId, 'info', 'slice', line)
   }
@@ -737,9 +773,15 @@ async function processJob(jobId: string): Promise<void> {
   // -----------------------------
   // Phase 1: SCRAPE
   // -----------------------------
+  // error: null clears any stale message from a previous failed attempt at
+  // this job (e.g. the API route's own "Pipeline service unreachable" write,
+  // or a prior run that errored and got manually restarted) — every UI
+  // surface that renders job.error gates on status === 'error', so a stale
+  // value was invisible for as long as the job stayed healthy, but nothing
+  // was actually clearing it on this fresh start.
   await db.job.update({
     where: { id: jobId },
-    data: { status: 'scraping', stage: 'scrape', message: 'Starting scrape' },
+    data: { status: 'scraping', stage: 'scrape', message: 'Starting scrape', error: null },
   })
   await emitStatus(jobId)
   await emitLog(jobId, 'info', 'scrape', `Starting scrape for "${job.mangaTitle}"`)
@@ -938,6 +980,12 @@ async function processJob(jobId: string): Promise<void> {
   } else {
     await emitLog(jobId, 'warn', 'slice', 'Canonical frame creation failed — falling back to full-page images.')
   }
+
+  // Slicing now runs as a cancellable async spawn (was blocking spawnSync,
+  // which meant a cancel request during slice couldn't even be received
+  // until slicing finished) — check here so a cancel lands immediately
+  // instead of quietly starting the transcribe phase anyway.
+  if (cancelledJobs.has(jobId)) return
 
   // -----------------------------
   // Phase 2: TRANSCRIBE — read bubble/caption text from each panel.
@@ -1547,14 +1595,29 @@ async function processJob(jobId: string): Promise<void> {
     // (e.g. 200 chapters) these dwarf the final compressed video, so this
     // alone is the biggest single win for disk usage.
     // -----------------------------
-    for (const dir of [workDir(jobId), datasetDir(jobId)]) {
-      try {
-        await fs.rm(dir, { recursive: true, force: true })
-      } catch (e) {
-        await emitLog(jobId, 'warn', 'done', `Could not clean up ${dir}: ${e instanceof Error ? e.message : e}`)
+    // master_pipeline.py is ALWAYS invoked with --keep-temp (see `args` above)
+    // so a crashed/restarted job can resume from its own per-chapter state —
+    // that flag has never meant "keep it after success" though, since this
+    // block unconditionally deletes work/+dataset/ the moment QA passes,
+    // for every job, with no way to opt out. That's fine for normal use (a
+    // 100-chapter job's intermediates dwarf the final video) but it means
+    // there is currently NO way to inspect per-frame OCR/narration/audio
+    // after a job finishes — which is exactly what post-mortem debugging of
+    // "transcription looked off in chapter N" needs. KEEP_JOB_ARTIFACTS=1
+    // (set for one run, not a default) skips this cleanup for every job
+    // while it's set, so a deliberate debug run can be inspected afterward.
+    if (process.env.KEEP_JOB_ARTIFACTS === '1') {
+      await emitLog(jobId, 'info', 'done', 'KEEP_JOB_ARTIFACTS=1 — leaving work/dataset files in place for inspection')
+    } else {
+      for (const dir of [workDir(jobId), datasetDir(jobId)]) {
+        try {
+          await fs.rm(dir, { recursive: true, force: true })
+        } catch (e) {
+          await emitLog(jobId, 'warn', 'done', `Could not clean up ${dir}: ${e instanceof Error ? e.message : e}`)
+        }
       }
+      await emitLog(jobId, 'info', 'done', 'Cleaned up intermediate work/dataset files')
     }
-    await emitLog(jobId, 'info', 'done', 'Cleaned up intermediate work/dataset files')
 
     // -----------------------------
     // Offload the final video to Cloudflare R2, then free the local copy

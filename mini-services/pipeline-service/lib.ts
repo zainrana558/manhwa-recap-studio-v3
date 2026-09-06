@@ -144,7 +144,13 @@ const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes TTL for failure cache
 // -> "H U N T E R"), which a v3-tagged cache entry would have baked in
 // verbatim and, without this bump, kept serving forever regardless of the
 // fix.
-const OCR_TUNING_VERSION = 'v4-glyph-merge-fix'
+// v5: post-OCR text cleanup gained real word-segmentation (fixed a bug
+// where "HELLARE"/"BETHE"/"SEEMTO" were never split), a glued-misspelling
+// map ("ATLEAST" -> "AT LEAST"), all-caps mid-word case repair ("WEll" ->
+// "WELL"), adjacent-duplicate-function-word collapse, possessive rejoin
+// ("DEMON' S" -> "DEMON'S"), ordinal preservation ("3RD"), and a
+// name-safe fuzzy-correction gate (was mangling SUNBAE->SUNDAE etc).
+const OCR_TUNING_VERSION = 'v5-text-cleanup'
 
 function vlmCacheKey(imagePath: string): string {
   return crypto.createHash('sha256').update(imagePath).digest('hex').slice(0, 16)
@@ -1018,13 +1024,59 @@ export async function fetchMangaDexChapters(
   return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
 }
 
+/**
+ * Fetch with retry for MangaDex's rate limiting. MangaDex documents a hard
+ * ~5 req/s global limit and returns 429 (sometimes with a Retry-After
+ * header) when exceeded; a scrape of a long manga hits both the
+ * /at-home/server/{id} lookup and every CDN image download back-to-back
+ * with no throttling on our side, so on a 100+ chapter job this WILL
+ * happen occasionally. There was previously no retry at all — a single
+ * 429 silently dropped that chapter's images (or that one page), which
+ * "succeeded" with fewer images than the chapter actually has. Also
+ * retries plain network errors (ECONNRESET/timeouts), which the MangaDex
+ * CDN under load produces too.
+ */
+async function fetchMangaDexWithRetry(
+  url: string,
+  init: RequestInit,
+  what: string,
+  attempts = 4,
+): Promise<Response> {
+  let lastErr: unknown
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, init)
+      if (res.status === 429) {
+        const retryAfterSec = Number(res.headers.get('retry-after')) || 0
+        const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : 500 * 2 ** (i - 1)
+        if (i < attempts) {
+          await new Promise((r) => setTimeout(r, waitMs))
+          continue
+        }
+      }
+      if (!res.ok && res.status >= 500 && i < attempts) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)))
+        continue
+      }
+      return res
+    } catch (e) {
+      lastErr = e
+      if (i < attempts) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)))
+        continue
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`${what}: exhausted ${attempts} attempts`)
+}
+
 /** Fetch page image URLs for a MangaDex chapter via the at-home server API. */
 export async function fetchMangaDexChapterImages(
   _mangaSlug: string,
   chapterId: string,
 ): Promise<string[]> {
   const url = `https://api.mangadex.org/at-home/server/${chapterId}`
-  const res = await fetch(url)
+  const res = await fetchMangaDexWithRetry(url, {}, `chapter ${chapterId} image list`)
   if (!res.ok) throw new Error(`MangaDex images ${res.status} for chapter ${chapterId}`)
   const data = (await res.json()) as { baseUrl: string; chapter: { hash: string; data: string[] } }
   const images = data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`)
@@ -1036,7 +1088,11 @@ export async function fetchMangaDexChapterImages(
 
 /** Download a MangaDex CDN image — requires a mangadex.org Referer. */
 export async function downloadMangaDexImage(imageUrl: string, destPath: string): Promise<void> {
-  const res = await fetch(imageUrl, { headers: { Referer: 'https://mangadex.org/' } })
+  const res = await fetchMangaDexWithRetry(
+    imageUrl,
+    { headers: { Referer: 'https://mangadex.org/' } },
+    `image ${imageUrl}`,
+  )
   if (!res.ok) throw new Error(`MangaDex image download ${res.status}: ${imageUrl}`)
   const buf = Buffer.from(await res.arrayBuffer())
   await fs.writeFile(destPath, buf)
