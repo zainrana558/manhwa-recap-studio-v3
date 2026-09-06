@@ -42,7 +42,6 @@
 .vercel
 .yarn/*
 .z-ai-config
-.zscripts/dev.pid
 /.next/
 /.pnp
 /FETCH_HEAD
