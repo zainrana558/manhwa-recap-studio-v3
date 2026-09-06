@@ -11,13 +11,34 @@ pinned: false
 # Manhwa Recap Studio
 
 Auto-scrape manhwa/manga/webtoon chapters, transcribe panel text with
-**RapidOCR (PP-OCRv6, ONNXRuntime)** as the primary transcriptor (no API
+**RapidOCR (PP-OCRv5, ONNXRuntime)** as the primary transcriptor (no API
 keys, no PaddlePaddle framework dependency) with **PaddleOCR PP-OCRv4** as
-a fallback tier and VLM as a last resort, translate to English, and render
-a narrated recap video with text-to-speech audio. All in one Docker
-container — runs free on Hugging Face Spaces.
+a fallback tier (x86 only) and VLM as a last resort, translate to English,
+and render a narrated recap video with text-to-speech audio.
 
-## Quick Deploy (5 steps, ~15 min)
+## Self-hosting on a VM (the current production setup)
+
+This is how the project actually runs in production (Oracle Cloud VM, x86 or
+ARM). One script does everything:
+
+```bash
+git clone <this-repo-url> manhwa-recap-studio && cd manhwa-recap-studio
+SKIP_OLLAMA=1 ./setup.sh          # drop SKIP_OLLAMA on an 8GB+ box if you want local LLMs
+# paste secrets into .env (only if you want cloud VLM — the default OCR flow needs none)
+```
+
+`setup.sh` installs system packages, the Python venv (RapidOCR + optional
+PaddleOCR), Bun deps, Piper TTS, Caddy, the systemd unit, builds the Next.js
+bundle, and starts everything. It is idempotent — re-run it any time.
+
+**Moving to a fresh instance (incl. ARM):** see **[MIGRATION.md](MIGRATION.md)**.
+It covers the aarch64 specifics (PaddleOCR skipped, RapidOCR is primary) and
+what to carry over from an old box (`db/custom.db`, `data/`, `.env` secrets).
+
+The Docker / Hugging Face Spaces path below still works but is not how the
+current deployment runs.
+
+## Quick Deploy — Hugging Face Spaces (5 steps, ~15 min)
 
 See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full guide. Short version:
 

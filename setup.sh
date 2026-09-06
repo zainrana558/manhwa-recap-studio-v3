@@ -672,6 +672,15 @@ if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
 fi
 
 # FIX #4: Also generate Prisma client for pipeline-service
+# Keep pipeline-service's schema copy byte-identical to the root schema so
+# the two generated clients can never drift (a stale copy caused a
+# Job.translate default mismatch between the API and pipeline-service).
+# The root schema is the source of truth — it's the one `prisma db push`
+# above actually shaped the database from.
+if ! diff -q prisma/schema.prisma mini-services/pipeline-service/prisma/schema.prisma >/dev/null 2>&1; then
+    cp prisma/schema.prisma mini-services/pipeline-service/prisma/schema.prisma
+    log_info "Synced pipeline-service/prisma/schema.prisma from root schema"
+fi
 log_info "Running Prisma generate for pipeline-service..."
 (
     cd mini-services/pipeline-service || exit 1

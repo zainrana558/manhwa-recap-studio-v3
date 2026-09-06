@@ -45,7 +45,6 @@
 .zscripts/dev.pid
 /.next/
 /.pnp
-/Caddyfile.prod
 /FETCH_HEAD
 /build
 /chap_001.mp4
@@ -66,7 +65,9 @@ data/cache/
 dev.log
 dev.out.log
 local-*
-logs/
+# anchored to the project root — a bare "logs/" also swallowed the
+# src/app/api/jobs/[id]/logs/ route directory
+/logs/
 mini-services/pipeline-service/data/
 next-env.d.ts
 node_modules

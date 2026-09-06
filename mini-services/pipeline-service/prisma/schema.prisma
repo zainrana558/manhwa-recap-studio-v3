@@ -68,7 +68,7 @@ model Job {
   autoArchive   Boolean  @default(false) // auto-upload to cloud after render
   voice       String    @default("en-US-AndrewNeural")
   chapterLimit Int      @default(0) // 0 = all chapters
-  translate   Boolean   @default(true)
+  translate   Boolean   @default(false)
   narrate     Boolean   @default(true) // true = LLM-rewritten recap narration; false = speak the raw transcribed panel text verbatim
   bgmPath     String?   // path to background music file (relative to data/bgm/)
   useBgm      Boolean   @default(true) // whether to overlay BGM

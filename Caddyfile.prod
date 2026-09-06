@@ -2,20 +2,54 @@
 # Change :80 to your domain (e.g. recap.example.com) for auto-HTTPS
 
 :80 {
-        @pipeline {
-                path /socket.io/*
+        # socket.io live progress + pipeline-service internal API
+        @transform_port_3001 {
+                query XTransformPort=3001
         }
-        handle @pipeline {
-                reverse_proxy localhost:3001
+        handle @transform_port_3001 {
+                reverse_proxy 127.0.0.1:3001 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 
-        @internal_api {
-                path /internal/*
+        # OCR mini-service (health checks / debugging)
+        @transform_port_3002 {
+                query XTransformPort=3002
         }
-        handle @internal_api {
-                reverse_proxy localhost:3001
+        handle @transform_port_3002 {
+                reverse_proxy 127.0.0.1:3002 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 
+        # Explicit XTransformPort=3000 (Next.js) — same as the default handler
+        @transform_port_3000 {
+                query XTransformPort=3000
+        }
+        handle @transform_port_3000 {
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
+
+        # Any other XTransformPort value is refused (no arbitrary localhost ports)
+        @transform_port_blocked {
+                query XTransformPort=*
+        }
+        handle @transform_port_blocked {
+                respond "Forbidden: port not allowed" 403
+        }
+
+        # dataset-v35 slicer web UI, if running (optional)
         @slicer {
                 path /slicer /slicer/*
         }
@@ -23,7 +57,13 @@
                 reverse_proxy localhost:8899
         }
 
+        # Everything else -> Next.js
         handle {
-                reverse_proxy localhost:3000
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 }
