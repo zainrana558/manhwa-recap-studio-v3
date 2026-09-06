@@ -29,8 +29,9 @@ done.
 | Node deps | `bun install` for the app **and** `mini-services/pipeline-service` |
 | Database | `prisma db push` creates `db/custom.db` from `prisma/schema.prisma` |
 | `.env` | generated with correct absolute paths (see `.env.example` for the full list) |
-| systemd | `install-systemd.sh` → `manhwa-recap-studio.service` (reboot-survivable) |
-| Caddy | reverse proxy on :80 → :3000 / :3001 |
+| Next.js build | `bun run build` runs in setup.sh (STEP 6b) with `NEXT_PUBLIC_PIPELINE_SECRET` baked in, so systemd start is instant instead of a 15-min cold build under a timeout |
+| systemd | `install-systemd.sh` → `manhwa-recap-studio.service` (reboot-survivable, `TimeoutStartSec=1800`) |
+| Caddy | reverse proxy on :80. Routes `?XTransformPort=3001` → pipeline-service (the browser's live-progress socket.io), `?XTransformPort=3002` → OCR, everything else → Next.js |
 | Firewall | opens 22 + 80 (or 3000) via iptables |
 
 ### Models — all fetched at first run, nothing to copy
@@ -122,9 +123,16 @@ curl -s localhost:3002/health | jq        # {"state":"READY", ...}  RapidOCR up
 curl -s localhost:3001/internal/health    # ok
 curl -sI localhost:3000/ | head -1        # HTTP/1.1 200 OK
 sudo systemctl status manhwa-recap-studio # active (running), enabled
+sudo systemctl status manhwa-caddy        # active (running)
+
+# live-progress socket routes to pipeline-service (NOT Next.js) — must print 0{"sid":...
+SEC=$(cat .pipeline-secret)
+curl -s "http://localhost/?EIO=4&transport=polling&XTransformPort=3001&secret=$SEC"
 ```
 
-Then open `http://<your-ip>/` and start a job.
+Then open `http://<your-ip>/` and start a job — the progress bar and log stream
+should update in real time (if the socket check above returned HTML instead of
+`0{"sid":...`, Caddy is routing wrong — re-check `Caddyfile.prod`).
 
 ---
 

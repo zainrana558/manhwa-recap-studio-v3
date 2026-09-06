@@ -689,6 +689,49 @@ fi
 log_info "Database ready"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP 6b: Build the Next.js production bundle NOW (not on first systemd start)
+#
+# start.sh builds Next.js itself if .next/standalone/server.js is missing, but
+# on a 1-OCPU ARM box a cold `next build` (Next 16 + React 19 + Tailwind 4 +
+# ~60 Radix packages) can take 10-20 min — longer than install-systemd.sh's
+# TimeoutStartSec, so the unit would be SIGKILLed mid-build and Restart= would
+# loop it forever. Building here, before systemd is involved, means start.sh's
+# stale-build check finds a fresh bundle and skips straight to launching it.
+#
+# NEXT_PUBLIC_PIPELINE_SECRET MUST be present at build time — it is baked into
+# the browser bundle (src/lib/socket.ts) and the live-progress socket.io
+# connection is refused without it. Same .pipeline-secret file start.sh uses.
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "6b" "Building Next.js production bundle..."
+
+SECRET_FILE="$PROJECT_DIR/.pipeline-secret"
+if [[ ! -s "$SECRET_FILE" ]]; then
+    head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    log_info "Generated .pipeline-secret"
+fi
+export PIPELINE_SECRET="$(cat "$SECRET_FILE")"
+export NEXT_PUBLIC_PIPELINE_SECRET="$PIPELINE_SECRET"
+# Single-box deploy: leave NEXT_PUBLIC_PIPELINE_SERVICE_URL unset so the
+# browser routes the socket through Caddy (?XTransformPort=3001).
+
+mkdir -p logs
+if [[ -f ".next/standalone/server.js" ]] \
+   && [[ "$(cat .next/standalone/.build-commit 2>/dev/null)" == "$(git rev-parse HEAD 2>/dev/null)" ]]; then
+    log_info "Next.js bundle already current — skipping build"
+else
+    bun run build 2>&1 | tee logs/nextjs-build.log | tail -8
+    if [[ ${PIPESTATUS[0]} -eq 0 && -f ".next/standalone/server.js" ]]; then
+        mkdir -p .next/standalone
+        git rev-parse HEAD 2>/dev/null > .next/standalone/.build-commit || true
+        log_info "Next.js production bundle built"
+    else
+        log_error "Next.js build FAILED — full log at logs/nextjs-build.log"
+        log_error "The stack can still start (start.sh retries the build), but fix this before relying on the web UI."
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 7: Caddy Reverse Proxy
 # ═══════════════════════════════════════════════════════════════════════════════
 log_step 7 "Setting up Caddy reverse proxy..."
@@ -747,9 +790,13 @@ log_step 8 "Installing systemd services..."
 # when referenced), and also create it even without systemd
 
 # ── Create production Caddyfile (plain :80, no env var syntax) ──
-# FIX #5: Added WebSocket support headers for socket.io
-# FIX #15: Removed port 3000 from external access since Next.js binds to 0.0.0.0
-# but Caddy handles external traffic on port 80
+# Route by the ?XTransformPort=NNNN query param, NOT by path. The browser
+# socket.io client (src/lib/socket.ts) connects with `path: "/"` and
+# `query: { XTransformPort: "3001" }` — it never requests "/socket.io/*",
+# so an earlier path-based rule (@pipeline { path /socket.io/* }) never
+# matched and every live-progress socket fell through to Next.js on :3000,
+# leaving the UI on its 5 s REST-poll fallback instead of real-time. This
+# is the same routing as the known-good Caddyfile.oracle.
 if [[ -n "$CADDY_BIN" && -x "$CADDY_BIN" ]]; then
     CADDY_ENABLED=true
     cat > Caddyfile.prod << 'CPFEEOF'
@@ -757,22 +804,69 @@ if [[ -n "$CADDY_BIN" && -x "$CADDY_BIN" ]]; then
 # Change :80 to your domain (e.g. recap.example.com) for auto-HTTPS
 
 :80 {
-        @pipeline {
-                path /socket.io/*
+        # socket.io live progress + pipeline-service internal API
+        @transform_port_3001 {
+                query XTransformPort=3001
         }
-        handle @pipeline {
-                reverse_proxy localhost:3001
+        handle @transform_port_3001 {
+                reverse_proxy 127.0.0.1:3001 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 
-        @internal_api {
-                path /internal/*
+        # OCR mini-service (health checks / debugging)
+        @transform_port_3002 {
+                query XTransformPort=3002
         }
-        handle @internal_api {
-                reverse_proxy localhost:3001
+        handle @transform_port_3002 {
+                reverse_proxy 127.0.0.1:3002 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 
+        # Explicit XTransformPort=3000 (Next.js) — same as the default handler
+        @transform_port_3000 {
+                query XTransformPort=3000
+        }
+        handle @transform_port_3000 {
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
+
+        # Any other XTransformPort value is refused (no arbitrary localhost ports)
+        @transform_port_blocked {
+                query XTransformPort=*
+        }
+        handle @transform_port_blocked {
+                respond "Forbidden: port not allowed" 403
+        }
+
+        # dataset-v35 slicer web UI, if running (optional)
+        @slicer {
+                path /slicer /slicer/*
+        }
+        handle @slicer {
+                reverse_proxy localhost:8899
+        }
+
+        # Everything else -> Next.js
         handle {
-                reverse_proxy localhost:3000
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
         }
 }
 CPFEEOF

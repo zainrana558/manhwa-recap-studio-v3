@@ -58,9 +58,11 @@ ExecStart=/bin/bash -c 'bash start.sh && exec tail -f /dev/null'
 ExecStop=/bin/bash -c 'pkill -f "watchdog.sh" || true; fuser -k 3000/tcp 2>/dev/null || true; fuser -k 3002/tcp 2>/dev/null || true; pkill -f "pipeline-service" || true; pkill -f "index.ts" || true; pkill -f "uvicorn main:app" || true'
 Restart=on-failure
 RestartSec=15
-# Give start.sh room: it installs system packages / downloads models on a
-# cold first run, which can take a few minutes.
-TimeoutStartSec=600
+# Give start.sh room: on a cold first run it may still download models and
+# (if setup.sh's STEP 6b was skipped) build the Next.js bundle, which on a
+# 1-OCPU ARM box can take 15-20 min. setup.sh normally pre-builds so start.sh
+# just relaunches, but this timeout covers the case where it didn't.
+TimeoutStartSec=1800
 
 [Install]
 WantedBy=multi-user.target
