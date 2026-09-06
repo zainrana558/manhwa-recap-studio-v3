@@ -274,7 +274,19 @@ fi
 # RapidOCR auto-downloads these from modelscope.cn on first init; this
 # pre-fetch just makes a cold first request fast and survives a flaky
 # mirror. If it fails the service still starts (falls back to stock v6).
-RAPIDOCR_MODELS_DIR="$PROJECT_DIR/.venv/lib/python3.11/site-packages/rapidocr/models"
+# The venv's python minor version is not fixed (3.10 on the old x86 box,
+# 3.12 on Ubuntu 24.04 ARM) — resolve the site-packages path instead of
+# hardcoding python3.11, which silently made this whole pre-fetch a no-op
+# on any other interpreter.
+RAPIDOCR_MODELS_DIR="$(
+    "$PROJECT_DIR/.venv/bin/python3" - <<'PY' 2>/dev/null || true
+import os, importlib.util
+spec = importlib.util.find_spec("rapidocr")
+if spec and spec.submodule_search_locations:
+    print(os.path.join(list(spec.submodule_search_locations)[0], "models"))
+PY
+)"
+RAPIDOCR_MODELS_DIR="${RAPIDOCR_MODELS_DIR:-$PROJECT_DIR/.venv/lib/python3.11/site-packages/rapidocr/models}"
 if [ -d "$RAPIDOCR_MODELS_DIR" ] && [ ! -s "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx" ]; then
     echo "  Pre-fetching RapidOCR PP-OCRv5 mobile models..."
     set +e

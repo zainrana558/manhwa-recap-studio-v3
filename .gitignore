@@ -33,6 +33,7 @@
 .DS_Store
 .claude
 .env*
+!.env.example
 .pipeline-secret
 .pnp.*
 .pnpm-debug.log*

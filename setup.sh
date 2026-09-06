@@ -77,6 +77,23 @@ detect_os() {
 OS=$(detect_os)
 log_info "Detected OS: $OS"
 
+# ── CPU architecture ─────────────────────────────────────────────────────────
+# aarch64 (Oracle Ampere A1 "Always Free", AWS Graviton, Raspberry Pi, Apple
+# Silicon under Linux) has NO prebuilt wheel for paddlepaddge==2.6.2 /
+# paddleocr==2.9.1 anywhere on PyPI — that whole fallback OCR tier simply
+# cannot be installed there. RapidOCR (onnxruntime, pure ONNX) is the PRIMARY
+# OCR engine and works fine on ARM, and mini-services/paddleocr-service/main.py
+# already degrades gracefully to "RapidOCR only" when PaddleOCR is absent
+# (_recompute_service_state: the service is READY as long as ONE engine works).
+# So on ARM we install everything EXCEPT the two paddle packages and treat
+# their absence as expected, not a failure.
+ARCH="$(uname -m)"
+IS_ARM=false
+case "$ARCH" in
+    aarch64|arm64) IS_ARM=true ;;
+esac
+log_info "CPU architecture: $ARCH$( $IS_ARM && echo '  (ARM — PaddleOCR fallback tier will be skipped, RapidOCR is primary)')"
+
 # ── Package manager detection ─────────────────────────────────────────────────
 is_deb=false
 
@@ -217,70 +234,90 @@ fi
 export PATH="$HOME/.bun/bin:$PATH"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3: Ollama + Local LLMs
+# STEP 3: Ollama + Local LLMs   (OPTIONAL — skip with SKIP_OLLAMA=1)
 # ═══════════════════════════════════════════════════════════════════════════════
+# Ollama is ONLY used for (a) VLM panel transcription when no cloud VLM key is
+# set and (b) narration rewriting when --narration-provider ollama. The
+# production recap flow this box runs uses per-frame RapidOCR transcription +
+# --narration-provider none, so Ollama is not on the critical path. llava:7b +
+# llama3.2:3b are ~7 GB on disk and llava needs ~6 GB RAM to run — too heavy
+# for a 6 GB "Always Free" ARM box. Set SKIP_OLLAMA=1 to skip it entirely
+# (recommended on small ARM instances; use a free GEMINI_API_KEY in .env for
+# VLM transcription instead). Auto-skips on ARM boxes with < 8 GB RAM.
 log_step 3 "Installing Ollama + local LLM models..."
 
-if command -v ollama &>/dev/null; then
-    log_info "Ollama already installed: $(ollama --version 2>/dev/null | head -1)"
-else
-    log_info "Downloading Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-    log_info "Ollama installed"
+_TOTAL_RAM_MB=$(LC_ALL=C free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+_TOTAL_RAM_MB="${_TOTAL_RAM_MB:-0}"
+if [[ "${SKIP_OLLAMA:-0}" != "1" ]] && $IS_ARM && [[ "$_TOTAL_RAM_MB" -lt 8000 ]]; then
+    log_warn "ARM box with ${_TOTAL_RAM_MB}MB RAM — auto-skipping Ollama (too little RAM for llava:7b)."
+    log_warn "  Set a free GEMINI_API_KEY in .env for VLM transcription, or re-run with SKIP_OLLAMA=0 to force."
+    SKIP_OLLAMA=1
 fi
 
-# Start Ollama service if not running
-if ! pgrep -x ollama &>/dev/null; then
-    if command -v systemctl &>/dev/null; then
-        sudo systemctl start ollama 2>/dev/null || {
+if [[ "${SKIP_OLLAMA:-0}" == "1" ]]; then
+    log_info "STEP 3 skipped (SKIP_OLLAMA=1) — no local LLMs. VLM transcription will need a cloud key (GEMINI_API_KEY etc.) in .env."
+else
+    if command -v ollama &>/dev/null; then
+        log_info "Ollama already installed: $(ollama --version 2>/dev/null | head -1)"
+    else
+        log_info "Downloading Ollama..."
+        curl -fsSL https://ollama.com/install.sh | sh
+        log_info "Ollama installed"
+    fi
+
+    # Start Ollama service if not running
+    if ! pgrep -x ollama &>/dev/null; then
+        if command -v systemctl &>/dev/null; then
+            sudo systemctl start ollama 2>/dev/null || {
+                ollama serve >/dev/null 2>&1 &
+                sleep 5
+            }
+        else
             ollama serve >/dev/null 2>&1 &
             sleep 5
-        }
+        fi
+        # Wait for Ollama to be ready
+        for i in $(seq 1 10); do
+            ollama list &>/dev/null && break
+            sleep 2
+        done
+        log_info "Ollama service started"
     else
-        ollama serve >/dev/null 2>&1 &
-        sleep 5
+        log_info "Ollama service already running"
     fi
-    # Wait for Ollama to be ready
-    for i in $(seq 1 10); do
-        ollama list &>/dev/null && break
-        sleep 2
+
+    # Helper: check if a specific Ollama model tag is already pulled
+    # FIX #3: Use exact tag match instead of loose base-name grep
+    ollama_has_model() {
+        local model="$1"
+        ollama list 2>/dev/null | awk '{print $1}' | grep -qxF "$model"
+    }
+
+    # Pull vision model (for panel text transcription)
+    log_info "Pulling vision model: $OLLAMA_VISION_MODEL (this may take a few minutes on first run)..."
+    if ollama_has_model "$OLLAMA_VISION_MODEL"; then
+        log_info "Vision model '$OLLAMA_VISION_MODEL' already pulled"
+    else
+        ollama pull "$OLLAMA_VISION_MODEL" && \
+            log_info "Vision model '$OLLAMA_VISION_MODEL' ready" || \
+            log_warn "Failed to pull vision model — run later: ollama pull $OLLAMA_VISION_MODEL"
+    fi
+
+    # Pull text model (for narrative rewriting)
+    log_info "Pulling text model: $OLLAMA_TEXT_MODEL..."
+    if ollama_has_model "$OLLAMA_TEXT_MODEL"; then
+        log_info "Text model '$OLLAMA_TEXT_MODEL' already pulled"
+    else
+        ollama pull "$OLLAMA_TEXT_MODEL" && \
+            log_info "Text model '$OLLAMA_TEXT_MODEL' ready" || \
+            log_warn "Failed to pull text model — run later: ollama pull $OLLAMA_TEXT_MODEL"
+    fi
+
+    log_info "Ollama models ready:"
+    ollama list 2>/dev/null | tail -n +2 | while read -r line; do
+        log_info "  $line"
     done
-    log_info "Ollama service started"
-else
-    log_info "Ollama service already running"
 fi
-
-# Helper: check if a specific Ollama model tag is already pulled
-# FIX #3: Use exact tag match instead of loose base-name grep
-ollama_has_model() {
-    local model="$1"
-    ollama list 2>/dev/null | awk '{print $1}' | grep -qxF "$model"
-}
-
-# Pull vision model (for panel text transcription)
-log_info "Pulling vision model: $OLLAMA_VISION_MODEL (this may take a few minutes on first run)..."
-if ollama_has_model "$OLLAMA_VISION_MODEL"; then
-    log_info "Vision model '$OLLAMA_VISION_MODEL' already pulled"
-else
-    ollama pull "$OLLAMA_VISION_MODEL" && \
-        log_info "Vision model '$OLLAMA_VISION_MODEL' ready" || \
-        log_warn "Failed to pull vision model — run later: ollama pull $OLLAMA_VISION_MODEL"
-fi
-
-# Pull text model (for narrative rewriting)
-log_info "Pulling text model: $OLLAMA_TEXT_MODEL..."
-if ollama_has_model "$OLLAMA_TEXT_MODEL"; then
-    log_info "Text model '$OLLAMA_TEXT_MODEL' already pulled"
-else
-    ollama pull "$OLLAMA_TEXT_MODEL" && \
-        log_info "Text model '$OLLAMA_TEXT_MODEL' ready" || \
-        log_warn "Failed to pull text model — run later: ollama pull $OLLAMA_TEXT_MODEL"
-fi
-
-log_info "Ollama models ready:"
-ollama list 2>/dev/null | tail -n +2 | while read -r line; do
-    log_info "  $line"
-done
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 4: Python Virtual Environment + ML Dependencies
@@ -390,8 +427,22 @@ pip install -r pipeline/requirements.txt 2>&1 | tail -5
 # mini-services/paddleocr-service/requirements.txt, so this only needs to
 # add rapidocr itself, --no-deps, on top of that.
 # ═══════════════════════════════════════════════════════════════════════════════
-log_info "Installing OCR service dependencies (RapidOCR PP-OCRv6 + PaddleOCR PP-OCRv4 fallback)..."
-pip install -r mini-services/paddleocr-service/requirements.txt 2>&1 | tail -5
+if $IS_ARM; then
+    # No paddlepaddle/paddleocr wheels exist for linux-aarch64. Installing the
+    # requirements file verbatim makes pip's resolver fail the WHOLE file
+    # (onnxruntime, fastapi, wordninja, ... all skipped) over those two lines,
+    # which would take RapidOCR down too. Install everything EXCEPT the two
+    # paddle lines instead.
+    log_info "Installing OCR service dependencies (ARM: RapidOCR PP-OCRv5 only — PaddleOCR fallback tier unavailable on aarch64)..."
+    _arm_req="$(mktemp)"
+    grep -viE '^[[:space:]]*(paddleocr|paddlepaddle)([[:space:]=<>!~]|$)' \
+        mini-services/paddleocr-service/requirements.txt > "$_arm_req"
+    pip install -r "$_arm_req" 2>&1 | tail -5
+    rm -f "$_arm_req"
+else
+    log_info "Installing OCR service dependencies (RapidOCR PP-OCRv5 primary + PaddleOCR PP-OCRv4 fallback)..."
+    pip install -r mini-services/paddleocr-service/requirements.txt 2>&1 | tail -5
+fi
 pip install --no-deps rapidocr==3.9.2 2>&1 | tail -3
 
 # FIX #14: Verify critical imports
@@ -412,16 +463,30 @@ else
 fi
 
 log_info "Verifying OCR engines..."
-if python3 -c "
+# RapidOCR is the PRIMARY engine and must import on every platform — a failure
+# here is fatal. PaddleOCR is the fallback tier and is simply absent on ARM
+# (see the ARM note in STEP 4 above); main.py's _recompute_service_state()
+# keeps the service READY on RapidOCR alone, so a missing PaddleOCR is only
+# fatal on x86 where it is expected to be present.
+if ! python3 -c "
 import rapidocr; print(f'  rapidocr: {rapidocr.__version__ if hasattr(rapidocr, \"__version__\") else \"installed\"}')
+print('  RapidOCR (primary OCR engine) importable OK')
+"; then
+    log_error "RapidOCR import verification FAILED — check the output above"
+    log_error "You may need to run: source $PYTHON_VENV/bin/activate && pip install --no-deps rapidocr==3.9.2"
+    exit 1
+fi
+if $IS_ARM; then
+    log_warn "PaddleOCR fallback tier skipped on ARM (no aarch64 wheel) — RapidOCR + Tesseract cover OCR here"
+elif python3 -c "
 import paddleocr; print(f'  paddleocr: {paddleocr.__version__}')
 import paddle; print(f'  paddlepaddle: {paddle.__version__}')
-print('  Both OCR engines importable OK')
+print('  PaddleOCR fallback tier importable OK')
 "; then
     log_info "OCR engines verified successfully (RapidOCR primary, PaddleOCR fallback)"
 else
-    log_error "OCR engine import verification FAILED — check the output above"
-    log_error "You may need to run: source $PYTHON_VENV/bin/activate && pip install -r mini-services/paddleocr-service/requirements.txt && pip install --no-deps rapidocr==3.9.2"
+    log_error "PaddleOCR fallback import verification FAILED on x86 (it should be present here) — check the output above"
+    log_error "You may need to run: source $PYTHON_VENV/bin/activate && pip install -r mini-services/paddleocr-service/requirements.txt"
     exit 1
 fi
 
