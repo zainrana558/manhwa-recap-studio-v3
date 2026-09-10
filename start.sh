@@ -178,125 +178,15 @@ fi
 
 echo ""
 
-# --- Comic text/bubble detector (ogkalu/comic-text-and-bubble-detector,
-#     RT-DETR-v2) ---
-# See the TEXT_DETECTOR_MODEL_ID comment in pipeline/master_pipeline.py
-# for the full reasoning (replaced an earlier Manga109-only YOLO model
-# after real jobs kept showing the same caption-fragmentation bug despite
-# downstream patches -- this one is trained on Manga/Webtoon/Manhua/
-# Western comics specifically, with "Tall Webtoons split vertically" as
-# an explicit training step). Apache-2.0, ~170MB. Downloaded via
-# huggingface_hub's snapshot_download (not a single curl -- unlike the
-# YOLO .pt file this replaces, an RT-DETR-v2 checkpoint loaded through
-# transformers needs the whole HF repo structure: config.json, weights,
-# and the image processor's preprocessor_config.json, not one file) into
-# this venv's own huggingface-hub/transformers install (already listed
-# in pipeline/requirements.txt -- if this venv predates that addition,
-# rerun `pip install -r pipeline/requirements.txt` first or this
-# download step will fail with an import error, which is caught and
-# degrades gracefully below same as any other failure mode here).
-# Purely additive either way: if this download fails, is skipped, or the
-# venv doesn't have transformers yet, the pipeline silently falls back to
-# its pre-existing pixel-only content mask (logged once, not an error) --
-# same "degrade, don't crash" pattern as the Piper download above.
-TEXT_DETECTOR_DIR="$PROJECT_DIR/pipeline/models/comic-text-and-bubble-detector"
-if [ ! -d "$TEXT_DETECTOR_DIR" ] || [ -z "$(ls -A "$TEXT_DETECTOR_DIR" 2>/dev/null)" ]; then
-    echo "  Downloading comic text/bubble detector (RT-DETR-v2)..."
-    mkdir -p "$TEXT_DETECTOR_DIR"
-    # Capturing output to a variable first, THEN checking $? explicitly,
-    # rather than `if cmd | tail -5; then` -- without `set -o pipefail`
-    # (not set in this script), that pattern's exit status is tail's, not
-    # the python command's, and tail virtually always succeeds reading
-    # piped input regardless of the upstream failing. Confirmed directly:
-    # a deliberately-failing command through that exact pattern still
-    # printed "reported success". Would have meant a failed download
-    # always printed the ✅ success line and left a broken, empty model
-    # directory for the pipeline to trip over later with no clue why.
-    #
-    # `set +e` / `set -e` bracket this specific command: confirmed
-    # directly that a bare `VAR=$(failing_command)` assignment is NOT
-    # exempt from this script's `set -e` (unlike being part of an
-    # if-condition or && / || chain) -- it aborts the whole script right
-    # at that line, before DOWNLOAD_STATUS is ever read, which would
-    # have been the exact same class of `set -e` bug found and fixed
-    # earlier in this same script's kill_service()/kill_port() functions
-    # and the Next.js readiness check.
-    set +e
-    # Fetch only what the pipeline uses: the ~11MB INT8 ONNX (fast onnxruntime
-    # path, _get_text_detector_onnx) + the config/preprocessor + safetensors
-    # (torch fallback, _get_text_detector). Skip the two big redundant ONNX
-    # exports (detector.onnx ~168MB, detector_int8.onnx ~44MB).
-    DOWNLOAD_OUTPUT=$("$PROJECT_DIR/.venv/bin/python3" -c "
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id='ogkalu/comic-text-and-bubble-detector', local_dir='$TEXT_DETECTOR_DIR',
-                  ignore_patterns=['detector.onnx', 'detector_int8.onnx'])
-" 2>&1)
-    DOWNLOAD_STATUS=$?
-    set -e
-    if [ $DOWNLOAD_STATUS -eq 0 ]; then
-        echo "  ✅ Comic text/bubble detector downloaded"
-    else
-        echo "  ⚠️  Comic text/bubble detector download failed (missing transformers/huggingface_hub in the venv, or a network issue) — falling back to pixel-only panel/caption detection"
-        echo "$DOWNLOAD_OUTPUT" | tail -5
-        rm -rf "$TEXT_DETECTOR_DIR"
-    fi
-else
-    echo "  ✅ Comic text/bubble detector already present: $TEXT_DETECTOR_DIR"
-fi
-
-# --- Manga panel detector (YOLO26-nano fine-tuned on Manga109-s, ONNX,
-# Apache-2.0, ~10MB). Primary panel splitter for reference-style framing
-# (pipeline/master_pipeline.py::_detect_page_panels). Single-file curl, not
-# snapshot_download — it's one small .onnx. Degrades to flood-fill panel
-# detection if absent, same "degrade, don't crash" pattern as above.
-PANEL_YOLO_DIR="$PROJECT_DIR/pipeline/models/manga-panel-yolo"
-PANEL_YOLO_FILE="$PANEL_YOLO_DIR/manga_panel_detector_fp32_1024.onnx"
-if [ ! -s "$PANEL_YOLO_FILE" ]; then
-    echo "  Downloading manga panel detector (YOLO26n ONNX, ~10MB)..."
-    mkdir -p "$PANEL_YOLO_DIR"
-    set +e
-    curl -fsSL -m 120 -o "$PANEL_YOLO_FILE" \
-        "https://huggingface.co/mednasserallah/manga-panel-detector-yolo26n-onnx/resolve/main/manga_panel_detector_fp32_1024.onnx"
-    if [ $? -eq 0 ] && [ -s "$PANEL_YOLO_FILE" ]; then
-        echo "  ✅ Manga panel detector downloaded"
-    else
-        echo "  ⚠️  Manga panel detector download failed — falling back to flood-fill panel detection"
-        rm -f "$PANEL_YOLO_FILE"
-    fi
-    set -e
-else
-    echo "  ✅ Manga panel detector already present: $PANEL_YOLO_FILE"
-fi
-
-# --- RapidOCR PP-OCRv5 mobile models (det ~5MB + EN rec ~8MB). PRIMARY OCR
-# recognition path — picked by a hand-transcribed bake-off over PP-OCRv6 /
-# PP-OCRv4 (see mini-services/paddleocr-service/main.py::_init_rapidocr).
-# RapidOCR auto-downloads these from modelscope.cn on first init; this
-# pre-fetch just makes a cold first request fast and survives a flaky
-# mirror. If it fails the service still starts (falls back to stock v6).
-# The venv's python minor version is not fixed (3.10 on the old x86 box,
-# 3.12 on Ubuntu 24.04 ARM) — resolve the site-packages path instead of
-# hardcoding python3.11, which silently made this whole pre-fetch a no-op
-# on any other interpreter.
-RAPIDOCR_MODELS_DIR="$(
-    "$PROJECT_DIR/.venv/bin/python3" - <<'PY' 2>/dev/null || true
-import os, importlib.util
-spec = importlib.util.find_spec("rapidocr")
-if spec and spec.submodule_search_locations:
-    print(os.path.join(list(spec.submodule_search_locations)[0], "models"))
-PY
-)"
-RAPIDOCR_MODELS_DIR="${RAPIDOCR_MODELS_DIR:-$PROJECT_DIR/.venv/lib/python3.11/site-packages/rapidocr/models}"
-if [ -d "$RAPIDOCR_MODELS_DIR" ] && [ ! -s "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx" ]; then
-    echo "  Pre-fetching RapidOCR PP-OCRv5 mobile models..."
-    set +e
-    RO_BASE="https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv5"
-    curl -fsSL -m 120 -o "$RAPIDOCR_MODELS_DIR/ch_PP-OCRv5_det_mobile.onnx" "$RO_BASE/det/ch_PP-OCRv5_det_mobile.onnx" \
-      && curl -fsSL -m 120 -o "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx" "$RO_BASE/rec/en_PP-OCRv5_rec_mobile.onnx" \
-      && echo "  ✅ RapidOCR PP-OCRv5 models pre-fetched" \
-      || { echo "  ⚠️  PP-OCRv5 pre-fetch failed — RapidOCR will retry at init, or fall back to stock v6"; \
-           rm -f "$RAPIDOCR_MODELS_DIR/ch_PP-OCRv5_det_mobile.onnx" "$RAPIDOCR_MODELS_DIR/en_PP-OCRv5_rec_mobile.onnx"; }
-    set -e
+# --- Pipeline + OCR models (one source of truth: pipeline/fetch_models.sh) ---
+# Downloads the comic text/bubble detector, manga panel detector, speech-bubble
+# + anime-face no-cut detectors, the Piper voice, and pre-fetches RapidOCR
+# PP-OCRv5. Every fetch is best-effort and idempotent — a miss just leaves the
+# pipeline on its documented fallback (pixel masks / flood-fill / eSpeak / stock
+# RapidOCR v6), logged, never fatal. Optional tiers via FETCH_KOKORO / FETCH_GOT_OCR
+# / FETCH_SMOLVLM=1. setup.sh runs the same script.
+if [ -f "$PROJECT_DIR/pipeline/fetch_models.sh" ]; then
+    bash "$PROJECT_DIR/pipeline/fetch_models.sh" || echo "  ⚠️  fetch_models.sh returned nonzero — continuing (models degrade gracefully)"
 fi
 
 echo ""

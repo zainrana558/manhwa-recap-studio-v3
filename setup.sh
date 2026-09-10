@@ -552,6 +552,26 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4c: Pipeline detection + OCR models
+#
+# One source of truth (pipeline/fetch_models.sh, also called by start.sh's
+# bootstrap): comic text/bubble RT-DETR-v2, manga-panel YOLO26n, speech-bubble
+# + anime-face no-cut detectors, Piper voice, RapidOCR PP-OCRv5 pre-fetch.
+# Every fetch is idempotent + best-effort — a miss leaves the pipeline on its
+# documented fallback (pixel masks / flood-fill / eSpeak / stock RapidOCR),
+# never fatal. Optional heavy tiers: FETCH_KOKORO=1 (neural TTS),
+# FETCH_GOT_OCR=1 (local VLM OCR), FETCH_SMOLVLM=1 (local captioner).
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "4c" "Downloading pipeline detection + OCR models..."
+if [[ -f "$PROJECT_DIR/pipeline/fetch_models.sh" ]]; then
+    PIPER_VOICE_NAME="$PIPER_VOICE_NAME" bash "$PROJECT_DIR/pipeline/fetch_models.sh" \
+        && log_info "Model provisioning complete" \
+        || log_warn "fetch_models.sh returned nonzero — some models missing, pipeline will use fallbacks"
+else
+    log_warn "pipeline/fetch_models.sh not found — skipping model download"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: Node.js / Bun Dependencies
 # ═══════════════════════════════════════════════════════════════════════════════
 log_step 5 "Installing Node.js/Bun dependencies..."
