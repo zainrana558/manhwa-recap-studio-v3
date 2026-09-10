@@ -1,0 +1,15 @@
+{
+  "_note": "Universal OCR fixes applied to EVERY series (data/ocr-corrections/). 'phrases' are case-insensitive whole-substring replacements applied first, longest-first; 'tokens' are word-boundary, case-preserving. 'sfx' = onomatopoeia the narration layer may drop. Per-series overrides live in <slug>.json; auto-learned candidates in <slug>.learned.jsonl (promoted at count>=3).",
+  "phrases": [
+    ["ID ON'T", "I DON'T"],
+    ["IN ASECOND", "IN A SECOND"]
+  ],
+  "tokens": {
+    "RUNAWAY": "RUN AWAY",
+    "USEIT": "USE IT",
+    "HEDISAPPEARED": "HE DISAPPEARED",
+    "INASECOND": "IN A SECOND",
+    "ISITANAGILITY": "IS IT AN AGILITY"
+  },
+  "sfx": []
+}

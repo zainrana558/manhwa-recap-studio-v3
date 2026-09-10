@@ -39,6 +39,7 @@
 .pnpm-debug.log*
 .start-services.lock
 .venv/
+pipeline/.venv-kokoro/
 .vercel
 .yarn/*
 .z-ai-config
@@ -48,7 +49,11 @@
 /build
 /chap_001.mp4
 /coverage
-/data/
+/data/*
+# ...but keep the OCR correction dictionaries + accumulated learn/exemplar
+# state (small JSONL; the parent /data/ is excluded so it must be /data/*
+# for this re-include to take effect).
+!/data/ocr-corrections/
 /db/
 /download/
 /master_merged.mp4
@@ -139,3 +144,12 @@ pipeline/training/dataset_v3/yolo_restitch/
 pipeline/training/dataset_v3/yolo_restitch_strict/
 pipeline/training/dataset_v35/_ckpt/
 Caddyfile.prod.bak
+
+# Third-party model weights — fetched on setup / hosted as Kaggle datasets,
+# never committed (baberu DINOv2 OCR ~282MB, etc.)
+/models/
+# session scratch
+/scratch_*.ts
+/scratch_*.sh
+# large generated OCR-training corpora live in Kaggle datasets, not git
+pipeline/training/ocr/_data/
