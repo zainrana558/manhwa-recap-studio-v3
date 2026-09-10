@@ -28,6 +28,7 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   toonily: "Toonily",
   comick: "Comick",
   weebcentral: "WeebCentral",
+  mgeko: "MangaGeko",
 };
 
 const STATUS_CLASSES: Record<string, string> = {

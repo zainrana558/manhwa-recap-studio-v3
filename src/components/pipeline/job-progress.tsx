@@ -19,6 +19,8 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { ChapterGrid } from "./chapter-grid";
+import { LiveFrames } from "./live-frames";
+import { PanelReview } from "./panel-review";
 import { LogStream } from "./log-stream";
 import { VideoResult } from "./video-result";
 import type { JobDetail, JobLogEntry } from "@/types/pipeline";
@@ -39,36 +41,44 @@ interface StageInfo {
 }
 
 const PIPELINE_STAGES: StageInfo[] = [
-  { key: "search", label: "Search", icon: SearchIcon },
   { key: "scrape", label: "Download", icon: ScanLine },
-  { key: "transcribe", label: "OCR", icon: FileText },
   { key: "slice", label: "Slice", icon: Scissors },
+  { key: "read", label: "Read text", icon: FileText },
+  { key: "narrate", label: "Narrate", icon: Clapperboard },
   { key: "render", label: "Render", icon: Clapperboard },
   { key: "done", label: "Done", icon: CheckCircle2 },
 ];
+
+// Human label for the fine substage tag the live socket sends.
+const SUBSTAGE_LABEL: Record<string, string> = {
+  frame: "Slicing panels",
+  ocr: "Reading panel text",
+  visual: "Describing panels",
+  tts: "Synthesising narration",
+  audio: "Building audio track",
+  encode: "Rendering video",
+  motion: "Applying camera motion",
+};
 
 function getActiveStageIndex(job: JobDetail | null): number {
   if (!job) return -1;
   if (job.status === "done") return PIPELINE_STAGES.length - 1;
   if (job.status === "error" || job.status === "cancelled") return -1;
-  const statusMap: Record<string, number> = {
-    pending: 0,
-    scraping: 1,
-    transcribing: 2,
-    rendering: 4,
-  };
+  // Prefer the fine substage, then the coarse stage, then the status.
+  const sub = job.substage || "";
+  if (sub === "frame") return 1;
+  if (sub === "ocr" || sub === "visual") return 2;
+  if (sub === "tts" || sub === "audio") return 3;
+  if (sub === "encode" || sub === "motion") return 4;
   const stageMap: Record<string, number> = {
-    search: 0,
-    scrape: 1,
-    transcribe: 2,
-    translate: 2,
-    slice: 3,
-    narrate: 4,
-    tts: 4,
-    captions: 4,
-    render: 4,
-    merge: 4,
-    bgm: 4,
+    search: 0, scrape: 0,
+    slice: 1,
+    transcribe: 2, translate: 2, captions: 2,
+    narrate: 3, tts: 3,
+    render: 4, merge: 4, bgm: 4,
+  };
+  const statusMap: Record<string, number> = {
+    pending: 0, scraping: 0, transcribing: 2, rendering: 4, merging: 4,
   };
   const stageIdx = job.stage ? (stageMap[job.stage] ?? -1) : -1;
   const statusIdx = job.status ? (statusMap[job.status] ?? -1) : -1;
@@ -104,7 +114,8 @@ export function JobProgress({ job, logs, connected, onCancel, onNewJob }: JobPro
   const isError = job.status === "error";
   const isCancelled = job.status === "cancelled";
   const isPending = job.status === "pending";
-  const isRunning = !isDone && !isError && !isCancelled;
+  const isAwaitingReview = job.status === "awaiting_review";
+  const isRunning = !isDone && !isError && !isCancelled && !isAwaitingReview;
   const isProcessing = isRunning && !isPending;
 
   return (
@@ -125,7 +136,7 @@ export function JobProgress({ job, logs, connected, onCancel, onNewJob }: JobPro
                 isProcessing && "pulse-glow border-primary/40"
               )}
             >
-              {job.status}
+              {job.status === "awaiting_review" ? "review" : job.status}
             </Badge>
             <span>·</span>
             <span>{job.totalChapters} chapters</span>
@@ -181,7 +192,7 @@ export function JobProgress({ job, logs, connected, onCancel, onNewJob }: JobPro
       <div className="p-6 rounded-xl border border-border bg-card space-y-4">
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium">
-            {isDone ? "Complete" : isError ? "Failed" : isCancelled ? "Cancelled" : isPending ? "Waiting for pipeline…" : "Processing…"}
+            {isDone ? "Complete" : isError ? "Failed" : isCancelled ? "Cancelled" : isAwaitingReview ? "Waiting for your review" : isPending ? "Waiting for pipeline…" : "Processing…"}
           </span>
           <span className="text-2xl font-bold tabular-nums text-primary">{job.progress}%</span>
         </div>
@@ -235,6 +246,20 @@ export function JobProgress({ job, logs, connected, onCancel, onNewJob }: JobPro
             );
           })}
         </div>
+
+        {isRunning && (job.message || job.substage) && (
+          <div className="flex items-center gap-2 pt-1 text-xs text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
+            <span className="truncate">
+              {job.substage && SUBSTAGE_LABEL[job.substage] ? (
+                <><span className="text-foreground/80">{SUBSTAGE_LABEL[job.substage]}</span>
+                  {job.message ? ` — ${job.message}` : ""}</>
+              ) : (
+                job.message
+              )}
+            </span>
+          </div>
+        )}
       </div>
 
       {isError && job.error && (
@@ -263,6 +288,19 @@ export function JobProgress({ job, logs, connected, onCancel, onNewJob }: JobPro
       )}
 
       {isDone && <VideoResult job={job} />}
+
+      {isAwaitingReview && (
+        <PanelReview
+          jobId={job.id}
+          onSubmitted={() => {
+            /* socket will push the status → rendering; nothing else needed */
+          }}
+        />
+      )}
+
+      {!isDone && !isError && !isAwaitingReview && (
+        <LiveFrames jobId={job.id} status={job.status} />
+      )}
 
       <div className="grid lg:grid-cols-2 gap-6">
         <div className="p-5 rounded-xl border border-border bg-card space-y-3">

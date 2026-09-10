@@ -19,6 +19,9 @@ import {
   CheckSquare,
   Square,
   Image as ImageIcon,
+  Sparkles,
+  Film,
+  Eye,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,7 +58,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [chapterLoading, setChapterLoading] = useState(true);
   const [language, setLanguage] = useState("en");
   const [chapterLimit, setChapterLimit] = useState(5);
-  const [voice, setVoice] = useState("en-US-AndrewNeural");
+  const [voice, setVoice] = useState("am_michael");
   const [groqKey, setGroqKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
   const [openRouterKey, setOpenRouterKey] = useState("");
@@ -65,7 +68,11 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [megaPassword, setMegaPassword] = useState("");
   const [autoArchive, setAutoArchive] = useState(false);
   const [translate, setTranslate] = useState(false);
-  const [narrate, setNarrate] = useState(true);
+  const [narrationStyle, setNarrationStyle] = useState<"verbatim" | "cleanup" | "recap">("verbatim");
+  const [describeVisuals, setDescribeVisuals] = useState(false);
+  const [visualProvider, setVisualProvider] = useState<"auto" | "ollama" | "groq" | "gemini" | "openrouter">("auto");
+  const [motionStyle, setMotionStyle] = useState<"none" | "kenburns">("none");
+  const [reviewPanels, setReviewPanels] = useState(false);
 
   // Chapter selection mode: "first-n" = slider, "specific" = grid picker
   const [chapterSelectionMode, setChapterSelectionMode] = useState<"first-n" | "specific">("first-n");
@@ -100,7 +107,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
         setMegaEmail(s.megaEmail ?? "");
         setMegaPassword(s.megaPassword ?? "");
         setAutoArchive(s.autoArchive ?? false);
-        setVoice(s.defaultVoice ?? "en-US-AndrewNeural");
+        setVoice(s.defaultVoice ?? "am_michael");
         setChapterLimit(s.defaultChapterLimit ?? 5);
 
         const allChapters: ChapterFeedItem[] = chaptersRes.chapters ?? [];
@@ -226,7 +233,12 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           ...chapterPayload,
           voice,
           translate,
-          narrate,
+          narrate: narrationStyle !== "verbatim",
+          narrationStyle,
+          describeVisuals,
+          visualProvider,
+          motionStyle,
+          reviewPanels,
           groqKey: groqKey || undefined,
           geminiKey: geminiKey || undefined,
           openRouterKey: openRouterKey || undefined,
@@ -249,7 +261,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
     } finally {
       setStarting(false);
     }
-  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrate, manga, onJobCreated]);
+  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrationStyle, describeVisuals, visualProvider, motionStyle, reviewPanels, manga, onJobCreated]);
 
   // --- Voice preview ---
   // Fetches a short edge-tts sample for the selected voice and plays it.
@@ -626,33 +638,111 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           )}
         </div>
 
-        {/* Narration toggle */}
-        <div className="flex items-center justify-between gap-4 p-3 rounded-lg bg-muted/50">
-          <div className="space-y-0.5">
-            <Label className="flex items-center gap-2 text-sm font-medium">
-              <Mic2 className="h-4 w-4 text-muted-foreground" />
-              Recap narration
-            </Label>
-            <p className="text-xs text-muted-foreground">
-              On: rewrite panel text into a flowing recap script. Off: speak the
-              raw transcribed dialogue and captions verbatim.
-            </p>
+        {/* Recap options — one grouped card so the screen doesn't sprawl */}
+        <div className="rounded-lg border border-border bg-muted/30 divide-y divide-border">
+          <div className="flex items-center gap-2 p-3">
+            <Sparkles className="h-4 w-4 text-muted-foreground" />
+            <span className="text-sm font-semibold">Recap options</span>
           </div>
-          <Switch checked={narrate} onCheckedChange={setNarrate} />
-        </div>
 
-        {/* Translate toggle */}
-        <div className="flex items-center justify-between gap-4 p-3 rounded-lg bg-muted/50">
-          <div className="space-y-0.5">
-            <Label className="flex items-center gap-2 text-sm font-medium">
-              <Languages className="h-4 w-4 text-muted-foreground" />
-              Auto-translate to English
-            </Label>
-            <p className="text-xs text-muted-foreground">
-              Uses Groq to translate non-English transcriptions before narration.
-            </p>
+          {/* Narration style */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="text-sm font-medium">Narration style</Label>
+              <p className="text-xs text-muted-foreground">
+                Verbatim: transcribed words as-is (no AI). Cleanup: fix OCR
+                order/typos only. Recap: rewrite into a flowing script.
+              </p>
+            </div>
+            <Select value={narrationStyle} onValueChange={(v) => setNarrationStyle(v as typeof narrationStyle)}>
+              <SelectTrigger className="w-32 shrink-0"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="verbatim">Verbatim</SelectItem>
+                <SelectItem value="cleanup">Cleanup</SelectItem>
+                <SelectItem value="recap">Recap</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-          <Switch checked={translate} onCheckedChange={setTranslate} />
+
+          {/* Visual action captioning */}
+          <div className="p-3 space-y-2">
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-0.5 min-w-0">
+                <Label className="flex items-center gap-2 text-sm font-medium">
+                  <Eye className="h-3.5 w-3.5 text-muted-foreground" />
+                  Describe visual action
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  A vision model narrates what happens in silent action panels.
+                  Needs a free Groq/Gemini key for reasonable speed — local is
+                  ~1&nbsp;min/panel without a GPU.
+                </p>
+              </div>
+              <Switch checked={describeVisuals} onCheckedChange={setDescribeVisuals} />
+            </div>
+            {describeVisuals && (
+              <div className="flex items-center justify-between gap-4 pt-1">
+                <Label className="text-xs text-muted-foreground">Vision engine</Label>
+                <Select value={visualProvider} onValueChange={(v) => setVisualProvider(v as typeof visualProvider)}>
+                  <SelectTrigger className="w-40 shrink-0"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto</SelectItem>
+                    <SelectItem value="groq">Groq (free key)</SelectItem>
+                    <SelectItem value="gemini">Gemini (free key)</SelectItem>
+                    <SelectItem value="openrouter">OpenRouter</SelectItem>
+                    <SelectItem value="ollama">Local — slow, no GPU</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
+
+          {/* Camera motion */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <Film className="h-3.5 w-3.5 text-muted-foreground" />
+                Ken Burns motion
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Off: static slideshow (fastest). On: a slow drifting-camera
+                pass over every panel — adds a second encode.
+              </p>
+            </div>
+            <Switch
+              checked={motionStyle === "kenburns"}
+              onCheckedChange={(on) => setMotionStyle(on ? "kenburns" : "none")}
+            />
+          </div>
+
+          {/* Review panels before render */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <CheckSquare className="h-3.5 w-3.5 text-muted-foreground" />
+                Review panels before rendering
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Pause after slicing so you can drop cover pages, ads and junk
+                panels. The render waits for you.
+              </p>
+            </div>
+            <Switch checked={reviewPanels} onCheckedChange={setReviewPanels} />
+          </div>
+
+          {/* Translate toggle */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <Languages className="h-3.5 w-3.5 text-muted-foreground" />
+                Auto-translate to English
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Translate non-English transcriptions before narration.
+              </p>
+            </div>
+            <Switch checked={translate} onCheckedChange={setTranslate} />
+          </div>
         </div>
 
         {/* VLM API Keys — for panel text transcription */}

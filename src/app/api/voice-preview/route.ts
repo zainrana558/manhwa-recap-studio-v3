@@ -20,8 +20,8 @@ export const maxDuration = 30;
 const PIPELINE_SERVICE_URL =
   process.env.PIPELINE_SERVICE_URL || "http://localhost:3001";
 
-// Voice IDs look like "en-US-AndrewNeural", "ja-JP-KeitaNeural", etc.
-const VOICE_ID_RE = /^[a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural$/;
+// edge-tts IDs ("en-US-AndrewNeural") or local Kokoro IDs ("am_michael", "af_bella").
+const VOICE_ID_RE = /^([a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural|[abhijpef][fm]_[a-z][a-z_]*)$/;
 
 export async function GET(req: NextRequest) {
   const voice = req.nextUrl.searchParams.get("voice");

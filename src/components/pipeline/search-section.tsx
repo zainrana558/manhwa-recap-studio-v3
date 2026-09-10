@@ -32,10 +32,16 @@ type QuickSort = "relevance" | "updated" | "followed" | "title-az";
 
 const SOURCE_FILTERS: { value: SourceFilter; label: string; color: string }[] = [
   { value: "all", label: "All Sources", color: "" },
-  { value: "mangahere", label: "MangaHere", color: "text-emerald-400" },
-  { value: "fanfox", label: "FanFox", color: "text-orange-400" },
+  { value: "mangadex", label: "MangaDex", color: "text-orange-400" },
+  { value: "mgeko", label: "MangaGeko", color: "text-teal-400" },
   { value: "webtoons", label: "Webtoons", color: "text-green-400" },
   { value: "asurascans", label: "AsuraScans", color: "text-rose-400" },
+  { value: "mangahere", label: "MangaHere", color: "text-emerald-400" },
+  { value: "fanfox", label: "FanFox", color: "text-orange-400" },
+  { value: "mangapill", label: "MangaPill", color: "text-cyan-400" },
+  { value: "toonily", label: "Toonily", color: "text-pink-400" },
+  { value: "comick", label: "Comick", color: "text-violet-400" },
+  { value: "weebcentral", label: "WeebCentral", color: "text-indigo-400" },
   { value: "mal", label: "MAL", color: "text-sky-400" },
   { value: "anilist", label: "AniList", color: "text-fuchsia-400" },
 ];
@@ -66,6 +72,7 @@ const SOURCE_BADGE_CLASSES: Record<MangaSource, string> = {
   toonily: "bg-pink-500/15 text-pink-300 border-pink-500/30",
   comick: "bg-violet-500/15 text-violet-300 border-violet-500/30",
   weebcentral: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30",
+  mgeko: "bg-teal-500/15 text-teal-300 border-teal-500/30",
 };
 
 const SOURCE_LABEL: Record<MangaSource, string> = {
@@ -80,6 +87,7 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   toonily: "Toonily",
   comick: "Comick",
   weebcentral: "WeebCentral",
+  mgeko: "MangaGeko",
 };
 
 const CONTENT_RATING_CLASSES: Record<string, string> = {
@@ -122,6 +130,12 @@ interface SourceCounts {
   fanfox: number;
   webtoons: number;
   asurascans: number;
+  mangadex: number;
+  mangapill: number;
+  toonily: number;
+  comick: number;
+  weebcentral: number;
+  mgeko: number;
   mal: number;
   anilist: number;
 }
@@ -339,27 +353,34 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     const handleSelect = useCallback(
       async (m: MangadexManga) => {
         const source = m.source ?? "mangahere";
-        if (source === "mangahere" || source === "fanfox" || source === "webtoons" || source === "asurascans") {
+        // Everything except the metadata-only catalogs (MAL / AniList) has a
+        // real chapter+image scraper — pass those straight through.
+        if (source !== "mal" && source !== "anilist") {
           onSelectManga(m);
           return;
         }
 
         setResolvingId(m.id);
         const findingToast = toast({
-          title: "Resolving on MangaHere",
-          description: `Finding on MangaHere…`,
+          title: "Resolving a scrapeable source",
+          description: `Matching "${m.title}" to a source with chapter images…`,
         });
 
         try {
-          const res = await fetch(`/api/search?q=${encodeURIComponent(m.title)}&limit=1&source=mangahere`);
-          const data = await res.json().catch(() => ({}));
-          const mdMatch: MangadexManga | undefined = (data.manga ?? [])[0];
+          // Try the sources that actually work from this host, in order.
+          let mdMatch: MangadexManga | undefined;
+          for (const s of ["mangadex", "mgeko", "mangahere", "fanfox"] as const) {
+            const r = await fetch(`/api/search?q=${encodeURIComponent(m.title)}&limit=1&source=${s}`);
+            const d = await r.json().catch(() => ({}));
+            const hit: MangadexManga | undefined = (d.manga ?? [])[0];
+            if (r.ok && hit) { mdMatch = hit; break; }
+          }
 
-          if (!res.ok || !mdMatch) {
+          if (!mdMatch) {
             findingToast.update({
               id: findingToast.id,
-              title: "Not found on MangaHere",
-              description: `Could not find on MangaHere for scraping.`,
+              title: "No scrapeable source found",
+              description: `Could not match "${m.title}" to a source with chapter images.`,
               variant: "destructive",
             });
             return;
@@ -491,7 +512,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
             </h1>
             <p className="text-muted-foreground text-base sm:text-lg max-w-2xl mx-auto leading-relaxed">
               Enter any manhwa, manga, or webtoon name. We search{" "}
-              <span className="text-foreground font-medium">6 sources at once</span>,
+              <span className="text-foreground font-medium">every source at once</span>,
               scrape every chapter, transcribe dialogue with AI, and render a narrated recap video.
             </p>
             <div className="flex items-center justify-center gap-3 text-xs text-muted-foreground/50">
@@ -960,7 +981,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
         {hasSearched && !loading && results.length > 0 && (
           <p className="text-center text-xs text-muted-foreground/60">
             {sourceCounts
-              ? `MangaHere: ${sourceCounts.mangahere} · FanFox: ${sourceCounts.fanfox} · Webtoons: ${sourceCounts.webtoons} · AsuraScans: ${sourceCounts.asurascans} · MAL: ${sourceCounts.mal} · AniList: ${sourceCounts.anilist}`
+              ? `MangaDex: ${sourceCounts.mangadex} · MangaGeko: ${sourceCounts.mgeko} · Webtoons: ${sourceCounts.webtoons} · MangaPill: ${sourceCounts.mangapill} · Comick: ${sourceCounts.comick} · MangaHere: ${sourceCounts.mangahere} · FanFox: ${sourceCounts.fanfox} · AsuraScans: ${sourceCounts.asurascans} · MAL: ${sourceCounts.mal} · AniList: ${sourceCounts.anilist}`
               : ""}{" "}
             — metadata-only results (MAL/AniList) are auto-matched to a scrapeable source on selection.
           </p>

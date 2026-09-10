@@ -9,6 +9,7 @@ import {
   searchToonily,
   searchComick,
   searchWeebCentral,
+  searchMgeko,
 } from "./scrapers";
 
 // ---------------------------------------------------------------------------
@@ -306,6 +307,7 @@ export interface MangaSearchSources {
   toonily: number;
   comick: number;
   weebcentral: number;
+  mgeko: number;
 }
 
 export interface UnifiedSearchResult {
@@ -325,7 +327,7 @@ export async function searchAllManga(
 ): Promise<UnifiedSearchResult> {
   const safeLimit = Math.min(Math.max(limit, 1), 25);
 
-  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, wcRes, malRes, alRes] = await Promise.allSettled([
+  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, wcRes, mgRes, malRes, alRes] = await Promise.allSettled([
     searchMangaHere(query, safeLimit),
     searchFanFox(query, safeLimit),
     searchWebtoons(query, safeLimit),
@@ -335,6 +337,7 @@ export async function searchAllManga(
     searchToonily(query, safeLimit),
     searchComick(query, safeLimit),
     searchWeebCentral(query, safeLimit),
+    searchMgeko(query, safeLimit),
     searchJikan(query, safeLimit),
     searchAniList(query, safeLimit),
   ]);
@@ -348,67 +351,74 @@ export async function searchAllManga(
   const toonily = tlRes.status === "fulfilled" ? tlRes.value : [];
   const comick = cmRes.status === "fulfilled" ? cmRes.value : [];
   const weebcentral = wcRes.status === "fulfilled" ? wcRes.value : [];
+  const mgeko = mgRes.status === "fulfilled" ? mgRes.value : [];
   const mal = malRes.status === "fulfilled" ? malRes.value : [];
   const anilist = alRes.status === "fulfilled" ? alRes.value : [];
 
-  // Dedupe: keep first occurrence per normalized title.
-  // Scraping sources are queried first so they win ties.
-  // Upgrade: if a later entry with the same title has a cover image but the
-  // existing one does not, replace it (so AsuraScans/MAL/AniList covers win
-  // over MangaHere/FanFox coverless results for the same title).
+  // NO cross-source hiding. Every scrapeable source that has the series gets
+  // its OWN card — the same title on mgeko (tiles), AsuraScans (tall strips)
+  // and Webtoons all show, because they scrape differently and the user picks
+  // which one to recap. We only collapse:
+  //   1. literal duplicates: the same (source, id) returned twice
+  //   2. same source + same normalized title (a source listing a series twice)
+  //   3. a MAL/AniList metadata entry whose title a real scrapeable source
+  //      already has — that card can't be scraped and adds nothing the
+  //      scrapeable card doesn't (MAL/AniList with NO scrapeable twin are
+  //      kept: handleSelect re-resolves them to a scrapeable source on click)
+  const scrapeableTitles = new Set<string>();
+  for (const m of [...mgeko, ...mangadex, ...webtoons, ...asurascans, ...mangapill,
+                   ...comick, ...weebcentral, ...toonily, ...mangahere, ...fanfox]) {
+    const k = normalizeTitle(m.title);
+    if (k) scrapeableTitles.add(k);
+  }
   const seen = new Map<string, MangadexManga>();
   for (const m of [
-    ...mangahere,
-    ...fanfox,
+    ...mgeko,
+    ...mangadex,
     ...webtoons,
     ...asurascans,
-    ...mangadex,
     ...mangapill,
-    ...toonily,
     ...comick,
     ...weebcentral,
+    ...toonily,
+    ...mangahere,
+    ...fanfox,
     ...mal,
     ...anilist,
   ]) {
     const key = normalizeTitle(m.title);
     if (!key) continue;
-    const existing = seen.get(key);
-    if (!existing) {
-      seen.set(key, m);
+    const src = m.source ?? "mangahere";
+    const isMeta = src === "mal" || src === "anilist";
+    if (isMeta && scrapeableTitles.has(key)) continue;   // redundant metadata card
+    const dedupeKey = `${src}::${m.id || key}`;
+    const perSourceTitleKey = `${src}::title::${key}`;
+    if (seen.has(dedupeKey) || seen.has(perSourceTitleKey)) {
+      const existing = seen.get(dedupeKey) ?? seen.get(perSourceTitleKey)!;
+      if (!existing.coverUrl && m.coverUrl) existing.coverUrl = m.coverUrl;
+      if (!existing.description && m.description) existing.description = m.description;
       continue;
     }
-    // Prefer an entry with a cover over one without.
-    if (!existing.coverUrl && m.coverUrl) {
-      seen.set(key, m);
-    }
+    seen.set(dedupeKey, m);
+    seen.set(perSourceTitleKey, m);
   }
-  // MAL/AniList are metadata-only catalogs — neither hosts scrapeable manga
-  // pages, so a result surviving the dedup above (i.e. no scrapeable source
-  // matched the same title) is a dead end: selecting it and starting a job
-  // always fails at the scrape phase (getSourceFromId has no mal-/anilist-
-  // case, by design — there's nothing to scrape). Scrapeable sources are
-  // deduped first (see the loop above), so any MAL/AniList entry that's
-  // *not* filtered out here already lost its slot to a real scrapeable
-  // result for the same title; this only removes the entries with no
-  // scrapeable match at all, rather than hiding MAL/AniList results wholesale.
-  const deduped: MangadexManga[] = [...seen.values()].filter(
-    (m) => m.source !== "mal" && m.source !== "anilist"
-  );
+  const deduped: MangadexManga[] = [...new Set(seen.values())];
 
   // Sort: by relevance to the query first (exact title match > starts-with >
   // contains > no match), then by source priority (scrapeable first).
   const sourceOrder: Record<string, number> = {
-    mangahere: 0,
-    fanfox: 1,
+    mgeko: 0,
+    mangadex: 1,
     webtoons: 2,
     asurascans: 3,
-    mangadex: 4,
-    mangapill: 5,
-    toonily: 6,
+    mangahere: 4,
+    fanfox: 5,
+    mangapill: 6,
     comick: 7,
     weebcentral: 8,
-    mal: 9,
-    anilist: 10,
+    toonily: 9,
+    mal: 10,
+    anilist: 11,
   };
   const STOP = new Set(["and", "the", "of", "a", "an", "to", "in", "vs", "or"]);
   const qNorm = normalizeTitle(query);
@@ -439,15 +449,10 @@ export async function searchAllManga(
     const sb = sourceOrder[b.source ?? "mangahere"] ?? 99;
     return sa - sb;
   });
-  // If there's at least one solid title match (relevance <= 3), drop the pure
-  // keyword-noise tail so the user isn't shown 13 unrelated webtoons above the
-  // series they searched for.
-  // If there's a strong match (exact/prefix/contains/all-words), drop the pure
-  // keyword-noise tail (relevance 4) so the user isn't shown a wall of
-  // unrelated series above the one they searched for. Partial-word hits
-  // (3.5/3.8) are kept — they're often the right series under an alt title.
-  const hasStrong = deduped.some((m) => relevance(m.title) <= 3);
-  const ranked = hasStrong ? deduped.filter((m) => relevance(m.title) < 4) : deduped;
+  // No hiding: every result from every source is returned. The relevance sort
+  // above already floats the real matches to the top; weaker keyword hits sit
+  // at the bottom where the source-filter chips and the eye can skip them.
+  const ranked = deduped;
 
   return {
     manga: ranked,
@@ -461,6 +466,7 @@ export async function searchAllManga(
       toonily: toonily.length,
       comick: comick.length,
       weebcentral: weebcentral.length,
+      mgeko: mgeko.length,
       mal: mal.length,
       anilist: anilist.length,
     },
@@ -473,7 +479,7 @@ export async function searchAllManga(
  */
 export async function searchSingleSource(
   query: string,
-  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick" | "weebcentral",
+  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick" | "weebcentral" | "mgeko",
   limit = 12
 ): Promise<MangadexManga[]> {
   switch (source) {
@@ -495,6 +501,8 @@ export async function searchSingleSource(
       return searchComick(query, limit);
     case "weebcentral":
       return searchWeebCentral(query, limit);
+    case "mgeko":
+      return searchMgeko(query, limit);
     case "mal":
       return searchJikan(query, limit);
     case "anilist":

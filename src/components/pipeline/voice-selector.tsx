@@ -23,6 +23,27 @@ interface VoiceGroup {
 
 const VOICE_GROUPS: VoiceGroup[] = [
   {
+    // Local Kokoro-82M — runs on the box, no network / no rate limits / one
+    // consistent voice for a whole series. IDs here must match
+    // _KOKORO_VOICE_RE in pipeline/master_pipeline.py.
+    code: "kokoro",
+    label: "Local · Kokoro (neural, offline)",
+    flag: "🖥️",
+    voices: [
+      { value: "am_michael", label: "Michael — warm US male (recommended)", gender: "male" },
+      { value: "am_onyx", label: "Onyx — deep US male", gender: "male" },
+      { value: "am_fenrir", label: "Fenrir — energetic US male", gender: "male" },
+      { value: "am_puck", label: "Puck — bright US male", gender: "male" },
+      { value: "am_adam", label: "Adam — US male", gender: "male" },
+      { value: "bm_george", label: "George — UK male, gravitas", gender: "male" },
+      { value: "bm_lewis", label: "Lewis — UK male", gender: "male" },
+      { value: "af_heart", label: "Heart — warm US female", gender: "female" },
+      { value: "af_bella", label: "Bella — expressive US female", gender: "female" },
+      { value: "af_nicole", label: "Nicole — soft US female", gender: "female" },
+      { value: "bf_emma", label: "Emma — UK female", gender: "female" },
+    ],
+  },
+  {
     code: "en-US",
     label: "English (US)",
     flag: "🇺🇸",

@@ -43,6 +43,7 @@ const STATUS_BAR_COLORS: Record<string, { bg: string; label: string }> = {
 
 const STATUS_ICON_MAP: Record<JobStatus, { color: string; bg: string }> = {
   pending: { color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20" },
+  awaiting_review: { color: "text-amber-300", bg: "bg-amber-500/10 border-amber-500/20" },
   scraping: { color: "text-amber-400", bg: "bg-amber-500/10 border-amber-500/20" },
   transcribing: { color: "text-orange-400", bg: "bg-orange-500/10 border-orange-500/20" },
   translating: { color: "text-purple-400", bg: "bg-purple-500/10 border-purple-500/20" },

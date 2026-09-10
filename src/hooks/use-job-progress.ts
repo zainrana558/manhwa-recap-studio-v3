@@ -84,6 +84,11 @@ export function useJobProgress(jobId: string | null): UseJobProgressResult {
         description: `"${job.mangaTitle}" encountered an error: ${job.error || "Unknown error"}`,
         variant: "destructive",
       });
+    } else if (status === "awaiting_review") {
+      toast({
+        title: "Panels ready for review",
+        description: `"${job.mangaTitle}" is paused — choose which panels to keep, then render.`,
+      });
     } else if (status === "cancelled") {
       toast({
         title: "Job cancelled",
@@ -194,6 +199,7 @@ export function useJobProgress(jobId: string | null): UseJobProgressResult {
               doneImages: payload.doneImages ?? prev.doneImages,
               totalImages: payload.totalImages ?? prev.totalImages,
               stage: payload.stage ?? prev.stage,
+              substage: (payload as { substage?: string }).substage ?? prev.substage ?? null,
               message: payload.message ?? prev.message,
             }
           : prev

@@ -18,7 +18,7 @@ const DEFAULTS: AppSettings = {
   r2SecretAccessKey: "",
   r2Bucket: "",
   autoArchive: false,
-  defaultVoice: "en-US-AndrewNeural",
+  defaultVoice: "am_michael",
   defaultLanguage: "en",
   defaultChapterLimit: 5,
 };

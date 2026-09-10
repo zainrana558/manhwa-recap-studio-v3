@@ -17,6 +17,7 @@ interface JobHistoryProps {
 
 const statusIcon: Record<JobStatus, typeof Clock> = {
   pending: Clock,
+  awaiting_review: Clock,
   scraping: Loader2,
   transcribing: Loader2,
   translating: Loader2,
@@ -29,6 +30,7 @@ const statusIcon: Record<JobStatus, typeof Clock> = {
 
 const statusColor: Record<JobStatus, string> = {
   pending: "text-amber-400",
+  awaiting_review: "text-amber-300",
   scraping: "text-amber-400",
   transcribing: "text-orange-400",
   translating: "text-purple-400",
@@ -41,6 +43,7 @@ const statusColor: Record<JobStatus, string> = {
 
 const statusBgColor: Record<JobStatus, string> = {
   pending: "bg-amber-500/10 border-amber-500/20",
+  awaiting_review: "bg-amber-500/10 border-amber-500/20",
   scraping: "bg-amber-500/10 border-amber-500/20",
   transcribing: "bg-orange-500/10 border-orange-500/20",
   translating: "bg-purple-500/10 border-purple-500/20",

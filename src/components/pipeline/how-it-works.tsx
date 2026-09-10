@@ -9,7 +9,7 @@ const STEPS = [
   {
     icon: Search,
     title: "Search",
-    desc: "Enter any manhwa title. We query 6 sources at once — MangaHere, FanFox, Webtoons, AsuraScans, MAL & AniList.",
+    desc: "Enter any manhwa title. We query every source at once — MangaDex, MangaGeko, Webtoons, MangaPill, Comick, MangaHere, FanFox, AsuraScans, WeebCentral, Toonily, plus MAL & AniList.",
     details: "Our parallel search engine hits all 6 manga databases simultaneously, returning results in under 5 seconds. Each source has specialized scrapers that understand the site structure.",
     duration: "~5s",
   },

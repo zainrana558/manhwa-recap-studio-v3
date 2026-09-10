@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Download, Film, CheckCircle2, Share2, Image as ImageIcon, BookOpen, Clock, Cloud, CloudUpload, Loader2, HardDrive } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { Download, Film, CheckCircle2, Share2, Image as ImageIcon, BookOpen, Clock, Cloud, CloudUpload, Loader2, HardDrive, SkipForward } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import type { JobDetail } from "@/types/pipeline";
@@ -17,6 +17,29 @@ export function VideoResult({ job }: VideoResultProps) {
   const [archiveProvider, setArchiveProvider] = useState<string | null>(
     job.archiveProvider ?? null
   );
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [chapters, setChapters] = useState<{ index: number; title: string; start: number }[]>([]);
+  const [totalDur, setTotalDur] = useState(0);
+
+  useEffect(() => {
+    fetch(`/api/jobs/${job.id}/chapters`)
+      .then((r) => r.json())
+      .then((d: { chapters?: typeof chapters; total?: number }) => {
+        if (Array.isArray(d.chapters)) setChapters(d.chapters);
+        if (typeof d.total === "number") setTotalDur(d.total);
+      })
+      .catch(() => {});
+  }, [job.id]);
+
+  const seek = (t: number) => {
+    const v = videoRef.current;
+    if (v) {
+      v.currentTime = t + 0.05;
+      void v.play().catch(() => {});
+    }
+  };
+  const fmt = (s: number) =>
+    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
   const handleShare = async () => {
     const url = `${window.location.origin}/api/download/${job.id}`;
@@ -87,6 +110,7 @@ export function VideoResult({ job }: VideoResultProps) {
       {/* Video player */}
       <div className="rounded-lg overflow-hidden bg-black border border-border">
         <video
+          ref={videoRef}
           controls
           className="w-full max-h-[480px]"
           preload="metadata"
@@ -98,6 +122,41 @@ export function VideoResult({ job }: VideoResultProps) {
           Your browser does not support the video tag.
         </video>
       </div>
+
+      {/* Chapter markers — click to jump */}
+      {chapters.length > 1 && (
+        <div className="space-y-1.5">
+          {totalDur > 0 && (
+            <div className="flex h-1.5 rounded-full overflow-hidden bg-muted">
+              {chapters.map((c, i) => {
+                const next = chapters[i + 1]?.start ?? totalDur;
+                return (
+                  <button
+                    key={c.index}
+                    onClick={() => seek(c.start)}
+                    title={`${c.title} · ${fmt(c.start)}`}
+                    style={{ width: `${((next - c.start) / totalDur) * 100}%` }}
+                    className={`h-full ${i % 2 ? "bg-primary/40" : "bg-primary/70"} hover:bg-primary transition-colors`}
+                  />
+                );
+              })}
+            </div>
+          )}
+          <div className="flex flex-wrap gap-1.5">
+            {chapters.map((c) => (
+              <button
+                key={c.index}
+                onClick={() => seek(c.start)}
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-card/60 border border-border hover:border-primary/50 hover:text-primary transition-colors"
+              >
+                <SkipForward className="h-3 w-3" />
+                {c.title}
+                <span className="text-muted-foreground tabular-nums">{fmt(c.start)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Video stats */}
       <div className="flex flex-wrap items-center gap-3">

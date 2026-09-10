@@ -63,3 +63,19 @@ function createPrismaClient(): PrismaClient {
 export const db = globalForPrisma.prisma ?? createPrismaClient()
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
+
+// Make the local SQLite connection tolerate write bursts (see F4/F5 in
+// research/overnight-bug-log.md). WAL persists on the file but busy_timeout is
+// per-connection. Fire-and-forget.
+if ((process.env.DATABASE_URL || '').startsWith('file:')) {
+  void (async () => {
+    try {
+      // $queryRawUnsafe (not $executeRawUnsafe): these PRAGMAs return a row.
+      await db.$queryRawUnsafe('PRAGMA busy_timeout = 15000')
+      await db.$queryRawUnsafe('PRAGMA journal_mode = WAL')
+      await db.$queryRawUnsafe('PRAGMA synchronous = NORMAL')
+    } catch {
+      /* non-fatal */
+    }
+  })()
+}

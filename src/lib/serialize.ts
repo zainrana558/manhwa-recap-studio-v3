@@ -102,6 +102,7 @@ export function mapJob(job: JobRow): JobDetail {
     chapterLimit: job.chapterLimit,
     translate: job.translate,
     narrate: job.narrate ?? true,
+    reviewPanels: (job as { reviewPanels?: boolean }).reviewPanels ?? false,
     bgmPath: job.bgmPath ?? null,
     useBgm: job.useBgm ?? true,
     createdAt: job.createdAt.toISOString(),

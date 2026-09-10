@@ -117,11 +117,26 @@ export async function POST(req: NextRequest) {
     const language = body.language || "en";
     const chapterLimit = Math.max(0, body.chapterLimit || 0);
     const chapterIds = body.chapterIds ?? null;
-    const voice = body.voice || "en-US-AndrewNeural";
+    // Kokoro ids (am_michael, af_bella, …) route to the local neural engine
+    // in master_pipeline.py; anything else is treated as an edge-tts id.
+    const voice = body.voice || "am_michael";
     const translate = body.translate === true;
     // Narration is on by default; pass narrate:false to speak the raw
     // transcribed panel text verbatim instead of an LLM-rewritten recap.
     const narrate = body.narrate !== false;
+    const narrationStyle = (["verbatim", "cleanup", "recap"] as const).includes(
+      body.narrationStyle as never
+    )
+      ? (body.narrationStyle as string)
+      : "verbatim";
+    const describeVisuals = body.describeVisuals === true;
+    const visualProvider = (
+      ["auto", "ollama", "groq", "gemini", "openrouter", "none"] as const
+    ).includes(body.visualProvider as never)
+      ? (body.visualProvider as string)
+      : "auto";
+    const motionStyle = body.motionStyle === "kenburns" ? "kenburns" : "none";
+    const reviewPanels = body.reviewPanels === true;
     const bgmPath = body.bgmPath ?? null;
     const useBgm = body.useBgm !== false;
 
@@ -220,6 +235,11 @@ export async function POST(req: NextRequest) {
         chapterLimit,
         translate,
         narrate,
+        narrationStyle,
+        describeVisuals,
+        visualProvider,
+        motionStyle,
+        reviewPanels,
         bgmPath,
         useBgm,
         chapters: {

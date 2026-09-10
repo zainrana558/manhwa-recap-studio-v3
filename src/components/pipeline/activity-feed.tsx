@@ -17,6 +17,7 @@ interface Activity {
 
 const STATUS_CONFIG: Record<JobStatus, { icon: typeof CheckCircle2; color: string; label: string; bg: string }> = {
   pending: { icon: Clock, color: "text-amber-400", label: "Queued", bg: "bg-amber-500/10" },
+  awaiting_review: { icon: Clock, color: "text-amber-300", label: "Review", bg: "bg-amber-500/10" },
   scraping: { icon: Loader2, color: "text-amber-400", label: "Scraping", bg: "bg-amber-500/10" },
   transcribing: { icon: Loader2, color: "text-orange-400", label: "Transcribing", bg: "bg-orange-500/10" },
   translating: { icon: Loader2, color: "text-purple-400", label: "Translating", bg: "bg-purple-500/10" },

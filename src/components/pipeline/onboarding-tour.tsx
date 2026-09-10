@@ -21,7 +21,7 @@ const STEPS: TourStep[] = [
   },
   {
     title: "Search for a Manhwa",
-    desc: "Type any title and search across 6 sources at once. Click a result to configure your video.",
+    desc: "Type any title and search every source at once. Click a result to configure your video.",
     target: "#search-input",
     icon: Search,
   },

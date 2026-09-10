@@ -3,6 +3,7 @@
 export type JobStatus =
   | "pending"
   | "scraping"
+  | "awaiting_review"
   | "transcribing"
   | "translating"
   | "rendering"
@@ -36,7 +37,8 @@ export type MangaSource =
   | "mangapill"
   | "toonily"
   | "comick"
-  | "weebcentral";
+  | "weebcentral"
+  | "mgeko";
 
 export interface MangadexManga {
   id: string;
@@ -89,6 +91,7 @@ export interface JobDetail {
   status: JobStatus;
   progress: number;
   stage: string | null;
+  substage?: string | null; // fine-grained sub-phase from live socket (frame/ocr/visual/tts/audio/encode/motion)
   message: string | null;
   totalChapters: number;
   doneChapters: number;
@@ -105,6 +108,7 @@ export interface JobDetail {
   chapterLimit: number;
   translate: boolean;
   narrate: boolean;
+  reviewPanels?: boolean;
   bgmPath: string | null;
   useBgm: boolean;
   createdAt: string;
@@ -132,7 +136,7 @@ export type ServerEvent =
   | { type: "subscribed"; jobId: string }
   | { type: "status"; job: JobDetail }
   | { type: "log"; log: JobLogEntry }
-  | { type: "progress"; jobId: string; progress: number; doneChapters: number; totalChapters: number; doneImages: number; totalImages: number; stage: string; message: string }
+  | { type: "progress"; jobId: string; progress: number; doneChapters?: number; totalChapters?: number; doneImages?: number; totalImages?: number; stage: string; substage?: string; message: string }
   | { type: "chapter"; jobId: string; chapter: ChapterInfo }
   | { type: "done"; jobId: string; outputVideo: string | null }
   | { type: "error"; jobId: string; error: string }
@@ -147,6 +151,11 @@ export interface CreateJobInput {
   voice: string;
   translate: boolean;
   narrate?: boolean;
+  narrationStyle?: "verbatim" | "cleanup" | "recap"; // default "verbatim"
+  describeVisuals?: boolean; // caption each panel's visual action, folded into narration
+  visualProvider?: "auto" | "ollama" | "groq" | "gemini" | "openrouter" | "none";
+  motionStyle?: "none" | "kenburns"; // subtle camera drift
+  reviewPanels?: boolean; // pause after slicing to drop cover/ad panels
   groqKey?: string;
   geminiKey?: string;
   openRouterKey?: string;

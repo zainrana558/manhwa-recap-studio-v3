@@ -10,6 +10,7 @@ import type { JobDetail, JobStatus } from "@/types/pipeline";
 
 const statusIcon: Record<JobStatus, typeof Clock> = {
   pending: Clock,
+  awaiting_review: Clock,
   scraping: Loader2,
   transcribing: Loader2,
   translating: Loader2,

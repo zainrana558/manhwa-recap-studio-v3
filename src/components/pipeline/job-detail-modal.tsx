@@ -18,6 +18,7 @@ interface JobDetailModalProps {
 
 const statusConfig: Record<JobStatus, { label: string; color: string; dotColor: string }> = {
   pending: { label: "Pending", color: "bg-amber-500/15 text-amber-400 border-amber-500/25", dotColor: "bg-amber-400" },
+  awaiting_review: { label: "Review", color: "bg-amber-500/15 text-amber-300 border-amber-500/25", dotColor: "bg-amber-300" },
   scraping: { label: "Scraping", color: "bg-amber-500/15 text-amber-400 border-amber-500/25", dotColor: "bg-amber-400" },
   transcribing: { label: "Transcribing", color: "bg-orange-500/15 text-orange-400 border-orange-500/25", dotColor: "bg-orange-400" },
   translating: { label: "Translating", color: "bg-purple-500/15 text-purple-400 border-purple-500/25", dotColor: "bg-purple-400" },
@@ -82,6 +83,7 @@ function ChapterStatusDot({ status }: { status: string }) {
     scraping: "bg-amber-400",
     scraped: "bg-amber-400",
     pending: "bg-muted-foreground",
+    awaiting_review: "bg-amber-400",
     error: "bg-rose-400",
     failed: "bg-rose-400",
   };

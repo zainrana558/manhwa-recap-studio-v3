@@ -22,15 +22,34 @@ import type { MangadexManga } from "@/types/pipeline";
 
 const FETCH_TIMEOUT_MS = 5_000; // 5s timeout for all external fetches
 
+// Cloudflare-fronted hosts that 403 a plain datacenter fetch on TLS/JA3
+// fingerprint (toonily / weebcentral). The pipeline-service side
+// (mini-services/pipeline-service/lib.ts) routes these through cf_fetch.py
+// (curl_cffi). Here — the Next.js search path — we can't spawn a subprocess
+// from a Turbopack-bundled route without the bundler choking on the venv
+// symlink, so the search request goes out via CF_PROXY_URL when configured
+// (a plain HTTP proxy / cf-worker), else a normal fetch (which just yields
+// fewer results for that one source — Promise.allSettled tolerates it).
+const CF_IMPERSONATE_HOSTS = /(^|\.)(toonily\.(com|me)|weebcentral\.com|comick\.io)$/i;
+const CF_PROXY_URL = process.env.CF_PROXY_URL || "";
+
 async function fetchWithTimeout(
   url: string,
   init?: RequestInit,
   timeoutMs: number = FETCH_TIMEOUT_MS
 ): Promise<Response> {
+  let target = url;
+  try {
+    if (CF_PROXY_URL && CF_IMPERSONATE_HOSTS.test(new URL(url).hostname)) {
+      target = CF_PROXY_URL.replace(/\/$/, "") + "?url=" + encodeURIComponent(url);
+    }
+  } catch {
+    /* ignore */
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(target, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -650,13 +669,19 @@ export async function searchMangaPill(
   const html = await res.text();
 
   const results: MangadexManga[] = [];
-  // MangaPill search results: <a href="/manga/{id}-{slug}" class="...">
-  const regex = /href="\/manga\/([^"]+)"[^>]*>[\s\S]*?<h3[^>]*>([^<]+)<\/h3>[\s\S]*?(?:src="([^"]+)")?/g;
+  // MangaPill search cards (2026 markup):
+  //   <a href="/manga/{numId}/{slug}" class="mb-2"> … </a>
+  //   <div class="mt-3 font-black leading-tight line-clamp-2">{Title}</div>
+  const regex =
+    /<a href="\/manga\/(\d+\/[a-z0-9-]+)"[^>]*class="mb-2"[\s\S]{0,400}?<div class="mt-3 font-black[^"]*">\s*([^<]+?)\s*<\/div>/g;
+  const seen = new Set<string>();
   let match;
   while ((match = regex.exec(html)) !== null && results.length < limit) {
     const slug = match[1];
+    if (seen.has(slug)) continue;
+    seen.add(slug);
     const title = match[2].trim();
-    const cover = match[3] || null;
+    const cover: string | null = null;
     results.push({
       id: `mp-${slug}`,
       title,
@@ -730,7 +755,8 @@ export type ScraperSource =
   | "mangapill"
   | "toonily"
   | "comick"
-  | "weebcentral";
+  | "weebcentral"
+  | "mgeko";
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mh-")) return "mangahere";
@@ -742,11 +768,12 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("tl-")) return "toonily";
   if (id.startsWith("cm-")) return "comick";
   if (id.startsWith("wc-")) return "weebcentral";
+  if (id.startsWith("mg-")) return "mgeko";
   return null;
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-)/, "");
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-|mg-)/, "");
 }
 
 export async function getChaptersForSource(
@@ -772,6 +799,8 @@ export async function getChaptersForSource(
       return getComickChapters(slug);
     case "weebcentral":
       return getWeebCentralChapters(slug);
+    case "mgeko":
+      return getMgekoChapters(slug);
   }
 }
 
@@ -799,7 +828,109 @@ export async function getImagesForSource(
       return getComickImages(slug, chapterId);
     case "weebcentral":
       return getWeebCentralImages(slug, chapterId);
+    case "mgeko":
+      return getMgekoImages(slug, chapterId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// MGEKO / MangaGeko (mgeko.cc) — large manhwa + manhua + manga aggregator,
+// plain server-rendered HTML, no Cloudflare challenge (works from a
+// datacenter IP where toonily / comick / weebcentral do not). `mg-{slug}`
+// id form. Structure:
+//   search : /search/?search={q}            -> <a href="/manga/{slug}/" title="{Title}">
+//   chaps  : /manga/{slug}/all-chapters/     -> <a href="/reader/en/{chapSlug}/">  (newest first)
+//   images : /reader/en/{chapSlug}/          -> <img src="https://imgsrv5.com/.../NN.jpg">
+// ---------------------------------------------------------------------------
+const MGEKO_BASE = "https://www.mgeko.cc";
+const MGEKO_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+export async function searchMgeko(query: string, limit = 10): Promise<MangadexManga[]> {
+  const res = await fetchWithTimeout(
+    `${MGEKO_BASE}/search/?search=${encodeURIComponent(query)}`,
+    { headers: { "User-Agent": MGEKO_UA } },
+    15000,
+  );
+  if (!res.ok) throw new Error(`Mgeko search ${res.status}`);
+  const html = await res.text();
+  const out: MangadexManga[] = [];
+  const seen = new Set<string>();
+  // <a href="/manga/{slug}/" title="{Title}"> … <img class="lazy" data-src='{cover}'>
+  const re =
+    /<a href="\/manga\/([^"/]+)\/"\s+title="([^"]+)"(?:[\s\S]{0,400}?(?:data-src|data-original|src)=['"]([^'"]+\.(?:png|jpe?g|webp))['"])?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null && out.length < limit) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    let cover: string | null =
+      m[3] && !/loading\.gif|placeholder|no-?cover|logo/i.test(m[3]) ? m[3] : null;
+    if (cover && cover.startsWith("/")) cover = `${MGEKO_BASE}${cover}`;
+    out.push({
+      id: `mg-${m[1]}`,
+      title: m[2].trim(),
+      description: "",
+      coverUrl: cover,
+      status: null,
+      year: null,
+      originalLanguage: null,
+      availableTranslatedLanguages: ["en"],
+      tags: [],
+      contentRating: "safe",
+      lastChapter: null,
+      source: "mgeko" as const,
+      externalUrl: `${MGEKO_BASE}/manga/${m[1]}/`,
+    });
+  }
+  return out;
+}
+
+export async function getMgekoChapters(slug: string): Promise<ScrapedChapter[]> {
+  const res = await fetchWithTimeout(
+    `${MGEKO_BASE}/manga/${slug}/all-chapters/`,
+    { headers: { "User-Agent": MGEKO_UA, Referer: `${MGEKO_BASE}/manga/${slug}/` } },
+    15000,
+  );
+  if (!res.ok) throw new Error(`Mgeko chapters ${res.status} for ${slug}`);
+  const html = await res.text();
+  const out: ScrapedChapter[] = [];
+  const seen = new Set<string>();
+  const re = /href="\/reader\/en\/([^"]+?)\/"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const chapSlug = m[1];
+    if (seen.has(chapSlug)) continue;
+    seen.add(chapSlug);
+    const numM = chapSlug.match(/chapter-([0-9.]+)/i);
+    out.push({ id: chapSlug, chapterNum: numM ? numM[1] : String(out.length + 1), title: null, language: "en" });
+  }
+  out.reverse(); // page lists newest first
+  return out;
+}
+
+export async function getMgekoImages(_slug: string, chapterId: string): Promise<ScrapedImage[]> {
+  const res = await fetchWithTimeout(
+    `${MGEKO_BASE}/reader/en/${chapterId}/`,
+    { headers: { "User-Agent": MGEKO_UA, Referer: `${MGEKO_BASE}/` } },
+    15000,
+  );
+  if (!res.ok) throw new Error(`Mgeko images ${res.status} for ${chapterId}`);
+  const html = await res.text();
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const re = /<img[^>]+(?:src|data-src)="(https?:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (/logo|banner|avatar|icon/i.test(m[1]) || seen.has(m[1])) continue;
+    seen.add(m[1]);
+    urls.push(m[1]);
+  }
+  return urls.map((url, i) => ({
+    url,
+    referer: `${MGEKO_BASE}/`,
+    filename: `${String(i + 1).padStart(3, "0")}.jpg`,
+    headers: { "User-Agent": MGEKO_UA },
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,7 +1424,7 @@ export async function getWeebCentralChapters(seriesId: string): Promise<ScrapedC
     const label = m[2];
     const numM =
       label.match(/(?:Chapter|Episode)\s+([\d.]+)/i) || label.match(/([\d.]+)\s*$/);
-    out.push({ id: m[1], chapterNum: numM ? numM[1] : null, title: label, language: "en" });
+    out.push({ id: m[1], chapterNum: numM ? numM[1] : "", title: label, language: "en" });
   }
   if (out.length === 0) throw new Error(`WeebCentral returned no chapters for ${seriesId}`);
   out.reverse(); // full-chapter-list is newest-first
