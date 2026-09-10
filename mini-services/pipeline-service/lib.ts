@@ -54,6 +54,23 @@ export const db = globalForPrisma.pipelinePrisma ?? createPrismaClient()
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.pipelinePrisma = db
 
+// F4/F5: make the local SQLite connection tolerate write bursts. WAL persists
+// on the file, but busy_timeout is per-connection and must be re-set here so a
+// concurrent writer waits up to 15s for the lock instead of erroring out.
+// Fire-and-forget; a failure here is not worth blocking startup.
+if ((process.env.DATABASE_URL || '').startsWith('file:')) {
+  void (async () => {
+    try {
+      // $queryRawUnsafe (not $executeRawUnsafe): these PRAGMAs return a row.
+      await db.$queryRawUnsafe('PRAGMA busy_timeout = 15000')
+      await db.$queryRawUnsafe('PRAGMA journal_mode = WAL')
+      await db.$queryRawUnsafe('PRAGMA synchronous = NORMAL')
+    } catch (e) {
+      console.warn('[db] could not apply SQLite pragmas:', e instanceof Error ? e.message : e)
+    }
+  })()
+}
+
 // ---------------------------------------------------------------------------
 // Paths — env-configurable so the mini-service can run anywhere (laptop, VPS,
 // etc.), not just the original sandbox. Defaults preserve the original
@@ -121,6 +138,78 @@ import { spawnSync, execFile } from 'child_process'
 import { promisify } from 'util'
 
 const execFileAsync = promisify(execFile)
+
+// ---------------------------------------------------------------------------
+// impFetch — browser-TLS-impersonating GET for Cloudflare-fronted sources.
+//
+// toonily / weebcentral (and comick's HTML) 403 a plain `fetch()` from a
+// datacenter IP on JA3/TLS fingerprint alone. `cf_fetch.py` (curl_cffi,
+// `impersonate="chrome"`) replays a real Chrome handshake and gets a 200 —
+// no headless browser, ~0 RAM. Verified 2026-09 against weebcentral.com.
+// Falls back to a normal fetch on any subprocess error so it can never make
+// a working source worse.
+// ---------------------------------------------------------------------------
+const CF_FETCH_PY = path.join(PROJECT_ROOT, 'mini-services', 'pipeline-service', 'cf_fetch.py')
+const IMP_PYTHON =
+  process.env.CF_FETCH_PYTHON ||
+  path.join(PROJECT_ROOT, '.venv', 'bin', 'python3')
+
+interface ImpResponse {
+  ok: boolean
+  status: number
+  url: string
+  headers: Record<string, string>
+  text(): Promise<string>
+  arrayBuffer(): Promise<ArrayBuffer>
+}
+
+async function impFetch(
+  url: string,
+  opts: { headers?: Record<string, string>; binary?: boolean; timeoutMs?: number } = {},
+): Promise<ImpResponse> {
+  const req = JSON.stringify({
+    url,
+    headers: opts.headers || {},
+    binary: !!opts.binary,
+    timeout: Math.max(5, Math.round((opts.timeoutMs ?? 25000) / 1000)),
+  })
+  try {
+    const { stdout } = await execFileAsync(IMP_PYTHON, [CF_FETCH_PY, req], {
+      timeout: (opts.timeoutMs ?? 25000) + 8000,
+      maxBuffer: 64 * 1024 * 1024,
+    })
+    const j = JSON.parse(stdout)
+    if (!j.ok) throw new Error(j.error || 'cf_fetch failed')
+    const bodyText: string = j.body ?? ''
+    const bodyB64: string | undefined = j.body_b64
+    return {
+      ok: j.status >= 200 && j.status < 400,
+      status: j.status,
+      url: j.url || url,
+      headers: j.headers || {},
+      async text() {
+        return bodyB64 ? Buffer.from(bodyB64, 'base64').toString('utf8') : bodyText
+      },
+      async arrayBuffer() {
+        const buf = bodyB64 ? Buffer.from(bodyB64, 'base64') : Buffer.from(bodyText, 'utf8')
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+      },
+    }
+  } catch (e) {
+    // subprocess unavailable / crashed — degrade to a plain fetch rather
+    // than failing the source outright
+    const r = await fetch(url, { headers: opts.headers })
+    return {
+      ok: r.ok,
+      status: r.status,
+      url: r.url || url,
+      headers: Object.fromEntries(r.headers.entries()),
+      text: () => r.text(),
+      arrayBuffer: () => r.arrayBuffer(),
+    }
+  }
+}
+export { impFetch }
 
 const VLM_CACHE_DIR = path.join(DATA_DIR, 'cache', 'vlm')
 const VLM_CACHE_TTL_MS = 365 * 24 * 3600 * 1000 // 1 year (effectively permanent)
@@ -329,7 +418,7 @@ export function filterJunkTextPanels<T extends { image: string; text: string }>(
 
 export type ScraperSource =
   | 'mangahere' | 'fanfox' | 'webtoons' | 'asurascans' | 'mangadex'
-  | 'mangapill' | 'toonily' | 'comick' | 'weebcentral'
+  | 'mangapill' | 'toonily' | 'comick' | 'weebcentral' | 'mgeko'
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('mh-')) return 'mangahere'
@@ -341,17 +430,42 @@ export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith('tl-')) return 'toonily'
   if (id.startsWith('cm-')) return 'comick'
   if (id.startsWith('wc-')) return 'weebcentral'
+  if (id.startsWith('mg-')) return 'mgeko'
   return null
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-)/, '')
+  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-|mg-)/, '')
 }
 
 // --- MangaHere (mangahere.cc) ---
 
 const MANGAHERE_BASE = 'https://www.mangahere.cc'
 const MANGAHERE_CDN = 'https://zjcdn.mangahere.org'
+const HTML_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+
+/** Minimal MangaHere / FanFox title search (slug-only, same CMS) — used by
+ *  the cross-source fallback, which only needs a slug to resolve. */
+async function searchMangaHereFF(
+  query: string,
+  which: 'mangahere' | 'fanfox',
+): Promise<Array<{ id: string; title: string }>> {
+  const base = which === 'mangahere' ? MANGAHERE_BASE : 'https://fanfox.net'
+  const prefix = which === 'mangahere' ? 'mh-' : 'ff-'
+  const res = await fetch(`${base}/search.php?name=${encodeURIComponent(query)}`, {
+    headers: { 'User-Agent': HTML_UA },
+  })
+  if (!res.ok) throw new Error(`${which} search ${res.status}`)
+  const html = await res.text()
+  const slugs = new Set<string>()
+  for (const m of html.matchAll(/href="\/manga\/([a-z0-9_]+)\/"/gi)) {
+    if (!/^c\d/.test(m[1])) slugs.add(m[1])
+  }
+  return Array.from(slugs)
+    .slice(0, 8)
+    .map((s) => ({ id: `${prefix}${s}`, title: s.replace(/_/g, ' ') }))
+}
 
 /**
  * Fetch the chapter list for a manga from MangaHere.
@@ -1199,7 +1313,7 @@ export async function fetchToonilyChapters(
   }>
 > {
   const url = `${TOONILY_BASE}/serie/${slug}/`
-  const res = await fetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  const res = await impFetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
   if (!res.ok) throw new Error(`Toonily chapters ${res.status} for ${slug}`)
   const html = await res.text()
 
@@ -1243,7 +1357,7 @@ export async function fetchToonilyChapterImages(
   const numMatch = chapterId.match(/-ch-(\d+(?:\.\d+)?)$/)
   const chapterNum = numMatch ? numMatch[1] : chapterId
   const url = `${TOONILY_BASE}/serie/${slug}/chapter-${chapterNum}/`
-  const res = await fetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  const res = await impFetch(url, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
   if (!res.ok) throw new Error(`Toonily images ${res.status} for ${slug}/chapter-${chapterNum}`)
   const html = await res.text()
 
@@ -1270,10 +1384,12 @@ export async function fetchToonilyChapterImages(
 
 /** Download a Toonily image. */
 export async function downloadToonilyImage(imageUrl: string, destPath: string): Promise<void> {
-  const res = await fetch(imageUrl, { headers: { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` } })
+  const hdrs = { 'User-Agent': TOONILY_UA, Referer: `${TOONILY_BASE}/` }
+  let res = await fetch(imageUrl, { headers: hdrs })
+  if (!res.ok && (res.status === 403 || res.status === 503))
+    res = (await impFetch(imageUrl, { headers: hdrs, binary: true })) as unknown as Response
   if (!res.ok) throw new Error(`Toonily image download ${res.status}: ${imageUrl}`)
-  const buf = Buffer.from(await res.arrayBuffer())
-  await fs.writeFile(destPath, buf)
+  await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
 }
 
 // --- Comick (comick.io) — JSON API aggregator, huge manhwa catalogue ---
@@ -1407,7 +1523,7 @@ export async function searchWeebCentral(
   const url =
     `${WEEBCENTRAL_BASE}/search/data?text=${encodeURIComponent(query)}` +
     `&sort=Best%20Match&order=Descending&official=Any&anime=Any&adult=Any&display_mode=Minimal%20Display`
-  const res = await fetch(url, { headers: weebHeaders() })
+  const res = await impFetch(url, { headers: weebHeaders() })
   if (!res.ok) throw new Error(`WeebCentral search ${res.status}`)
   const html = await res.text()
   const out: Array<{ id: string; title: string; slug: string }> = []
@@ -1436,7 +1552,7 @@ export async function fetchWeebCentralChapters(
   }>
 > {
   const url = `${WEEBCENTRAL_BASE}/series/${encodeURIComponent(seriesId)}/full-chapter-list`
-  const res = await fetch(url, { headers: weebHeaders(`${WEEBCENTRAL_BASE}/series/${seriesId}`) })
+  const res = await impFetch(url, { headers: weebHeaders(`${WEEBCENTRAL_BASE}/series/${seriesId}`) })
   if (!res.ok) throw new Error(`WeebCentral chapters ${res.status} for ${seriesId}`)
   const html = (await res.text()).replace(/\s+/g, ' ')
   const out: Array<{
@@ -1482,7 +1598,7 @@ export async function fetchWeebCentralChapterImages(
   const url =
     `${WEEBCENTRAL_BASE}/chapters/${encodeURIComponent(chapterId)}/images` +
     `?is_prev=False&current_page=1&reading_style=long_strip`
-  const res = await fetch(url, {
+  const res = await impFetch(url, {
     headers: weebHeaders(`${WEEBCENTRAL_BASE}/chapters/${chapterId}`),
   })
   if (!res.ok) throw new Error(`WeebCentral images ${res.status} for chapter ${chapterId}`)
@@ -1496,11 +1612,266 @@ export async function fetchWeebCentralChapterImages(
 }
 
 export async function downloadWeebCentralImage(imageUrl: string, destPath: string): Promise<void> {
-  const res = await fetch(imageUrl, {
-    headers: { 'User-Agent': WEEBCENTRAL_UA, Referer: `${WEEBCENTRAL_BASE}/` },
-  })
+  const hdrs = { 'User-Agent': WEEBCENTRAL_UA, Referer: `${WEEBCENTRAL_BASE}/` }
+  let res = await fetch(imageUrl, { headers: hdrs })
+  if (!res.ok && (res.status === 403 || res.status === 503)) {
+    // CDN behind Cloudflare too — retry through the impersonating client
+    res = (await impFetch(imageUrl, { headers: hdrs, binary: true })) as unknown as Response
+  }
   if (!res.ok) throw new Error(`WeebCentral image download ${res.status}: ${imageUrl}`)
   await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+}
+
+// --- MGEKO / MangaGeko (mgeko.cc) — plain-HTML manhwa+manhua+manga
+//     aggregator, no Cloudflare (works from a datacenter IP). `mg-{slug}`.
+const MGEKO_BASE = 'https://www.mgeko.cc'
+const MGEKO_UA = HTML_UA
+function mgekoHeaders(ref?: string): Record<string, string> {
+  return { 'User-Agent': MGEKO_UA, Accept: 'text/html', ...(ref ? { Referer: ref } : {}) }
+}
+
+export async function searchMgeko(
+  query: string,
+  limit = 8,
+): Promise<Array<{ id: string; title: string }>> {
+  const res = await fetch(`${MGEKO_BASE}/search/?search=${encodeURIComponent(query)}`, {
+    headers: mgekoHeaders(),
+  })
+  if (!res.ok) throw new Error(`Mgeko search ${res.status}`)
+  const html = await res.text()
+  const out: Array<{ id: string; title: string }> = []
+  const seen = new Set<string>()
+  const re = /<a href="\/manga\/([^"/]+)\/"\s+title="([^"]+)"/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null && out.length < limit) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    out.push({ id: `mg-${m[1]}`, title: m[2].trim() })
+  }
+  return out
+}
+
+export async function fetchMgekoChapters(
+  slug: string,
+  chapterLimit: number,
+): Promise<
+  Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }>
+> {
+  const res = await fetch(`${MGEKO_BASE}/manga/${slug}/all-chapters/`, {
+    headers: mgekoHeaders(`${MGEKO_BASE}/manga/${slug}/`),
+  })
+  if (!res.ok) throw new Error(`Mgeko chapters ${res.status} for ${slug}`)
+  const html = await res.text()
+  const out: Array<{
+    mangadexId: string
+    chapterNum: string | null
+    title: string | null
+    language: string
+    pageCount: number
+    external: boolean
+  }> = []
+  const seen = new Set<string>()
+  const re = /href="\/reader\/en\/([^"]+?)\/"/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    const numM = m[1].match(/chapter-([0-9.]+)/i)
+    out.push({
+      mangadexId: m[1],
+      chapterNum: numM ? numM[1] : String(out.length + 1),
+      title: null,
+      language: 'en',
+      pageCount: 0,
+      external: false,
+    })
+  }
+  out.reverse()
+  if (out.length === 0) throw new Error(`Mgeko: no chapters for ${slug}`)
+  return chapterLimit > 0 ? out.slice(0, chapterLimit) : out
+}
+
+export async function fetchMgekoChapterImages(_slug: string, chapterId: string): Promise<string[]> {
+  const res = await fetch(`${MGEKO_BASE}/reader/en/${chapterId}/`, {
+    headers: mgekoHeaders(`${MGEKO_BASE}/`),
+  })
+  if (!res.ok) throw new Error(`Mgeko images ${res.status} for ${chapterId}`)
+  const html = await res.text()
+  const imgs: string[] = []
+  const seen = new Set<string>()
+  const re = /<img[^>]+(?:src|data-src)="(https?:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null) {
+    if (/logo|banner|avatar|icon/i.test(m[1]) || seen.has(m[1])) continue
+    seen.add(m[1])
+    imgs.push(m[1])
+  }
+  if (imgs.length === 0) throw new Error(`Mgeko returned no images for chapter ${chapterId}`)
+  return imgs
+}
+
+export async function downloadMgekoImage(imageUrl: string, destPath: string): Promise<void> {
+  const res = await fetch(imageUrl, { headers: { 'User-Agent': MGEKO_UA, Referer: `${MGEKO_BASE}/` } })
+  if (!res.ok) throw new Error(`Mgeko image download ${res.status}: ${imageUrl}`)
+  await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-source fallback
+//
+// A job is locked to one source by its mangaId prefix. That breaks when the
+// chosen source lists a chapter but can't serve its pages — the classic case
+// is a MangaDex entry whose chapters are hosted on the scanlator's own site
+// (at-home/server returns nothing). Rather than error the chapter, re-resolve
+// the SAME title on an aggregator that mirrors the images (WeebCentral, then
+// Comick), match the chapter number, and scrape those pages instead. Only the
+// download of that one chapter switches source; the job id is untouched.
+// ---------------------------------------------------------------------------
+
+/** Minimal Comick title search — enough to resolve a slug for the fallback. */
+export async function searchComick(
+  query: string,
+  limit = 6,
+): Promise<Array<{ id: string; slug: string; title: string }>> {
+  const url = `${COMICK_API}/v1.0/search?q=${encodeURIComponent(query)}&type=comic&limit=${limit}&page=1`
+  const res = await fetch(url, { headers: comickHeaders() })
+  if (!res.ok) throw new Error(`Comick search ${res.status}`)
+  const data = (await res.json()) as Array<{ slug?: string; title?: string }>
+  return (data || [])
+    .filter((d): d is { slug: string; title?: string } => Boolean(d.slug))
+    .map((d) => ({ id: `cm-${d.slug}`, slug: d.slug, title: d.title || d.slug }))
+}
+
+function titleKey(s: string): string {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+/** Recover one chapter's image URLs from an alternate source by title +
+ *  chapter-number match. Returns null when nothing usable is found. */
+export async function fetchChapterImagesCrossSource(
+  title: string,
+  chapterNum: string | null,
+  exclude: ScraperSource[] = [],
+): Promise<{ source: ScraperSource; images: string[] } | null> {
+  const want = chapterNum != null && chapterNum !== '' ? parseFloat(chapterNum) : NaN
+  const key = titleKey(title)
+  const numMatch = (c: { chapterNum: string | null }) =>
+    !Number.isNaN(want) && c.chapterNum != null &&
+    Math.abs((parseFloat(c.chapterNum) || -999) - want) < 0.001
+
+  const providers: Array<{
+    source: ScraperSource
+    search: (q: string) => Promise<Array<{ id: string; title: string }>>
+    chapters: (slug: string) => Promise<Array<{ mangadexId: string; chapterNum: string | null }>>
+    images: (slug: string, ch: string) => Promise<string[]>
+  }> = [
+    // MangaHere / FanFox first — plain HTML, no Cloudflare (work from a
+    // datacenter IP). WeebCentral + Comick after: better manhwa coverage but
+    // Cloudflare-gated, so they only succeed behind a solver / residential IP.
+    {
+      source: 'mangahere',
+      search: (q) => searchMangaHereFF(q, 'mangahere'),
+      chapters: (s) => fetchMangaHereChapters(s, 0) as any,
+      images: (s, c) => fetchMangaHereChapterImages(s, c),
+    },
+    {
+      source: 'fanfox',
+      search: (q) => searchMangaHereFF(q, 'fanfox'),
+      chapters: (s) => fetchFanFoxChapters(s, 0) as any,
+      images: (s, c) => fetchFanFoxChapterImages(s, c),
+    },
+    {
+      source: 'mgeko',
+      search: (q) => searchMgeko(q, 6),
+      chapters: (s) => fetchMgekoChapters(s, 0),
+      images: (s, c) => fetchMgekoChapterImages(s, c),
+    },
+    {
+      source: 'weebcentral',
+      search: (q) => searchWeebCentral(q, 6),
+      chapters: (s) => fetchWeebCentralChapters(s, 0),
+      images: (s, c) => fetchWeebCentralChapterImages(s, c),
+    },
+    {
+      source: 'comick',
+      search: (q) => searchComick(q, 6),
+      chapters: (s) => fetchComickChapters(s, 0),
+      images: (s, c) => fetchComickChapterImages(s, c),
+    },
+  ]
+
+  for (const p of providers) {
+    if (exclude.includes(p.source)) continue
+    try {
+      const hits = await p.search(title)
+      const hit = hits.find((h) => titleKey(h.title) === key) || hits[0]
+      if (!hit) continue
+      const slug = getSlugFromId(hit.id)
+      const chs = await p.chapters(slug)
+      const ch = chs.find(numMatch) || (Number.isNaN(want) ? chs[0] : undefined)
+      if (!ch) continue
+      const images = await p.images(slug, ch.mangadexId)
+      if (images.length > 0) return { source: p.source, images }
+    } catch {
+      /* provider unavailable / no match — try the next */
+    }
+  }
+  return null
+}
+
+type StdChapter = {
+  mangadexId: string
+  chapterNum: string | null
+  title: string | null
+  language: string
+  pageCount: number
+  external: boolean
+}
+
+/** Resolve a whole series on a mirror when the job's source has no chapter
+ *  list at all (e.g. a MangaDex title whose every chapter is external). The
+ *  returned mangaId carries the new source's prefix so getSourceFromId() and
+ *  every dispatcher downstream switch over cleanly. */
+export async function resolveSeriesCrossSource(
+  title: string,
+  chapterLimit: number,
+  exclude: ScraperSource[] = [],
+): Promise<{ source: ScraperSource; mangaId: string; chapters: StdChapter[] } | null> {
+  const key = titleKey(title)
+  const providers: Array<{
+    source: ScraperSource
+    prefix: string
+    search: (q: string) => Promise<Array<{ id: string; title: string }>>
+    chapters: (slug: string, lim: number) => Promise<StdChapter[]>
+  }> = [
+    { source: 'mgeko', prefix: 'mg-', search: (q) => searchMgeko(q, 6),
+      chapters: (s, l) => fetchMgekoChapters(s, l) },
+    { source: 'weebcentral', prefix: 'wc-', search: (q) => searchWeebCentral(q, 6),
+      chapters: (s, l) => fetchWeebCentralChapters(s, l) },
+    { source: 'comick', prefix: 'cm-', search: (q) => searchComick(q, 6),
+      chapters: (s, l) => fetchComickChapters(s, l) },
+  ]
+  for (const p of providers) {
+    if (exclude.includes(p.source)) continue
+    try {
+      const hits = await p.search(title)
+      const hit = hits.find((h) => titleKey(h.title) === key) || hits[0]
+      if (!hit) continue
+      const slug = getSlugFromId(hit.id)
+      const chapters = await p.chapters(slug, chapterLimit)
+      if (chapters.length > 0) return { source: p.source, mangaId: `${p.prefix}${slug}`, chapters }
+    } catch {
+      /* try next */
+    }
+  }
+  return null
 }
 
 // --- Unified dispatchers ---
@@ -1530,6 +1901,8 @@ export async function fetchChaptersForSource(
       return fetchComickChapters(slug, chapterLimit)
     case 'weebcentral':
       return fetchWeebCentralChapters(slug, chapterLimit)
+    case 'mgeko':
+      return fetchMgekoChapters(slug, chapterLimit)
   }
 }
 
@@ -1561,6 +1934,8 @@ export async function fetchImagesForSource(
       return fetchComickChapterImages(slug, chapterSlug)
     case 'weebcentral':
       return fetchWeebCentralChapterImages(slug, chapterSlug)
+    case 'mgeko':
+      return fetchMgekoChapterImages(slug, chapterSlug)
   }
 }
 
@@ -1588,6 +1963,8 @@ export async function downloadImageForSource(
       return downloadComickImage(imageUrl, destPath)
     case 'weebcentral':
       return downloadWeebCentralImage(imageUrl, destPath)
+    case 'mgeko':
+      return downloadMgekoImage(imageUrl, destPath)
   }
 }
 

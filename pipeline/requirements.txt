@@ -18,3 +18,22 @@ transformers>=4.50.0
 # imported in 3 call sites without ever being declared here -- any venv
 # built strictly from this file was silently missing it.
 openai>=1.30.0
+# Browser-TLS impersonation for the Cloudflare-fronted scraper sources
+# (toonily / weebcentral). Used by mini-services/pipeline-service/cf_fetch.py,
+# which lib.ts + scrapers.ts shell out to. Ships prebuilt Linux x86_64 wheels
+# (no compiler needed). Optional at runtime — cf_fetch.py degrades to a plain
+# fetch if it's absent.
+curl_cffi>=0.7
+# ── OPTIONAL neural TTS: Kokoro-82M ONNX ──────────────────────────────────
+# NOT installed here — kokoro-onnx hard-requires numpy>=2, which collides
+# with this venv's numpy<2 pin. It gets its own isolated venv instead:
+#     bash pipeline/setup_kokoro.sh      # builds pipeline/.venv-kokoro + models
+# then enable with RECAP_TTS_ENGINE=kokoro (see .env.example). master_pipeline
+# shells out to pipeline/kokoro_tts.py and falls back to edge-tts if absent.
+#
+# ── OPTIONAL local VLM: SmolVLM2-500M panel captioner (--visual-provider smolvlm) ──
+# Runs in THIS venv via transformers (already pinned above). Its processor
+# needs num2words; without it the smolvlm provider logs once and no-ops.
+num2words>=0.5.12
+# GOT-OCR2.0 (the local OCR_LOCAL_VLM tier in mini-services/paddleocr-service)
+# is also transformers-native and needs nothing beyond transformers + torch.

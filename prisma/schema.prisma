@@ -69,7 +69,12 @@ model Job {
   voice       String    @default("en-US-AndrewNeural")
   chapterLimit Int      @default(0) // 0 = all chapters
   translate   Boolean   @default(false)
-  narrate     Boolean   @default(true) // true = LLM-rewritten recap narration; false = speak the raw transcribed panel text verbatim
+  narrate     Boolean   @default(true) // legacy toggle, kept for back-compat; superseded by narrationStyle
+  narrationStyle String @default("verbatim") // verbatim | cleanup | recap  (recap/cleanup need an LLM: local Ollama or a free Groq/Gemini key)
+  describeVisuals Boolean @default(false)     // caption each panel's visual action with a vision model, folded into the narration
+  visualProvider  String  @default("auto")   // auto | ollama | groq | gemini | openrouter | none
+  motionStyle     String  @default("none")   // none | kenburns  (subtle camera drift; slower render)
+  reviewPanels    Boolean @default(false)    // pause after slicing so the user can drop cover/ad/junk panels before render
   bgmPath     String?   // path to background music file (relative to data/bgm/)
   useBgm      Boolean   @default(true) // whether to overlay BGM
   createdAt   DateTime  @default(now())

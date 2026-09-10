@@ -12,6 +12,24 @@ cd "$SCRIPT_DIR"
 #      just installed.
 #   3. Bare `python3` as a last resort (e.g. dependencies installed
 #      system-wide, or a venv already active in the parent environment).
+# Load the project .env so per-box tuning + optional keys reach THIS service.
+# bun/uvicorn's callers read .env on their own; this pure-Python launcher never
+# did, so anything set ONLY in .env (GEMINI_API_KEY for the OCR VLM fallback
+# tier, OCR_* / RAPIDOCR_* knobs) was invisible here. Export every assignment;
+# `.` runs the file so comments/blanks are handled by the shell. PATH is
+# preserved — .env ships its own PATH= line for the systemd-spawned pipeline
+# and it must not shadow the venv/bin this script's parent prepended.
+ENV_FILE="$SCRIPT_DIR/../../.env"
+if [ -f "$ENV_FILE" ]; then
+    _SAVED_PATH="$PATH"
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+    export PATH="$_SAVED_PATH"
+    unset _SAVED_PATH
+fi
+
 ROOT_VENV="$SCRIPT_DIR/../../.venv"
 if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
     PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"

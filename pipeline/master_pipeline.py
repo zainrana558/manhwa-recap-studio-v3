@@ -50,7 +50,19 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from dataclasses import dataclass, field
+
+# CPU-thread caps — MUST be set before numpy / torch / onnxruntime first
+# import so their BLAS backends pick them up. This box is a 4-vCPU CPU-only
+# machine that also runs ffmpeg and the OCR service concurrently; letting
+# every BLAS pool grab all cores just makes them fight. `RECAP_CPU_THREADS`
+# overrides (0/unset -> min(4, cores)).
+_cpu_threads = os.environ.get("RECAP_CPU_THREADS")
+_cpu_threads = int(_cpu_threads) if _cpu_threads else max(1, min(4, os.cpu_count() or 4))
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, str(_cpu_threads))
 from collections import Counter
 from pathlib import Path
 from typing import List, Optional
@@ -97,6 +109,11 @@ FPS = int(os.environ.get("RECAP_FPS", "12"))
 # per-frame OCR of the tight raw crop (see _ocr_frames_into_narration_json /
 # _emit). On by default; the raw-crop image is only written when this is set.
 _OCR_FRAMES_ENABLED = os.environ.get("RECAP_OCR_FRAMES", "1").lower() not in ("0", "false", "no")
+# When a fat inter-panel gutter has a lone narration caption floating in it,
+# carve the caption out and still cut in the clear part of the gutter instead
+# of discarding the whole band (which glued stacked beats into one frame).
+# RECAP_GUTTER_CARVE=0 restores the discard-whole-band behaviour.
+_GUTTER_CARVE = os.environ.get("RECAP_GUTTER_CARVE", "1").lower() not in ("0", "false", "no")
 
 # Comic text/bubble detector: ogkalu/comic-text-and-bubble-detector
 # (RT-DETR-v2 r50vd, Apache-2.0, 42.9M params). Superseded an earlier
@@ -150,10 +167,124 @@ _text_detector_load_attempted = False
 # class 1 = text. This is the primary panel detector for reference-style
 # framing; the pixel/flood-fill path below is the fallback when the model
 # file is absent.
-PANEL_YOLO_PATH = Path(__file__).parent / "models" / "manga-panel-yolo" / "manga_panel_detector_fp32_1024.onnx"
+_MODELS_ROOT = Path(__file__).parent / "models"
+PANEL_YOLO_PATH = _MODELS_ROOT / "manga-panel-yolo" / "manga_panel_detector_fp32_1024.onnx"
 PANEL_YOLO_INPUT = 1024
 _panel_yolo_session = None  # type: Any
 _panel_yolo_load_attempted = False
+
+
+def _resolve_model(*candidates) -> Optional[Path]:
+    """First existing non-empty path from `candidates`, in priority order.
+    Lets a newer/better-trained weight be dropped in beside the shipped one
+    and picked up with zero code change — e.g. a YOLO26n re-export placed
+    next to the legacy v8 `.pt`/`.onnx` (see pipeline/training/). A bare
+    filename is also probed directly under pipeline/models/."""
+    for c in candidates:
+        if not c:
+            continue
+        p = Path(c)
+        for cand in (p, _MODELS_ROOT / p) if not p.is_absolute() else (p,):
+            try:
+                if cand.exists() and cand.is_file() and cand.stat().st_size > 0:
+                    return cand
+            except OSError:
+                pass
+    return None
+
+
+# Extra lightweight detectors fused into the slicer as NO-CUT ZONES: a
+# horizontal cut is never allowed to pass through a detected face or speech
+# bubble. Both are small ONNX/YOLO models (~12/50 MB), CPU ~80/150 ms per
+# 640-1024 px band. Absent files -> the signal is simply skipped.
+#
+# Each is resolved from an ordered candidate list at load time: a YOLO26n
+# re-export (43% faster CPU, NMS-free — see pipeline/training/) is preferred
+# over the shipped legacy weight when present. _detect_faces_raw parses both
+# the classic v8 (4+nc, N) output and the YOLO26 end-to-end (N, 6) output.
+FACE_ONNX_PATH = _MODELS_ROOT / "anime-face" / "face_v1.4_n.onnx"
+FACE_ONNX_CANDIDATES = (
+    os.environ.get("RECAP_FACE_MODEL"),
+    _MODELS_ROOT / "anime-face" / "face_yolo26n.onnx",
+    _MODELS_ROOT / "anime-face" / "face_v1.4_n_yolo26.onnx",
+    FACE_ONNX_PATH,
+)
+BUBBLE_PT_PATH = _MODELS_ROOT / "comic-bubble" / "comic-speech-bubble-detector.pt"
+BUBBLE_MODEL_CANDIDATES = (
+    os.environ.get("RECAP_BUBBLE_MODEL"),
+    _MODELS_ROOT / "comic-bubble" / "comic-speech-bubble-detector-yolo26n.onnx",
+    _MODELS_ROOT / "comic-bubble" / "bubble_yolo26n.onnx",
+    _MODELS_ROOT / "comic-bubble" / "comic-speech-bubble-detector.onnx",
+    BUBBLE_PT_PATH,
+)
+_face_session = None       # type: Any
+_face_load_attempted = False
+_bubble_model = None       # type: Any
+_bubble_load_attempted = False
+
+
+_torch_threads_capped = False
+
+
+def _cap_torch_threads():
+    """One-time torch intra-op thread cap (matches the BLAS env caps at the
+    top of this file). Only touches torch if/when it's actually imported for
+    a fallback detector — no eager torch import."""
+    global _torch_threads_capped
+    if _torch_threads_capped:
+        return
+    _torch_threads_capped = True
+    try:
+        import torch
+        torch.set_num_threads(_cpu_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _ort_session(model_path, tag: str = ""):
+    """Build an onnxruntime CPU InferenceSession tuned for this box.
+
+    Every detector session in this file went through the bare
+    `ort.InferenceSession(path, providers=["CPUExecutionProvider"])` which
+    leaves ORT on its defaults: it spawns as many intra-op threads as there
+    are logical cores (oversubscribing a 4-vCPU box that's *also* running
+    ffmpeg / the OCR service) and only applies the "basic" graph-optimisation
+    level. On a CPU-bound pipeline that's free latency left on the table.
+
+    - `graph_optimization_level = ORT_ENABLE_ALL` — constant folding, op
+      fusion, layout opt. Documented up to ~4x on CPU transformer graphs.
+    - `intra_op_num_threads` pinned to `RECAP_ORT_THREADS` (default:
+      min(4, cores)) so ORT doesn't fight ffmpeg/OCR for the same cores.
+    - `execution_mode = ORT_SEQUENTIAL` — these are single small models fed
+      one image at a time; parallel-mode's dispatch overhead is pure loss.
+    - arena allocator on (fewer mallocs on the hot path), dynamic-block
+      shrink so a big webtoon page doesn't permanently balloon RSS.
+    """
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    try:
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        _n = os.environ.get("RECAP_ORT_THREADS")
+        _threads = int(_n) if _n else max(1, min(4, os.cpu_count() or 4))
+        so.intra_op_num_threads = _threads
+        so.inter_op_num_threads = 1
+        so.enable_cpu_mem_arena = True
+        try:
+            so.add_session_config_entry("session.dynamic_block_base", "4")
+        except Exception:
+            pass
+    except Exception:
+        pass  # any ORT version quirk -> fall back to plain session
+    sess = ort.InferenceSession(str(model_path), sess_options=so,
+                                providers=["CPUExecutionProvider"])
+    if tag:
+        log.info("ORT session '%s' — intra_op=%s, opt=ALL", tag, so.intra_op_num_threads)
+    return sess
 # A crop taller than this multiple of its own width gets split into
 # overlapping vertical bands before detection, each band's own
 # detections offset back into the original crop's coordinates and
@@ -184,7 +315,18 @@ FRAME_HOLD_PADDING = 0.5  # extra seconds a frame stays on screen AFTER its own 
 # but removes the zero-crossing discontinuity that causes the "pop" sound.
 SEGMENT_FADE_IN = 0.025
 SEGMENT_FADE_OUT = 0.040
+# OPT-IN neural TTS — Kokoro-82M ONNX. Lives in its own venv (numpy>=2 pin
+# collides with the main venv); pipeline/setup_kokoro.sh builds it and
+# pipeline/kokoro_tts.py is shelled out to. Only touched when
+# RECAP_TTS_ENGINE=kokoro; any failure falls back to edge-tts -> Piper -> eSpeak.
+KOKORO_TTS_SCRIPT = Path(__file__).parent / "kokoro_tts.py"
+KOKORO_MODEL_DIR = Path(__file__).parent / "models" / "kokoro"
+KOKORO_VENV_PYTHON = Path(__file__).parent / ".venv-kokoro" / "bin" / "python3"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# OpenAI-compatible endpoints for the free-tier fallback providers. Cerebras
+# is deliberately NOT here — it dropped its no-card free tier in Aug 2026.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MAX_FRAMES_PER_PANEL = 4  # Cap frames per source panel (prevents overslicing tall splash panels)
 
 # Phase 3: Audio post-processing targets.
@@ -230,7 +372,7 @@ class PipelineConfig:
     openai_api_key: Optional[str] = None
     keep_temp: bool = False
     groq_api_key: Optional[str] = None
-    groq_model: str = "llama-3.1-8b-instant"
+    groq_model: str = os.environ.get("GROQ_TEXT_MODEL", "qwen/qwen3.8-27b")
     translate: bool = True
     narration_provider: str = "auto"  # auto|openai|groq|ollama|none
     narration_model: Optional[str] = None  # override model for narration
@@ -240,6 +382,18 @@ class PipelineConfig:
     observer: bool = False             # verbatim-only: let a tiny local LLM (ollama
                                        # llama3.2:3b) repair garbled OCR tokens in place,
                                        # hard-guarded so it can only fix spelling
+    # OPTIONAL: describe each panel's VISUAL action with a vision model and fold
+    # that into the narration, so silent/action panels aren't just silence.
+    # Off by default. Engine order: ollama (local, free, unlimited) unless a
+    # cloud key makes another provider available.
+    describe_visuals: bool = False
+    visual_provider: str = "auto"      # auto|ollama|groq|gemini|openrouter|none
+    visual_model: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    # OPTIONAL: subtle camera motion instead of a hard slideshow. "none"
+    # (default) keeps the fast static render; "kenburns" adds a slow drift.
+    motion: str = "none"               # none|kenburns
     progress_file: Optional[Path] = None  # JSON file the Node service polls
     slice_only: bool = False  # if True, only run panel slicing then exit (used by the Node orchestrator so VLM can read individual sliced panels)
     production_mode: bool = False
@@ -280,17 +434,26 @@ class PipelineConfig:
             d.mkdir(parents=True, exist_ok=True)
 
     def write_progress(self, stage: str, chapter_index: int, total_chapters: int,
-                       message: str, status: str = "running") -> None:
-        """Write a small JSON status file the Node orchestrator polls."""
+                       message: str, status: str = "running", frac: float = 0.0,
+                       substage: str = "") -> None:
+        """Write a small JSON status file the Node orchestrator polls.
+
+        `frac` (0..1) is progress WITHIN the current chapter — lets the bar
+        move smoothly through a long chapter instead of only jumping at
+        chapter boundaries. `substage` is a short machine tag for the UI
+        stage rail (e.g. 'frame', 'ocr', 'visual', 'tts', 'encode')."""
         if not self.progress_file:
             return
         try:
-            pct = int(round((chapter_index / max(1, total_chapters)) * 100)) if total_chapters else 0
+            done = chapter_index + max(0.0, min(1.0, frac))
+            pct = (done / max(1, total_chapters)) * 100.0 if total_chapters else 0.0
             payload = {
                 "stage": stage,
+                "substage": substage,
                 "chapter_index": chapter_index,
+                "chapter_frac": round(max(0.0, min(1.0, frac)), 3),
                 "total_chapters": total_chapters,
-                "progress": pct,
+                "progress": round(pct, 1),
                 "message": message,
                 "status": status,
                 "updated_at": time.time(),
@@ -676,6 +839,7 @@ def _get_text_detector():
         log.info("Comic text/bubble detector not found at %s — skipping (pixel-only mask still applies)", TEXT_DETECTOR_LOCAL_DIR)
         return None, None
     try:
+        _cap_torch_threads()
         from transformers import RTDetrImageProcessor, RTDetrV2ForObjectDetection
         _text_detector_processor = RTDetrImageProcessor.from_pretrained(str(TEXT_DETECTOR_LOCAL_DIR))
         _text_detector_model = RTDetrV2ForObjectDetection.from_pretrained(str(TEXT_DETECTOR_LOCAL_DIR))
@@ -698,9 +862,7 @@ def _get_text_detector_onnx():
     if not TEXT_DETECTOR_ONNX_PATH.exists():
         return None
     try:
-        import onnxruntime as ort
-        _text_detector_onnx = ort.InferenceSession(
-            str(TEXT_DETECTOR_ONNX_PATH), providers=["CPUExecutionProvider"])
+        _text_detector_onnx = _ort_session(TEXT_DETECTOR_ONNX_PATH, "text-bubble")
         log.info("Loaded comic text/bubble detector (INT8 ONNX) from %s", TEXT_DETECTOR_ONNX_PATH)
     except Exception as exc:  # pragma: no cover
         log.warning("text/bubble ONNX load failed (%s) — falling back to torch path", exc)
@@ -847,6 +1009,178 @@ def _detect_text_boxes(img_gray) -> List[tuple]:
 
 
 _detect_text_boxes._cache = {}
+
+
+# ---------------------------------------------------------------------------
+# Face + bubble detectors — fused into the slicer as NO-CUT ZONES.
+# ---------------------------------------------------------------------------
+
+def _get_face_session():
+    global _face_session, _face_load_attempted
+    if _face_load_attempted:
+        return _face_session
+    _face_load_attempted = True
+    face_path = _resolve_model(*FACE_ONNX_CANDIDATES)
+    if face_path is None:
+        log.info("anime-face detector not found (%s) — skipping face no-cut zones", FACE_ONNX_PATH)
+        return None
+    try:
+        _face_session = _ort_session(face_path, "anime-face")
+        log.info("Loaded anime-face detector (ONNX) from %s", face_path.name)
+    except Exception as exc:  # pragma: no cover
+        log.warning("anime-face detector load failed (%s)", exc)
+        _face_session = None
+    return _face_session
+
+
+def _get_bubble_model():
+    global _bubble_model, _bubble_load_attempted
+    if _bubble_load_attempted:
+        return _bubble_model
+    _bubble_load_attempted = True
+    bubble_path = _resolve_model(*BUBBLE_MODEL_CANDIDATES)
+    if bubble_path is None:
+        return None
+    try:
+        _cap_torch_threads()
+        from ultralytics import YOLO
+        # YOLO() loads .pt and .onnx alike (onnxruntime backend, Results API
+        # unchanged), so a YOLO26n ONNX export is a drop-in — and faster on CPU.
+        _bubble_model = YOLO(str(bubble_path))
+        log.info("Loaded comic speech-bubble detector from %s", bubble_path.name)
+    except Exception as exc:  # pragma: no cover
+        log.warning("bubble detector load failed (%s)", exc)
+        _bubble_model = None
+    return _bubble_model
+
+
+def _nms(boxes, iou=0.45):
+    boxes = sorted(boxes, key=lambda b: -b[4])
+    keep = []
+    for b in boxes:
+        ab = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+        if all((max(0, min(b[2], k[2]) - max(b[0], k[0])) *
+                max(0, min(b[3], k[3]) - max(b[1], k[1]))) / ab < iou for k in keep):
+            keep.append(b)
+    return keep
+
+
+def _detect_faces_raw(rgb, imgsz=640, conf=0.30):
+    sess = _get_face_session()
+    if sess is None:
+        return []
+    h, w = rgb.shape[:2]
+    s = imgsz / max(h, w)
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    canvas = np.full((imgsz, imgsz, 3), 114, np.uint8)
+    canvas[:nh, :nw] = cv2.resize(rgb, (nw, nh))
+    x = canvas.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+    try:
+        inp = sess.get_inputs()[0].name
+        out = np.asarray(sess.run(None, {inp: x})[0])
+    except Exception:
+        return []
+    while out.ndim > 2:
+        out = out[0]
+    if out.ndim != 2 or out.size == 0:
+        return []
+    res = []
+    if out.shape[1] == 6 and out.shape[0] != 6:
+        # YOLO26 end-to-end head: (N, 6) = [x1, y1, x2, y2, score, cls] in
+        # letterbox pixels — no cx/cy/wh decode, no NMS needed.
+        for row in out:
+            x1b, y1b, x2b, y2b, sc = (float(row[0]), float(row[1]),
+                                      float(row[2]), float(row[3]), float(row[4]))
+            if sc < conf:
+                continue
+            res.append((max(0.0, x1b / s), max(0.0, y1b / s),
+                        min(float(w), x2b / s), min(float(h), y2b / s), sc))
+        return _nms(res)
+    # Classic v8/v11 head: (4+nc, A) or (A, 4+nc), boxes as cx, cy, bw, bh.
+    if out.shape[0] < out.shape[1]:
+        out = out.T
+    for row in out:
+        cx, cy, bw, bh = row[:4]
+        sc = float(row[4:].max()) if row.shape[0] > 4 else float(row[4])
+        if sc < conf:
+            continue
+        res.append((max(0.0, (cx - bw / 2) / s), max(0.0, (cy - bh / 2) / s),
+                    min(float(w), (cx + bw / 2) / s), min(float(h), (cy + bh / 2) / s), sc))
+    return _nms(res)
+
+
+def _detect_regions_tallsafe(rgb, fn, band_ratio=2.0):
+    """Run detector `fn(rgb)->[(x1,y1,x2,y2,score)]` on `rgb`, splitting a tall
+    image into 20%-overlapping vertical bands first (offset detections back)."""
+    h, w = rgb.shape[:2]
+    if w == 0 or h / max(1, w) <= band_ratio:
+        return fn(rgb)
+    band_h = int(w * band_ratio)
+    step = max(1, int(band_h * 0.8))
+    out, y = [], 0
+    while y < h:
+        b0, b1 = int(y), int(min(h, y + band_h))
+        for (x1, y1, x2, y2, sc) in fn(rgb[b0:b1]):
+            out.append((x1, y1 + b0, x2, y2 + b0, sc))
+        if b1 >= h:
+            break
+        y += step
+    return _nms(out)
+
+
+def _detect_faces(rgb):
+    try:
+        return _detect_regions_tallsafe(rgb, _detect_faces_raw)
+    except Exception as exc:  # pragma: no cover
+        log.debug("face detection skipped (%s)", exc)
+        return []
+
+
+def _detect_bubbles(rgb):
+    m = _get_bubble_model()
+    if m is None:
+        return []
+    def _one(sub):
+        try:
+            r = m.predict(sub, imgsz=1024, conf=0.30, verbose=False)[0]
+        except Exception:
+            return []
+        if r.boxes is None:
+            return []
+        xy = r.boxes.xyxy.cpu().numpy()
+        cf = r.boxes.conf.cpu().numpy()
+        return [(float(a), float(b), float(c), float(d), float(s)) for (a, b, c, d), s in zip(xy, cf)]
+    try:
+        return _detect_regions_tallsafe(rgb, _one)
+    except Exception as exc:  # pragma: no cover
+        log.debug("bubble detection skipped (%s)", exc)
+        return []
+
+
+def _face_row_mask(rgb, H, dilate=20):
+    """Boolean per-row: True where a horizontal cut is HARD-forbidden — inside
+    a detected face (+`dilate` px). Faces are the only true no-cut zone: a
+    speech bubble floating in a gutter must be ASSIGNED to a panel, not skipped
+    (skipping it merges the two panels). RECAP_NOCUT_ZONES=0 disables."""
+    mask = np.zeros(int(H), dtype=bool)
+    if os.environ.get("RECAP_NOCUT_ZONES", "1").lower() in ("0", "false", "no"):
+        return mask
+    regions = []
+    try:
+        regions += [b[:4] for b in _detect_faces(rgb)]
+    except Exception:
+        pass
+    if os.environ.get("RECAP_BUBBLE_DETECT", "0").lower() in ("1", "true", "yes"):
+        try:
+            regions += [b[:4] for b in _detect_bubbles(rgb)]
+        except Exception:
+            pass
+    for (_x1, y1, _x2, y2) in regions:
+        a = max(0, int(y1) - dilate)
+        b = min(int(H), int(y2) + dilate)
+        if b > a:
+            mask[a:b] = True
+    return mask
 
 
 def _add_text_boxes_to_mask(mask, img_gray) -> "np.ndarray":
@@ -1142,6 +1476,18 @@ def _is_blank_crop(arr_gray) -> bool:
     # Near-white with low detail = blank white panel.
     if mean_val > 245.0 and std_val < 15.0:
         return True
+    # A pure vertical gradient (scene-transition wipe): EVERY row is nearly
+    # flat across its width, and the row means march monotonically from one
+    # tone to another. No lines, no art, no text — nothing to show. (A dark
+    # caption box or figure breaks the "every row flat" test.)
+    if arr_gray.ndim == 2 and arr_gray.shape[0] >= 24:
+        row_mean = arr_gray.mean(axis=1)
+        row_span = float(row_mean.max() - row_mean.min())
+        row_std_max = float(arr_gray.std(axis=1).max())
+        if row_std_max < 12.0 and row_span > 40.0:
+            d = np.diff(row_mean)
+            if np.mean(d >= -0.5) > 0.98 or np.mean(d <= 0.5) > 0.98:
+                return True
     return False
 
 
@@ -1192,6 +1538,62 @@ def _looks_like_credits_panel(arr_rgb) -> bool:
         if 1 <= bands <= 12 and float(inked_rows.mean()) <= 0.55:
             return True
     return False
+
+
+def _looks_like_scanlator_card(arr_rgb) -> bool:
+    """A scanlation studio credits / chapter-title card — the COLOURED kind
+    that `_looks_like_credits_panel` (tuned for white translator-note pages)
+    misses: a mostly flat poster-colour fill (few large uniform regions,
+    little drawn linework) carrying a logo + a line or two of text. Used only
+    on the first/last frame of a chapter, and only when OCR already returned
+    no narratable text — so a false positive can at worst drop one silent
+    boundary frame, never a narrated story panel. F3."""
+    if arr_rgb is None or getattr(arr_rgb, "size", 0) < 900:
+        return False
+    g = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(g, 60, 160)
+    edge_frac = float((edges > 0).mean())
+    # a real drawn panel is dense with linework; a logo card is not
+    if edge_frac > 0.11:
+        return False
+    # how much of the frame is a handful of flat colours? quantise to 3-bit/chan
+    q = (arr_rgb.astype(np.uint16) >> 5)
+    codes = (q[..., 0] << 6) | (q[..., 1] << 3) | q[..., 2]
+    vals, counts = np.unique(codes, return_counts=True)
+    counts = np.sort(counts)[::-1]
+    top3 = float(counts[:3].sum()) / float(codes.size)
+    return top3 >= 0.72
+
+
+# Near-duplicate frame detection (webtoons reuse panels in "previously on…"
+# recap strips and flashbacks — on a multi-hour recap that's real repetition).
+# 512-bit combined dHash+vHash on a 16x16 grey — hashed on the TIGHT panel
+# content (the *_ocr.jpg crop), not the composed canvas: the blurred backdrop
+# on the canvas is low-entropy and makes unrelated frames look alike. Pure numpy.
+_RECAP_SEEN_HASHES: List[int] = []
+
+
+def _frame_dhash(path) -> Optional[int]:
+    try:
+        from PIL import Image
+        p = Path(path)
+        ocr = p.with_name(p.stem + "_ocr" + p.suffix)
+        src = ocr if ocr.exists() else p
+        a = np.asarray(Image.open(src).convert("L").resize((17, 16), Image.BILINEAR), dtype=np.int16)
+        b = a[:16, :16]
+        dh = (a[:16, 1:] > a[:16, :-1]).flatten()           # 256 horizontal-gradient bits
+        vv = np.asarray(Image.open(src).convert("L").resize((16, 17), Image.BILINEAR), dtype=np.int16)
+        dv = (vv[1:, :16] > vv[:-1, :16]).flatten()          # 256 vertical-gradient bits
+        bits = 0
+        for v in np.concatenate([dh, dv]):
+            bits = (bits << 1) | int(v)
+        return bits
+    except Exception:
+        return None
+
+
+def _ham64(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
 
 
 def _is_lines_only_crop(arr_gray) -> bool:
@@ -1399,6 +1801,7 @@ def _detect_panels_yolo(img_gray) -> List[tuple]:
     Returns list of (x, y, w, h) tuples sorted by y position.
     """
     try:
+        _cap_torch_threads()
         from ultralytics import YOLO
     except ImportError:
         return []
@@ -1748,10 +2151,7 @@ def _get_panel_yolo():
         log.info("Manga panel YOLO not found at %s — using flood-fill panel detection", PANEL_YOLO_PATH)
         return None
     try:
-        import onnxruntime as ort
-        _panel_yolo_session = ort.InferenceSession(
-            str(PANEL_YOLO_PATH), providers=["CPUExecutionProvider"]
-        )
+        _panel_yolo_session = _ort_session(PANEL_YOLO_PATH, "panel-yolo")
         log.info("Loaded manga panel detector (YOLO26n) from %s", PANEL_YOLO_PATH)
     except Exception as e:  # pragma: no cover
         log.warning("panel YOLO load failed (%s) — using flood-fill fallback", e)
@@ -1879,13 +2279,58 @@ def _split_borderless_column(box, gray, texts) -> "List[list]":
                 return True
         return False
 
+    def _clear_subrun(a, b):
+        """Largest sub-range of column-local band [a, b] that NO wide text box
+        overlaps — the true gutter once a caption floating in the blank space
+        is carved out. Returns None only when a box spans the whole band (a
+        bubble taller than the gap — never cut there). Without this, a single
+        narration caption dropped into an otherwise-clean 400px gutter made
+        the band's midpoint 'straddle text', so the WHOLE band was discarded
+        and three stacked beats stayed glued into one 16-second frame."""
+        span = max(1, b - a)
+        blocked = np.zeros(span, dtype=bool)
+        for (tx1, ty1, tx2, ty2, _s) in (texts or []):
+            if min(tx2, x2) - max(tx1, x1) <= 0.2 * W:
+                continue
+            u = max(a, int(ty1) - y1 - 4)
+            v = min(b, int(ty2) - y1 + 4)
+            if v > u:
+                blocked[u - a:v - a] = True
+        if blocked.all():
+            return None
+        best, i = (0, 0), 0
+        while i < span:
+            if blocked[i]:
+                i += 1
+                continue
+            j = i
+            while j < span and not blocked[j]:
+                j += 1
+            if j - i > best[1] - best[0]:
+                best = (i, j)
+            i = j
+        return (a + best[0], a + best[1])
+
     # Content segments live BETWEEN the gutter bands. A fat gutter (>= 60px)
-    # is dropped whole — its blank rows belong to no beat; a thin one is split
-    # at its midpoint so each side keeps a small natural margin.
+    # is dropped whole (its blank rows belong to no beat) — but only the part
+    # of it clear of any floating caption; a thin one is split at its midpoint.
     spans, prev = [], 0
     for (a, b) in bands:
-        lo, hi = (a, b) if b - a >= 60 else ((a + b) // 2, (a + b) // 2)
-        if _text_straddles(y1 + (lo + hi) // 2):
+        if b - a >= 60 and _GUTTER_CARVE:
+            cr = _clear_subrun(a, b)
+            if cr is None:
+                continue
+            lo, hi = cr
+        elif b - a >= 60:
+            lo, hi = a, b
+            if _text_straddles(y1 + (a + b) // 2):
+                continue
+        else:
+            mid = (a + b) // 2
+            if _text_straddles(y1 + mid):
+                continue
+            lo = hi = mid
+        if lo <= prev:
             continue
         spans.append((prev, lo))
         prev = hi
@@ -2574,6 +3019,36 @@ def _pages_are_webtoon_chunks(page_paths: "List[Path]") -> bool:
     return seams > 0 and seam_hits / seams >= 0.34
 
 
+def _pages_are_webtoon_strip(page_paths: "List[Path]") -> bool:
+    """True when the 'pages' are a long vertical webtoon chapter served as
+    several tall, uniform-width strip images — whether the host cut them at
+    arbitrary rows (mid-art, → _pages_are_webtoon_chunks) OR politely on a
+    gutter (AsuraScans, Webtoons mirrors, …). Either way each 'page' is a
+    multi-panel column, not a single comic page, so the right move is to glue
+    them and cut the whole strip with the conservative gutter rule instead of
+    running per-page panel detection (which orphans every floating bubble).
+
+    Signature: ≥3 pages, near-uniform width, and the typical page is TALL
+    (median aspect ≥ 2.2) — a normally paginated comic page is ~1.3–1.6."""
+    from PIL import Image
+    if len(page_paths) < 3:
+        return False
+    widths, aspects = [], []
+    for p in page_paths:
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+        except Exception:
+            return False
+        if w <= 0 or h <= 0:
+            return False
+        widths.append(w)
+        aspects.append(h / w)
+    if max(widths) - min(widths) > max(4, 0.02 * float(np.median(widths))):
+        return False
+    return float(np.median(aspects)) >= 2.2
+
+
 def _seam_is_midart(bottom_gray: "np.ndarray", top_gray: "np.ndarray") -> bool:
     """A page boundary that cuts THROUGH artwork — ink right up to the bottom
     edge of page N and the top edge of page N+1, with no white gutter band.
@@ -2585,6 +3060,739 @@ def _seam_is_midart(bottom_gray: "np.ndarray", top_gray: "np.ndarray") -> bool:
     b_white = int(np.argmax((bottom_gray[::-1] >= 243).mean(axis=1) < 0.97)) if bottom_gray.size else 99
     t_white = int(np.argmax((top_gray >= 243).mean(axis=1) < 0.97)) if top_gray.size else 99
     return b > 0.05 and t > 0.05 and b_white < 4 and t_white < 4
+
+
+def _pages_are_presliced_tiles(page_paths: "List[Path]") -> bool:
+    """True when the source 'pages' are already individual panel tiles — the
+    shape many aggregators (mgeko, toonily, mangapill, …) serve instead of a
+    raw 800x10000 webtoon strip. Signature: uniform width, modest heights
+    (never a tall strip), aspect ratio close to a single panel, and enough of
+    them that the chapter was clearly served pre-cut. On tiles the panel
+    detector + borderless split + edge-trim machinery (all tuned for tall
+    strips) does more harm than good — it fragments clean panels, emits
+    atmosphere-only slivers, and crops through faces. RECAP_TILE_PASSTHROUGH=0
+    forces the full detection path anyway."""
+    if os.environ.get("RECAP_TILE_PASSTHROUGH", "1").lower() in ("0", "false", "no"):
+        return False
+    from PIL import Image
+    if len(page_paths) < 12:
+        return False
+    dims = []
+    for p in page_paths[:40]:
+        try:
+            with Image.open(p) as im:
+                dims.append(im.size)  # (w, h)
+        except Exception:
+            return False
+    if len(dims) < 12:
+        return False
+    ws = sorted(w for w, _ in dims)
+    med_w = ws[len(ws) // 2]
+    # tolerate a handful of odd pages (title card, wide splash): most tiles
+    # share a width, few are tall, typical single-panel aspect on the median.
+    same_w = sum(1 for w, _ in dims if abs(w - med_w) <= max(6, 0.06 * med_w))
+    tall = sum(1 for w, h in dims if h > 2200 or h / max(1, w) > 2.6)
+    ratios = sorted(h / max(1, w) for w, h in dims)
+    med_ratio = ratios[len(ratios) // 2]
+    return (same_w >= 0.8 * len(dims)
+            and tall <= 0.12 * len(dims)
+            and med_ratio <= 2.2
+            and med_w <= 1600)
+
+
+def _border_trim_amounts(rgb: "np.ndarray", max_frac: float = 0.10):
+    """(top, bottom, left, right) rows/cols of pure letterbox to drop —
+    near-white (>=246) OR near-black (<=12) across >=98.5% of the span,
+    contiguous from each edge, capped at `max_frac` per side. Never touches
+    coloured art or a bubble edge (the old `< 234` ink trim did — that was
+    the 'cuts through content' bug)."""
+    if rgb.ndim != 3 or rgb.shape[0] < 20 or rgb.shape[1] < 20:
+        return 0, 0, 0, 0
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    H, W = g.shape
+    row_bar = ((g >= 246).mean(axis=1) >= 0.985) | ((g <= 12).mean(axis=1) >= 0.985)
+    col_bar = ((g >= 246).mean(axis=0) >= 0.985) | ((g <= 12).mean(axis=0) >= 0.985)
+    def _run(mask, limit):
+        n = 0
+        while n < limit and n < len(mask) and mask[n]:
+            n += 1
+        return n
+    t = _run(row_bar, int(H * max_frac))
+    b = _run(row_bar[::-1], int(H * max_frac))
+    l = _run(col_bar, int(W * max_frac))
+    r = _run(col_bar[::-1], int(W * max_frac))
+    if t + b >= H - 20 or l + r >= W - 20:
+        return 0, 0, 0, 0
+    return t, b, l, r
+
+
+def _safe_border_trim(rgb: "np.ndarray", max_frac: float = 0.10) -> "np.ndarray":
+    t, b, l, r = _border_trim_amounts(rgb, max_frac)
+    if t or b or l or r:
+        return rgb[t:rgb.shape[0] - b, l:rgb.shape[1] - r]
+    return rgb
+
+
+_INCLUSIVE_SLICE = os.environ.get("RECAP_SLICE_INCLUSIVE", "0").lower() not in ("0", "false", "no")
+
+
+def _inclusive_crop_box(gray, box, prev_y2, next_y1, W, H):
+    """Inclusive slicing (RECAP_SLICE_INCLUSIVE=1). Expand the panel box into
+    the gutters — capped at ~45 % of a gutter so it can never reach the
+    neighbour's art — then a bounded cropper re-finds the exact gutter cut
+    inside that safe band, correcting a detector edge that landed a little
+    inside the panel. When there's no clean gutter to cut at (borderless
+    bleed) it keeps the loose edge: the panel is always whole; a wrong
+    gutter estimate costs a thin gutter sliver, never a truncated panel."""
+    x1, y1, x2, y2 = (int(v) for v in box)
+    OV = int(os.environ.get("RECAP_SLICE_OVERLAP_PX", "90"))
+    FR = float(os.environ.get("RECAP_SLICE_OVERLAP_FRAC", "0.45"))
+    RCH = int(os.environ.get("RECAP_SLICE_CORRECT_PX", "24"))  # max correction PAST the detector edge
+    inf_up = min(OV, max(0, int(FR * (y1 - prev_y2))))
+    inf_dn = min(OV, max(0, int(FR * (next_y1 - y2))))
+    ly1, ly2 = max(0, y1 - inf_up), min(H, y2 + inf_dn)
+
+    row_ink = (gray < 200).mean(axis=1)          # fraction of dark px per row
+
+    def _gutter_cut(lo, hi):
+        """emptiest row in [lo, hi) if it's a genuine gutter (<=3% ink),
+        widened to the middle of the low-ink run; else None."""
+        lo, hi = max(0, int(lo)), min(H, int(hi))
+        if hi - lo < 4:
+            return None
+        seg = row_ink[lo:hi]
+        k = int(np.argmin(seg))
+        if seg[k] > 0.03:
+            return None
+        a = b = k
+        while a > 0 and seg[a - 1] <= 0.03:
+            a -= 1
+        while b < len(seg) - 1 and seg[b + 1] <= 0.03:
+            b += 1
+        return lo + (a + b) // 2
+
+    # Search ONLY the inflation band (pure gutter) plus a tiny fixed reach past
+    # the detector edge — the cropper can pull a frame in to a clean gutter but
+    # can NEVER carve into the panel body looking for a gutter that isn't there.
+    top = _gutter_cut(ly1, y1 + RCH) if inf_up > 0 or ly1 < y1 else None
+    bot = _gutter_cut(y2 - RCH, ly2) if inf_dn > 0 or ly2 > y2 else None
+    ny1 = top if top is not None else ly1
+    ny2 = bot if bot is not None else ly2
+    # hard floors: never past the detector edge by more than RCH
+    ny1 = min(max(ny1, y1 - inf_up), y1 + RCH)
+    ny2 = max(min(ny2, y2 + inf_dn), y2 - RCH)
+    if ny2 - ny1 < 0.6 * (y2 - y1):
+        ny1, ny2 = ly1, ly2
+    return max(0, x1 - 4), ny1, min(W, x2 + 4), ny2
+
+
+def _frame_presliced_tiles(cfg: "PipelineConfig", chapter: "Chapter",
+                           out_dir: Path) -> "List[FrameEntry]":
+    """Passthrough framing for chapters served as individual panel tiles.
+    Each tile becomes ONE frame — no panel detection, no splitting, no
+    aggressive cropping. Pure letterbox bars are trimmed; a run of very short
+    tiles is merged so a 1-line caption strip isn't its own 2-second beat."""
+    from PIL import Image
+    entries: List[FrameEntry] = []
+    counter = 0
+    total = len(chapter.panel_paths)
+
+    def _emit_tile(rgb, page_idx, page_name):
+        nonlocal counter
+        g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        if _is_blank_crop(g) or rgb.shape[0] < 24 or rgb.shape[1] < 24:
+            return
+        if (page_idx <= 1 or page_idx >= total - 2) and _looks_like_credits_panel(rgb):
+            log.info("[%s] tile passthrough: skipped credits panel on page %d", chapter.tag, page_idx + 1)
+            return
+        fp = out_dir / f"frame_{counter:05d}.jpg"
+        _compose_canvas(Image.fromarray(rgb)).save(fp, quality=92)
+        ocr_path = ""
+        if _OCR_FRAMES_ENABLED:
+            ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
+            try:
+                oc = rgb
+                target = int(os.environ.get("RECAP_OCR_MAX_SIDE", "1100"))
+                m = max(oc.shape[:2])
+                if m > 0 and abs(m - target) / target > 0.05:
+                    s = target / m
+                    interp = cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC
+                    oc = cv2.resize(oc, (max(1, int(oc.shape[1] * s)), max(1, int(oc.shape[0] * s))), interpolation=interp)
+                Image.fromarray(oc).save(ocr_fp, quality=94)
+                ocr_path = str(ocr_fp.resolve())
+            except Exception:
+                ocr_path = ""
+        entries.append(FrameEntry(
+            frame_id=f"{chapter.tag}_frame_{counter:05d}",
+            filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
+            source_page=page_name, source_index=page_idx, frame_kind="panel",
+            source_box=[0, 0, int(rgb.shape[1]), int(rgb.shape[0])],
+        ))
+        counter += 1
+
+    pending = None  # (rgb, page_idx, name) — a short tile waiting to merge downward
+    MIN_H = int(os.environ.get("RECAP_TILE_MIN_H", "190"))
+    for page_idx, p in enumerate(chapter.panel_paths):
+        try:
+            with Image.open(p) as im:
+                rgb = _safe_border_trim(np.array(im.convert("RGB")))
+        except Exception as exc:
+            log.warning("[%s] tile passthrough: unreadable %s (%s)", chapter.tag, p.name, exc)
+            continue
+        if pending is not None:
+            prg, pidx, pnm = pending
+            if prg.shape[1] == rgb.shape[1]:
+                rgb = np.concatenate([prg, rgb], axis=0)
+            else:
+                _emit_tile(prg, pidx, pnm)
+            pending = None
+        if rgb.shape[0] < MIN_H:
+            pending = (rgb, page_idx, p.name)
+            continue
+        _emit_tile(rgb, page_idx, p.name)
+    if pending is not None:
+        _emit_tile(*pending)
+
+    log.info("[%s] tile passthrough: %d tiles -> %d panel frames", chapter.tag, total, len(entries))
+    _slice_qa_check(chapter.tag, entries, [])
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Strip reconstruction (RECAP_STRIP_RECONSTRUCT / _pages_are_webtoon_chunks)
+#
+# Aggregators serve a webtoon as fixed-height chunks cut at ARBITRARY pixel
+# rows — usually mid-panel. Slicing each chunk alone means the cutter keeps
+# seeing "half a panel + whitespace + half a panel" and guesses wrong. Glue
+# the chunks back into the original strip first, de-dup the seams, then cut
+# the whole thing — every panel is complete. Tiles (mgeko etc.) skip this:
+# they're already single panels, reconstruction would be wasted work.
+# ---------------------------------------------------------------------------
+
+def _reconstruct_strip(page_paths):
+    """Concatenate chunk images into one tall RGB array. Cross-correlates each
+    seam to drop duplicated rows (some CDNs repeat a strip of pixels across the
+    join); a genuine gutter gap is left alone. Returns (strip_rgb, spans) where
+    spans = [(page_name, y0, y1)] for mapping a panel back to its source page."""
+    from PIL import Image
+    imgs, names = [], []
+    for p in page_paths:
+        try:
+            with Image.open(p) as im:
+                imgs.append(np.array(im.convert("RGB")))
+                names.append(p.name)
+        except Exception as exc:
+            log.warning("reconstruct: unreadable %s (%s)", p.name, exc)
+    if not imgs:
+        return None, []
+    W = int(np.median([a.shape[1] for a in imgs]))
+    norm = []
+    for a in imgs:
+        if a.shape[1] != W:
+            a = cv2.resize(a, (W, int(a.shape[0] * W / a.shape[1])), interpolation=cv2.INTER_AREA)
+        norm.append(a)
+    parts, spans, y = [], [], 0
+    for i, a in enumerate(norm):
+        drop = 0
+        if parts:
+            prev_tail = cv2.cvtColor(parts[-1][-60:], cv2.COLOR_RGB2GRAY).astype(np.float32)
+            head = cv2.cvtColor(a[:200], cv2.COLOR_RGB2GRAY).astype(np.float32)
+            best, bestsc = 0, 1e18
+            for sh in range(0, min(150, len(head) - len(prev_tail))):
+                d = np.abs(head[sh:sh + len(prev_tail)] - prev_tail).mean()
+                if d < bestsc:
+                    bestsc, best = d, sh
+            if bestsc < 6.0:            # a real overlap, not coincidence
+                drop = best + len(prev_tail)
+        a2 = a[drop:] if 0 < drop < a.shape[0] - 20 else a
+        parts.append(a2)
+        spans.append((names[i], y, y + a2.shape[0]))
+        y += a2.shape[0]
+    return np.concatenate(parts, axis=0), spans
+
+
+def _cut_strip_into_panels(gray, texts, W, H, nocut=None):
+    """Cut a reconstructed strip into panels — CONSERVATIVE gutter rule.
+
+    Cut ONLY at a wide, clean, full-width gutter (a near-white OR near-black
+    band). `nocut` (bool per-row) is the HARD no-cut mask — faces, plus
+    bubbles when RECAP_BUBBLE_DETECT=1 — a cut may never pass through it.
+    A speech bubble floating in a gutter does NOT block the cut (that merged
+    THWT conversations into one tall strip); instead the band is bridged back
+    together and the cut is placed on the clean side of the bubble so it
+    stays whole with exactly one panel (webtoon default: bubble joins the
+    panel BELOW when there's clean gutter above it). Whatever sits between two
+    gutters is one panel with every bubble that lands there — no box
+    expansion, no "nearest panel" reasoning. A near-empty segment folds into
+    the segment BELOW. An over-tall gutterless block gets one low-ink split.
+    """
+    MIN_GUT = int(os.environ.get("RECAP_STRIP_MIN_GUTTER", "34"))
+    MIN_PANEL = int(os.environ.get("RECAP_STRIP_MIN_PANEL", "170"))
+    MAX_PANEL = int(os.environ.get("RECAP_STRIP_MAX_PANEL", "3800"))
+    g = gray.astype(np.int16)
+    std = g.std(axis=1)
+    ink = (g < 205).mean(axis=1)
+
+    tboxes = [(int(ty1), int(ty2)) for (tx1, ty1, tx2, ty2, *_r) in (texts or [])
+              if 0 <= ty1 < ty2 <= H]
+    txt_rows = np.zeros(H, dtype=bool)
+    for (ty1, ty2) in tboxes:
+        txt_rows[max(0, ty1 - 4):min(H, ty2 + 4)] = True
+
+    # `nocut` is the HARD no-cut mask — faces (and bubbles when
+    # RECAP_BUBBLE_DETECT=1). A cut may never pass through it. Speech-bubble
+    # TEXT is NOT a no-cut zone: a bubble floating in a gutter has to be
+    # ASSIGNED to one of the two neighbouring panels, never used to suppress
+    # the gutter — suppressing it is exactly what merged THWT conversations
+    # into one tall strip.
+    face_rows = (np.asarray(nocut, dtype=bool)[:H] if nocut is not None
+                 else np.zeros(H, dtype=bool))
+
+    # clean gutter row: near-uniform full-width white OR black, not through a face
+    white = ((g >= 244).mean(axis=1) >= 0.97) & (std <= 16)
+    black = ((g <= 18).mean(axis=1) >= 0.95) & (std <= 14)
+    gut = (white | black) & ~face_rows
+
+    # raw clean-gutter bands
+    raw, i = [], 0
+    while i < H:
+        if not gut[i]:
+            i += 1; continue
+        j = i
+        while j < H and gut[j]:
+            j += 1
+        raw.append([i, j])
+        i = j
+
+    # A speech bubble floating in a gutter splits the white band in two, and
+    # each half can drop under MIN_GUT so the cut is lost and the panels
+    # merge. Bridge two clean bands separated ONLY by bubble text + blank
+    # rows (no solid art between them) back into one logical gutter zone.
+    BR = int(os.environ.get("RECAP_STRIP_BUBBLE_BRIDGE", "170"))
+    bands = []
+    for bd in raw:
+        if bands:
+            g0, g1 = bands[-1][1], bd[0]
+            if 0 < g1 - g0 <= BR:
+                solid = (ink[g0:g1] >= 0.16) & ~txt_rows[g0:g1]
+                if float(solid.mean()) < 0.04:
+                    bands[-1][1] = bd[1]
+                    continue
+        bands.append(bd[:])
+
+    # place one cut per gutter band; when a bubble sits in the band, cut on
+    # the clean side of it so it stays whole with a single panel
+    cuts = []
+    for (a, b) in bands:
+        if int(gut[a:b].sum()) < MIN_GUT:
+            continue
+        ov = [(t1, t2) for (t1, t2) in tboxes if t1 < b - 2 and t2 > a + 2]
+        if ov:
+            btop = max(a, min(t[0] for t in ov))
+            bbot = min(b, max(t[1] for t in ov))
+            if btop - a >= 12:
+                cuts.append((a + btop) // 2)        # clean gutter above -> bubble joins panel BELOW
+            elif b - bbot >= 12:
+                cuts.append((bbot + b) // 2)        # clean gutter below -> bubble joins panel ABOVE
+            else:
+                cuts.append((a + b) // 2)
+        else:
+            cuts.append((a + b) // 2)
+
+    bounds = [0] + cuts + [H]
+    segs = [[bounds[k], bounds[k + 1]] for k in range(len(bounds) - 1)
+            if bounds[k + 1] - bounds[k] >= MIN_PANEL]
+    if not segs:
+        segs = [[0, H]]
+
+    # split an over-tall gutterless block once at its emptiest internal row
+    out = []
+    for (a, b) in segs:
+        while b - a > MAX_PANEL:
+            lo, hi = a + int(0.30 * (b - a)), b - int(0.30 * (b - a))
+            seg = ink[lo:hi]
+            k = lo + int(np.argmin(seg))
+            if seg.min() > 0.055 or face_rows[k] or txt_rows[k]:
+                break
+            out.append([a, k]); a = k
+        out.append([a, b])
+    out.sort()
+
+    def _artf(a, b):
+        s = slice(max(0, a), min(H, b))
+        return float(((ink[s] >= 0.16) & ~txt_rows[s]).mean()) if b > a else 0.0
+
+    def _nbox(a, b):
+        return sum(1 for (t1, t2) in tboxes if t1 < b - 2 and t2 > a + 2)
+
+    # A segment that must NOT stand on its own as a frame: a sliver, a near-
+    # blank band, a bubble/text run over almost no drawn art, or a tall stack
+    # of ≥3 bubbles with little art (an orphan speech ribbon). A segment that
+    # carries real art of its own — e.g. a face close-up under one bubble —
+    # is NOT needy and is never folded away, even when it's tall.
+    def _needy(a, b):
+        if b - a < MIN_PANEL:
+            return True
+        af = _artf(a, b)
+        if af < 0.10:
+            return True
+        if af < 0.24 and _nbox(a, b) >= 1:          # bubbles/caption over sparse art
+            return True
+        if (b - a) > int(1.8 * W) and _nbox(a, b) >= 3 and af < 0.28:
+            return True
+        return False
+
+    # Fold each needy segment into the neighbour with the most drawn art —
+    # i.e. toward the speaker. A speech bubble in this genre sits just below
+    # (or beside) whoever said it far more often than above the next shot, so
+    # "always fold down" kept handing a bubble to the beat AFTER the one it
+    # belongs to ("ghalat panel ko ghalat bubble"). One left-to-right pass;
+    # each merged block is locked (index skips past it) so a big orphan ribbon
+    # can't chain-eat a whole column of panels.
+    i = 0
+    while i < len(out) and len(out) > 1:
+        if not _needy(*out[i]):
+            i += 1
+            continue
+        if i == 0:
+            j = 1
+        elif i == len(out) - 1:
+            j = i - 1
+        else:
+            j = i - 1 if _artf(*out[i - 1]) >= _artf(*out[i + 1]) else i + 1
+        lo, hi = min(i, j), max(i, j)
+        out[lo] = [min(out[lo][0], out[hi][0]), max(out[lo][1], out[hi][1])]
+        del out[hi]
+        i = lo + 1
+
+    # cut points land in the middle of the gap between finished panels
+    out.sort()
+    res, prev = [], 0
+    for idx, (a, b) in enumerate(out):
+        top = prev if idx else 0
+        bot = (b + out[idx + 1][0]) // 2 if idx + 1 < len(out) else H
+        res.append((0, max(0, top), W, min(H, bot)))
+        prev = bot
+    return res
+
+
+def _squeeze_internal_whitespace(rgb, keep=48):
+    """Collapse a wide internal all-background band (>150px of near-uniform
+    white/black spanning the full width) down to `keep` px, seaming the
+    content above and below together. Used after a floating bubble is folded
+    into its panel so the frame shows 'bubble + panel', not 'bubble + a lake
+    of white + panel'. Purely visual."""
+    if rgb.ndim != 3 or rgb.shape[0] < 400:
+        return rgb
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.int16)
+    H = g.shape[0]
+    std = g.std(axis=1)
+    bg = (((g >= 244).mean(axis=1) >= 0.97) | ((g <= 16).mean(axis=1) >= 0.97)) & (std <= 14)
+    keep_rows = np.ones(H, dtype=bool)
+    i = 0
+    while i < H:
+        if not bg[i]:
+            i += 1; continue
+        j = i
+        while j < H and bg[j]:
+            j += 1
+        # only squeeze an INTERNAL band (not the top/bottom margin) that's fat
+        if i > 10 and j < H - 10 and (j - i) > 150:
+            keep_rows[i + keep // 2: j - keep // 2] = False
+        i = j
+    if keep_rows.all():
+        return rgb
+    return rgb[keep_rows]
+
+
+_WM_RE = re.compile(
+    r"(read\s+(it\s+)?(first|now|more)?\s*(on|at)\b)|(\.com\b)|(\.net\b)|"
+    r"(scans?\b)|(manhwa[\s-]*freak)|(freakscans)|(asura\w*)|(flamescans?)|"
+    r"(reaperscans?)|(mangabuddy)|(manhuaplus)|(join\s+(our\s+)?discord)|"
+    r"(follow\s+us)|(support\s+us\s+on)", re.IGNORECASE)
+
+
+def _strip_edge_watermark(rgb, text_boxes=None, max_frac: float = 0.30):
+    """Trim an aggregator's watermark from the TOP or BOTTOM edge of a panel
+    crop — the "READ AT / MANHWA-FREAK.COM / FREAKSCANS.COM" style stack that
+    scanlation sites burn onto the artwork (not a flat banner, so
+    `_looks_like_credits_panel` / `_border_trim_amounts` miss it; mid-art, so
+    `_trim_edge_whitespace` misses it too).
+
+    Structural signal, no OCR: >=2 WIDE (>=48% of the crop width) text lines,
+    STACKED (line gaps <= 30px), FLUSH to an edge (within ~24px), with the
+    real artwork ending in a near-clean transition just above/below the stack.
+    Three wide text lines glued to the very bottom edge is a watermark, not a
+    story caption (those are boxed and sit higher).
+
+    `text_boxes` = the detected text boxes in THIS crop's coordinates
+    [(x1,y1,x2,y2,...), ...]. Falls back to a pixel scan if not given.
+    Returns (trimmed_rgb, top_removed, bottom_removed). Conservative and it
+    only touches the *displayed* frame — the OCR crop keeps everything.
+    """
+    if os.environ.get("RECAP_STRIP_WATERMARK", "1").lower() in ("0", "false", "no"):
+        return rgb, 0, 0
+    if rgb.ndim != 3 or rgb.shape[0] < 200 or rgb.shape[1] < 120:
+        return rgb, 0, 0
+    H, W = rgb.shape[:2]
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.int16)
+    row_ink = ((g < 150).mean(axis=1))
+
+    # derive per-line bands: prefer detector text boxes, else find full-width
+    # text-ink runs
+    lines = []  # (y1, y2, width_frac)
+    if text_boxes:
+        for tb in text_boxes:
+            x1, y1, x2, y2 = int(tb[0]), int(tb[1]), int(tb[2]), int(tb[3])
+            y1 = max(0, min(H, y1)); y2 = max(0, min(H, y2))
+            if y2 - y1 >= 4:
+                lines.append((y1, y2, (x2 - x1) / max(1.0, W)))
+    else:
+        inked = row_ink > 0.05
+        i = 0
+        while i < H:
+            if not inked[i]:
+                i += 1; continue
+            j = i
+            while j < H and inked[j]:
+                j += 1
+            # estimate this line's width span from the middle row
+            mid = (i + j) // 2
+            cols = np.where(g[mid] < 150)[0]
+            wf = (cols[-1] - cols[0]) / max(1.0, W) if len(cols) else 0.0
+            lines.append((i, j, wf))
+            i = j
+    lines = [(a, b, wf) for (a, b, wf) in lines if wf >= 0.48 and 4 <= (b - a) <= 0.14 * H]
+    if len(lines) < 2:
+        return rgb, 0, 0
+    lines.sort()
+
+    def _edge_stack(near_bottom: bool):
+        cand = sorted(lines, key=lambda t: -t[0] if near_bottom else t[0])
+        stack = [cand[0]]
+        for ln in cand[1:]:
+            top = min(stack, key=lambda t: t[0])
+            bot = max(stack, key=lambda t: t[1])
+            if near_bottom and 0 <= top[0] - ln[1] <= 30:
+                stack.append(ln)
+            elif (not near_bottom) and 0 <= ln[0] - bot[1] <= 30:
+                stack.append(ln)
+            else:
+                break
+        if len(stack) < 2:
+            return None
+        s0 = min(t[0] for t in stack)
+        s1 = max(t[1] for t in stack)
+        cap = int(max_frac * H)
+        if near_bottom:
+            if H - s1 > 24 or (H - s0) > cap:
+                return None
+            k = s0 - 1
+            if k > 3 and not (row_ink[max(0, k - 5):k + 1].mean() < 0.05):
+                return None
+            return ("bottom", s0)
+        else:
+            if s0 > 24 or s1 > cap:
+                return None
+            k = s1 + 1
+            if k < H - 4 and not (row_ink[k:min(H, k + 6)].mean() < 0.05):
+                return None
+            return ("top", s1)
+
+    top_rm = bot_rm = 0
+    b = _edge_stack(near_bottom=True)
+    if b:
+        bot_rm = H - b[1]
+        rgb = rgb[:b[1]]
+    if rgb.shape[0] > 200:
+        # recheck top edge on the possibly-shortened crop
+        H2 = rgb.shape[0]
+        t = None
+        tl = [(a, bb, wf) for (a, bb, wf) in lines if bb <= H2]
+        if len(tl) >= 2:
+            saved = lines
+            lines = tl
+            row_ink = ((cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.int16) < 150).mean(axis=1))
+            H = H2
+            t = _edge_stack(near_bottom=False)
+            lines = saved
+        if t:
+            top_rm = t[1]
+            rgb = rgb[top_rm:]
+    return rgb, top_rm, bot_rm
+
+
+def _trim_edge_whitespace(rgb, keep=36):
+    """Drop leading / trailing full-width near-pure white or black rows down
+    to a `keep`-px margin. Unlike _border_trim_amounts this is UNCAPPED: the
+    conservative strip cutter puts its cut at the midpoint of a gutter, so a
+    panel can inherit hundreds of px of pure gutter on an edge, and that is
+    never content. Returns (trimmed_rgb, rows_removed_from_top)."""
+    if rgb.ndim != 3 or rgb.shape[0] < 80:
+        return rgb, 0
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    H = g.shape[0]
+    bar = (((g >= 244).mean(axis=1) >= 0.985) | ((g <= 14).mean(axis=1) >= 0.985))
+    t = 0
+    while t < H and bar[t]:
+        t += 1
+    b = 0
+    while b < H and bar[H - 1 - b]:
+        b += 1
+    t = max(0, t - keep)
+    b = max(0, b - keep)
+    if t + b >= H - 40:
+        return rgb, 0
+    return rgb[t:H - b], t
+
+
+def _tall_display_window(rgb, max_aspect=2.5, target_aspect=1.85):
+    """Pick the vertical sub-window of a very tall grouped panel that best
+    shows the DRAWN ART, so the on-screen frame is a readable panel instead
+    of a hair-thin centre ribbon. The OCR crop stays the full height, so no
+    dialogue is lost from the narration — a bubble that scrolls off the
+    displayed frame is still transcribed and spoken.
+
+    Returns (y0, y1). Falls back to the whole crop when the panel isn't tall,
+    or has no clear art concentration (a genuine tall scroll shot)."""
+    if os.environ.get("RECAP_STRIP_TALL_WINDOW", "1").lower() in ("0", "false", "no"):
+        return 0, rgb.shape[0]
+    H, W = rgb.shape[:2]
+    if rgb.ndim != 3 or H <= int(max_aspect * W):
+        return 0, H
+    win = int(target_aspect * W)
+    if win >= H:
+        return 0, H
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.int16)
+    # an "art" row is substantially non-white across its width; a speech
+    # bubble reads as a mostly-white row (thin outline + a little text), so
+    # this weights real drawn panels far above floating dialogue
+    art = (g < 232).mean(axis=1)
+    art = np.clip((art - 0.30) / 0.40, 0.0, 1.0)          # soft threshold ~0.30
+    k = 41
+    dens = np.convolve(art, np.ones(k, np.float32) / k, mode="same")
+    csum = np.concatenate([[0.0], np.cumsum(dens)])
+    best_s, best_v = 0, -1.0
+    for s in range(0, H - win + 1, 12):
+        v = float(csum[s + win] - csum[s])
+        if v > best_v:
+            best_v, best_s = v, s
+    if best_v <= 0.02 * win:
+        return 0, H
+    y0, y1 = best_s, best_s + win
+    # nudge each edge off the middle of an ink run so the visible frame
+    # doesn't slice cleanly through a bubble / face
+    lowink = art < 0.12
+    for _ in range(1):
+        if y0 > 0 and not lowink[y0]:
+            cand = np.where(lowink[max(0, y0 - 180):y0 + 1])[0]
+            if len(cand):
+                y0 = max(0, y0 - 180) + int(cand[-1])
+        if y1 < H and not lowink[min(H - 1, y1)]:
+            cand = np.where(lowink[y1:min(H, y1 + 180)])[0]
+            if len(cand):
+                y1 = y1 + int(cand[0])
+    return max(0, y0), min(H, y1)
+
+
+def _frame_reconstructed_strip(cfg, chapter, out_dir):
+    """Reconstruct the chapter strip, cut it whole, emit one frame per panel."""
+    from PIL import Image
+    strip, spans = _reconstruct_strip(chapter.panel_paths)
+    if strip is None:
+        return []
+    H, W = strip.shape[:2]
+    gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
+    log.info("[%s] reconstructed strip %dx%d from %d chunks", chapter.tag, W, H, len(chapter.panel_paths))
+    try:
+        tb = _detect_text_boxes(gray)
+        texts = [(int(a), int(c_), int(b_), int(d_), 0.9) for (a, c_, b_, d_) in tb]
+    except Exception:
+        texts = []
+    try:
+        _t0 = time.time()
+        nocut = _face_row_mask(strip, H)
+        log.info("[%s] face no-cut mask over %.1fs (%d guarded rows)", chapter.tag,
+                 time.time() - _t0, int(np.count_nonzero(nocut)))
+    except Exception as exc:
+        log.warning("[%s] face no-cut detection failed (%s) — gutter-only guard", chapter.tag, exc)
+        nocut = None
+    boxes = _cut_strip_into_panels(gray, texts, W, H, nocut=nocut)
+
+    def _page_for(y):
+        for (nm, y0, y1) in spans:
+            if y0 <= y < y1:
+                return nm, y0
+        return (spans[-1][0], spans[-1][1]) if spans else ("001.jpg", 0)
+
+    entries, counter = [], 0
+    for (x1, y1, x2, y2) in boxes:
+        crop = strip[max(0, y1):min(H, y2), max(0, x1):min(W, x2)]
+        t, b, l, r = _border_trim_amounts(crop)
+        if (t or b or l or r) and crop.shape[0] - t - b >= 24:
+            crop = crop[t:crop.shape[0] - b, l:crop.shape[1] - r]
+            y1 += t
+        crop, _ct = _trim_edge_whitespace(crop)
+        y1 += _ct
+        crop = _squeeze_internal_whitespace(crop)
+        gc = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        if _is_blank_crop(gc) or crop.shape[0] < 24 or crop.shape[1] < 24:
+            continue
+        pi = int(spans and next((k for k, (_n, a, bb) in enumerate(spans) if a <= y1 < bb), 0))
+        if (pi <= 1 or pi >= len(chapter.panel_paths) - 2) and _looks_like_credits_panel(crop):
+            log.info("[%s] strip: skipped credits panel near chunk %d", chapter.tag, pi + 1)
+            continue
+        # the displayed frame focuses on the art of a very tall grouped panel;
+        # OCR still sees the whole crop so every bubble is transcribed
+        dw0, dw1 = _tall_display_window(crop)
+        disp = crop[dw0:dw1] if (dw0, dw1) != (0, crop.shape[0]) else crop
+        # trim a burned-on aggregator watermark stack from the displayed frame
+        # only (the OCR crop `oc` below keeps it, so narration is unaffected)
+        _ch0 = disp.shape[0]
+        _cy = y1 + dw0
+        _tl = [(int(t[0]) - x1, int(t[1]) - _cy, int(t[2]) - x1, int(t[3]) - _cy) for t in texts]
+        _tl = [(max(0, a), max(0, b), min(disp.shape[1], c), min(disp.shape[0], d))
+               for (a, b, c, d) in _tl if b < disp.shape[0] and d > 0 and c > a and d > b]
+        disp, _wt, _wb = _strip_edge_watermark(disp, text_boxes=_tl or None)
+        if (_wt or _wb) and disp.shape[0] >= 24:
+            log.info("[%s] frame %d: trimmed watermark (top %d, bot %d)", chapter.tag, counter, _wt, _wb)
+        elif disp.shape[0] < 24:
+            disp = crop[dw0:dw1] if (dw0, dw1) != (0, crop.shape[0]) else crop
+        fp = out_dir / f"frame_{counter:05d}.jpg"
+        _compose_canvas(Image.fromarray(disp)).save(fp, quality=92)
+        ocr_path = ""
+        if _OCR_FRAMES_ENABLED:
+            ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
+            try:
+                # OCR crop: aim the WIDTH at the target (text legibility scales
+                # with column width, not the long side) and only clamp height
+                # for a genuinely giant panel — scaling a tall grouped panel by
+                # its long side crushed the text to an unreadable sliver.
+                oc = crop
+                tgt = int(os.environ.get("RECAP_OCR_MAX_SIDE", "1100"))
+                hh, ww = oc.shape[:2]
+                s = tgt / max(1, ww)
+                if hh * s > tgt * 6:
+                    s = (tgt * 6) / max(1, hh)
+                if abs(s - 1.0) > 0.05:
+                    oc = cv2.resize(oc, (max(1, int(ww * s)), max(1, int(hh * s))),
+                                    interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+                Image.fromarray(oc).save(ocr_fp, quality=94)
+                ocr_path = str(ocr_fp.resolve())
+            except Exception:
+                ocr_path = ""
+        nm, y0 = _page_for(y1)
+        entries.append(FrameEntry(
+            frame_id=f"{chapter.tag}_frame_{counter:05d}",
+            filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
+            source_page=nm, source_index=pi, frame_kind="scroll_frame",
+            source_box=[int(x1), int(max(0, y1 - y0)), int(x2), int(y2 - y0)],
+        ))
+        counter += 1
+    log.info("[%s] strip reconstruction: %d chunks -> %d panel frames", chapter.tag,
+             len(chapter.panel_paths), len(entries))
+    _slice_qa_check(chapter.tag, entries, [])
+    return entries
 
 
 def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
@@ -2601,23 +3809,64 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
     art, the two halves are stitched and emitted as ONE frame — never cut."""
     from PIL import Image
 
-    # 1. detect panels on every page, note which touch the top/bottom edge
-    pages = []   # (page_idx, name, rgb_ndarray, gray_ndarray, [ (box, clip_top, clip_bot) ])
+    # Aggregators (mgeko, toonily, mangapill, …) serve a chapter as individual
+    # ~760x850 panel TILES, not a raw tall strip. On those, panel detection +
+    # borderless split + edge-trim fragments clean panels and crops through
+    # faces — pass each tile straight through instead.
+    if _pages_are_presliced_tiles(chapter.panel_paths):
+        log.info("[%s] source pages look pre-sliced into panel tiles — using passthrough framing", chapter.tag)
+        return _frame_presliced_tiles(cfg, chapter, out_dir)
+
+    # Chunked webtoon: glue the arbitrary chunks back into the original strip
+    # and cut the whole thing, so the cutter never sees a half-panel. NOT for
+    # tiles (already handled above). RECAP_STRIP_RECONSTRUCT forces it on/off.
+    _sr = os.environ.get("RECAP_STRIP_RECONSTRUCT", "auto").lower()
+    if _sr not in ("0", "false", "no") and (
+            _sr in ("1", "true", "yes")
+            or _pages_are_webtoon_chunks(chapter.panel_paths)
+            or _pages_are_webtoon_strip(chapter.panel_paths)):
+        log.info("[%s] webtoon strip — reconstructing full column before slicing", chapter.tag)
+        _r = _frame_reconstructed_strip(cfg, chapter, out_dir)
+        if _r:
+            return _r
+        log.warning("[%s] strip reconstruction produced nothing — falling back to per-page", chapter.tag)
+
+    # 1. detect panels on every page, note which touch the top/bottom edge.
+    # This is the CPU-bound half of framing (image decode + YOLO panel detect
+    # + RT-DETR text detect per page) and every page is independent, so run it
+    # across a small thread pool — the ONNX sessions (_panel_yolo, text
+    # detector) are shared and their .run() is thread-safe. cv2/PIL release
+    # the GIL. The seam-stitch/emit pass below stays serial (it needs pages in
+    # order and shares a frame counter). RECAP_FRAME_WORKERS overrides (1 =
+    # back to serial). Measured ~3x on this leg on the 4-core box.
     total = len(chapter.panel_paths)
-    for page_idx, page_path in enumerate(chapter.panel_paths):
+    _fw = max(1, int(os.environ.get("RECAP_FRAME_WORKERS", "3")))
+
+    def _scan_page(item):
+        page_idx, page_path = item
         try:
             with Image.open(page_path) as im:
                 rgb = np.array(im.convert("RGB"))
         except Exception as exc:
             log.warning("[%s] skipping unreadable page %s: %s", chapter.tag, page_path.name, exc)
-            continue
+            return None
         h, w = rgb.shape[:2]
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         dets = []
         for (x1, y1, x2, y2) in _detect_page_panels(Image.fromarray(rgb)):
             dets.append(((int(x1), int(y1), int(x2), int(y2)),
                          y1 <= 0.012 * h, y2 >= 0.988 * h))
-        pages.append([page_idx, page_path.name, rgb, gray, dets])
+        return [page_idx, page_path.name, rgb, gray, dets]
+
+    if _fw > 1 and total > 1:
+        # warm the lazy-init detector singletons once, serially, so the pool
+        # threads don't race on first construction
+        _detect_page_panels(Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)))
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_fw, total)) as _ex:
+            pages = [p for p in _ex.map(_scan_page, list(enumerate(chapter.panel_paths))) if p is not None]
+    else:
+        pages = [p for p in (_scan_page(it) for it in enumerate(chapter.panel_paths)) if p is not None]
 
     seam_stitch = (os.environ.get("RECAP_SEAM_STITCH", "1").lower() not in ("0", "false", "no")
                    and _pages_are_webtoon_chunks(chapter.panel_paths))
@@ -2627,17 +3876,18 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
 
     def _emit(crop_rgb, page_idx, page_name, src_box=None):
         nonlocal counter
-        # drop dead margin the detector/stitch left on the crop edges
-        g = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-        ri = np.where((g < 234).mean(axis=1) >= 0.02)[0]
-        ci = np.where((g < 234).mean(axis=0) >= 0.02)[0]
-        if ri.size >= 4 and ci.size >= 4:
+        # Drop ONLY pure letterbox (near-white / near-black full-width bands),
+        # capped at 10% per side. The old `< 234` ink-density trim shaved the
+        # edges off coloured panels, SFX and faces — the exact "cuts through
+        # content" complaint. `_safe_border_trim` never touches coloured art.
+        h0, w0 = crop_rgb.shape[:2]
+        t, b, l, r = _border_trim_amounts(crop_rgb)
+        if (t or b or l or r) and (h0 - t - b) >= 24 and (w0 - l - r) >= 24:
             if src_box is not None:
-                # keep the recorded source-page box in step with the trim
-                bx1, by1, bx2, by2 = src_box
-                src_box = [int(bx1 + ci[0]), int(by1 + ri[0]),
-                           int(bx1 + ci[-1] + 1), int(by1 + ri[-1] + 1)]
-            crop_rgb = crop_rgb[ri[0]:ri[-1] + 1, ci[0]:ci[-1] + 1]
+                bx1, by1, _bx2, _by2 = src_box
+                src_box = [int(bx1 + l), int(by1 + t),
+                           int(bx1 + w0 - r), int(by1 + h0 - b)]
+            crop_rgb = crop_rgb[t:h0 - b, l:w0 - r]
         elif src_box is not None:
             src_box = [int(v) for v in src_box]
         arr_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
@@ -2657,10 +3907,22 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
             try:
                 oc = crop_rgb
-                if max(oc.shape[:2]) < 1500:   # upscale small crops for the detector
-                    s = 1500 / max(oc.shape[:2])
-                    oc = cv2.resize(oc, (int(oc.shape[1] * s), int(oc.shape[0] * s)),
-                                    interpolation=cv2.INTER_CUBIC)
+                # Normalise the OCR crop's long side to RECAP_OCR_MAX_SIDE
+                # (default 1100). Bench on this box: RapidOCR is 427 ms/frame
+                # at 1500 px vs 293 ms at 1100 vs 203 at 900 — image size is
+                # the dominant cost, and PP-OCRv5-mobile's detector runs at
+                # ~960 px internally anyway, so 1100 keeps recognition detail
+                # while cutting OCR wall time ~1.5x. Crucially this now also
+                # DOWNSCALES oversized crops (a 3000 px tall webtoon panel used
+                # to be OCR'd at full height — the real worst case).
+                target = int(os.environ.get("RECAP_OCR_MAX_SIDE", "1100"))
+                m = max(oc.shape[:2])
+                if m > 0 and abs(m - target) / target > 0.05:
+                    s = target / m
+                    interp = cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC
+                    oc = cv2.resize(oc, (max(1, int(oc.shape[1] * s)),
+                                         max(1, int(oc.shape[0] * s))),
+                                    interpolation=interp)
                 Image.fromarray(oc).save(ocr_fp, quality=94)
                 ocr_path = str(ocr_fp.resolve())
             except Exception:
@@ -2728,19 +3990,378 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
                         _emit(merged_crop, page_idx, name)
                         consumed_first.add(pi + 1)
                         continue
-            cx1 = max(0, x1 - pad_x); cy1 = max(0, y1 - pad_y)
-            cx2 = min(w, x2 + pad_x); cy2 = min(h, y2 + pad_y)
+            if _INCLUSIVE_SLICE:
+                prev_y2 = int(dets[di - 1][0][3]) if di > 0 else 0
+                next_y1 = int(dets[di + 1][0][1]) if di < len(dets) - 1 else h
+                cx1, cy1, cx2, cy2 = _inclusive_crop_box(gray, box, prev_y2, next_y1, w, h)
+            else:
+                cx1 = max(0, x1 - pad_x); cy1 = max(0, y1 - pad_y)
+                cx2 = min(w, x2 + pad_x); cy2 = min(h, y2 + pad_y)
             if cx2 - cx1 < w * 0.12 or cy2 - cy1 < h * 0.02:
                 continue
             _emit(rgb[cy1:cy2, cx1:cx2], page_idx, name, src_box=(cx1, cy1, cx2, cy2))
 
     log.info("[%s] reference-style framing: %d pages -> %d panel frames",
              chapter.tag, total, len(entries))
+    _slice_qa_check(chapter.tag, entries, pages)
     return entries
 
 
+def _slice_qa_check(tag: str, entries: "List[FrameEntry]", pages) -> None:
+    """Sanity-score a chapter's slice result and WARN on pathological layouts
+    (borrowed from the zainrana558/slicer QA-scorer idea). Purely advisory —
+    it never changes the frames — but a loud log line on a chapter that sliced
+    badly lets a 100-chapter batch be caught before it wastes hours. Silenced
+    with RECAP_SLICE_QA=0."""
+    if os.environ.get("RECAP_SLICE_QA", "1").lower() in ("0", "false", "no"):
+        return
+    n = len(entries)
+    if n == 0:
+        log.warning("[%s] SLICE QA: 0 panels emitted — the chapter will be empty", tag)
+        return
+    try:
+        page_h = [p[2].shape[0] for p in pages if p and p[2] is not None] if pages else []
+    except Exception:
+        page_h = []
+    if not page_h:
+        # tile-passthrough (no page scan): score on panel count + sliver ratio only
+        hs = [(b[3] - b[1]) for e in entries if (b := e.source_box) and len(b) == 4]
+        slivers = sum(1 for h in hs if h < 120)
+        if slivers > max(3, 0.30 * n):
+            log.warning("[%s] SLICE QA: %d/%d sliver panels (<120px)", tag, slivers, n)
+        else:
+            log.info("[%s] SLICE QA: ok (%d panels, passthrough)", tag, n)
+        return
+    total_h = float(sum(page_h)) or 1.0
+    heights, widths = [], []
+    for e in entries:
+        b = e.source_box
+        if b and len(b) == 4:
+            heights.append(b[3] - b[1])
+            widths.append(b[2] - b[0])
+    if not heights:
+        return
+    covered = float(sum(heights))
+    coverage = covered / total_h
+    per_page = n / max(1, len(page_h))
+    slivers = sum(1 for h in heights if h < 120)
+    giants = sum(1 for h, w in zip(heights, widths) if w > 0 and h > 4.0 * w)
+    issues = []
+    if coverage < 0.28:
+        issues.append(f"low art coverage {coverage:.0%} — panels likely being MISSED")
+    if coverage > 1.15:
+        issues.append(f"coverage {coverage:.0%} — panels overlapping / double-counted")
+    if per_page < 1.2:
+        issues.append(f"only {per_page:.1f} panels/page — under-segmenting (beats glued together)")
+    if slivers > max(3, 0.30 * n):
+        issues.append(f"{slivers}/{n} sliver panels (<120px) — over-segmenting")
+    if giants:
+        issues.append(f"{giants} panel(s) taller than 4x their width — probably an unsplit multi-beat block")
+    if issues:
+        log.warning("[%s] SLICE QA: %s", tag, " | ".join(issues))
+    else:
+        log.info("[%s] SLICE QA: ok (%d panels, %.0f%% coverage, %.1f/page)",
+                 tag, n, coverage * 100, per_page)
+
+
+_VISUAL_PROMPT = (
+    "Caption this manhwa artwork for an audio recap. Reply with ONE sentence, "
+    "max 18 words, present tense, describing only the physical action and mood "
+    "— e.g. 'A swordsman lunges as shadowy figures surround him.' "
+    "Rules: start with a noun ('A ...', 'Two ...', 'The ...'). Refer to people "
+    "as he/she/they or by role. Do NOT quote or read any text. Do NOT use the "
+    "words image, picture, panel, scene, comic, manhwa, artwork, illustration, "
+    "shows, depicts, features. If it is only a logo, credits, an ad, a title "
+    "card, or blank, reply exactly: SKIP"
+)
+
+
+_smolvlm_cache: "dict" = {}
+
+
+def _get_smolvlm():
+    """Lazy-load SmolVLM2-500M (Apache-2.0, HF-native) for local, key-free panel
+    captioning. Returns (model, processor) or None. ~3.5 s/panel on this 4-vCPU
+    box WHEN the processor's longest_edge is pinned to 512 — the default 2048
+    tiles each frame into a 4x4 grid and blows per-panel latency to ~30 s.
+
+    First call downloads ~500 MB to the HF cache. Any failure (transformers
+    missing, num2words missing, OOM, download blocked) returns None and the
+    caller falls through to its next provider."""
+    if "v" in _smolvlm_cache:
+        return _smolvlm_cache["v"]
+    _smolvlm_cache["v"] = None
+    model_id = os.environ.get("RECAP_SMOLVLM_MODEL", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+    edge = int(os.environ.get("RECAP_SMOLVLM_EDGE", "512"))
+    try:
+        _cap_torch_threads()
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+        proc = AutoProcessor.from_pretrained(model_id, size={"longest_edge": edge})
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype=torch.float32, _attn_implementation="eager").eval()
+        _smolvlm_cache["v"] = (model, proc, edge)
+        log.info("Loaded SmolVLM2 local caption model (%s, longest_edge=%d)", model_id, edge)
+    except Exception as exc:
+        log.warning("SmolVLM2 load failed (%s) — local captioning unavailable "
+                    "(pip install num2words if that is the error)", exc)
+        _smolvlm_cache["v"] = None
+    return _smolvlm_cache["v"]
+
+
+def _resolve_visual_client(cfg: "PipelineConfig"):
+    """Return (call_fn, label) where call_fn(jpeg_bytes)->str produces a one-line
+    visual caption, or (None, 'none') if no vision engine is available.
+
+    Precedence for provider='auto': a cloud key if the user supplied one
+    (fast), else — only when RECAP_VISUAL_LOCAL=1 — local SmolVLM2, else
+    nothing (local models are ~3.5 s/panel so they stay opt-in).
+    """
+    import base64 as _b64
+    import json as _json
+    import urllib.request
+
+    prov = (cfg.visual_provider or "auto").lower()
+    groq_key = cfg.groq_api_key or os.environ.get("GROQ_API_KEY")
+    gem_key = cfg.gemini_api_key or os.environ.get("GEMINI_API_KEY")
+    orouter_key = cfg.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+    ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
+    def _ollama_up():
+        try:
+            urllib.request.urlopen(ollama_base + "/api/tags", timeout=3).read()
+            return True
+        except Exception:
+            return False
+
+    if prov == "auto":
+        # 'auto' deliberately does NOT fall through to local Ollama: on a
+        # GPU-less box llava/moondream run ~20-70s PER PANEL, which turns even
+        # a 3-chapter job into hours. A cloud free-tier key (Groq / Gemini) is
+        # ~1-2s/panel. With no key, 'auto' means "off" — the user must pick
+        # 'ollama' explicitly (and accept the wait) to caption locally.
+        if groq_key:
+            prov = "groq"
+        elif gem_key:
+            prov = "gemini"
+        elif orouter_key:
+            prov = "openrouter"
+        elif os.environ.get("RECAP_VISUAL_LOCAL", "0").lower() in ("1", "true", "yes"):
+            prov = "smolvlm"
+        else:
+            log.warning("--describe-visuals: no cloud vision key (GROQ/GEMINI/"
+                        "OPENROUTER) — skipping. Use visual_provider=smolvlm (local "
+                        "SmolVLM2, ~3.5s/panel) or =ollama to caption without a key.")
+            return None, "none"
+
+    if prov == "none":
+        return None, "none"
+
+    if prov == "smolvlm":
+        loaded = _get_smolvlm()
+        if not loaded:
+            return None, "none"
+        model, proc, _edge = loaded
+        import torch
+        _max_new = int(os.environ.get("RECAP_SMOLVLM_TOKENS", "48"))
+        # SmolVLM2-500M parrots few-shot examples and drowns in long negative
+        # rule lists — the elaborate _VISUAL_PROMPT makes it worse, not better.
+        # A short direct instruction gives the cleanest output; the regex
+        # post-processing in _describe_frames strips any "comic/panel" framing.
+        _prompt = os.environ.get("RECAP_SMOLVLM_PROMPT") or (
+            "Describe what is happening in this scene in one short sentence. "
+            "Focus on the characters and their action or expression. "
+            "Do not mention comics, panels, or art style.")
+
+        def _call(jpeg: bytes) -> str:
+            from PIL import Image
+            import io as _io
+            im = Image.open(_io.BytesIO(jpeg)).convert("RGB")
+            msgs = [{"role": "user", "content": [
+                {"type": "image", "image": im},
+                {"type": "text", "text": _prompt},
+            ]}]
+            inp = proc.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt")
+            with torch.no_grad():
+                ids = model.generate(**inp, do_sample=False, max_new_tokens=_max_new)
+            txt = proc.batch_decode(
+                ids[:, inp["input_ids"].shape[-1]:], skip_special_tokens=True)[0].strip()
+            # keep just the first sentence — the model tends to ramble a second.
+            m = re.match(r"^(.+?[.!?])(?:\s|$)", txt)
+            return (m.group(1) if m else txt).strip()
+
+        return _call, f"smolvlm/{os.environ.get('RECAP_SMOLVLM_MODEL', 'SmolVLM2-500M')}"
+
+    if prov == "ollama":
+        if not _ollama_up():
+            log.warning("--describe-visuals: Ollama not reachable at %s — skipping", ollama_base)
+            return None, "none"
+        # moondream (1.8B, ~20s/panel) is faster than llava:7b (~70s/panel) on
+        # CPU but its captions were unreliable in testing; llava is the default
+        # despite the cost. RECAP_VISUAL_MODEL overrides. Either way this is an
+        # "leave it running" path on a GPU-less box — see RECAP_VISUAL_MAX.
+        model = cfg.visual_model or os.environ.get("RECAP_VISUAL_MODEL", "llava:7b")
+
+        def _call(jpeg: bytes) -> str:
+            body = _json.dumps({
+                "model": model,
+                "prompt": _VISUAL_PROMPT,
+                "images": [_b64.b64encode(jpeg).decode()],
+                "stream": False,
+                "options": {"temperature": 0.2, "num_predict": 60},
+            }).encode()
+            req = urllib.request.Request(ollama_base + "/api/generate", data=body,
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                return (_json.load(r).get("response") or "").strip()
+
+        return _call, f"ollama/{model}"
+
+    # cloud: all OpenAI-chat-compatible (image_url data URI)
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None, "none"
+    if prov == "groq":
+        client = OpenAI(api_key=groq_key, base_url=GROQ_BASE_URL)
+        model = cfg.visual_model or "meta-llama/llama-4-scout-17b-16e-instruct"
+    elif prov == "gemini":
+        client = OpenAI(api_key=gem_key,
+                        base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+        model = cfg.visual_model or "gemini-2.0-flash"
+    elif prov == "openrouter":
+        client = OpenAI(api_key=orouter_key, base_url="https://openrouter.ai/api/v1")
+        model = cfg.visual_model or "google/gemini-2.0-flash-exp:free"
+    else:
+        return None, "none"
+
+    def _call(jpeg: bytes) -> str:
+        uri = "data:image/jpeg;base64," + _b64.b64encode(jpeg).decode()
+        resp = client.chat.completions.create(
+            model=model, temperature=0.2, max_tokens=80,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": _VISUAL_PROMPT},
+                {"type": "image_url", "image_url": {"url": uri}},
+            ]}],
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    return _call, f"{prov}/{model}"
+
+
+def _describe_frames(cfg: "PipelineConfig", chapter: "Chapter",
+                     frame_entries: List["FrameEntry"], dialogue: List[str],
+                     phase_cb=None) -> List[str]:
+    """Return a visual caption (or "") per frame. Best-effort: any failure
+    yields "" for that frame and the pipeline carries on as before.
+
+    By default only frames with NO usable dialogue are captioned (that is
+    exactly where the recap currently goes silent). RECAP_VISUAL_ALL=1
+    captions every frame (visual context even under dialogue)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+    import io as _io
+
+    call, label = _resolve_visual_client(cfg)
+    if call is None:
+        log.warning("[%s] --describe-visuals: no vision engine available "
+                    "(no cloud key, Ollama not reachable) — skipping", chapter.tag)
+        return [""] * len(frame_entries)
+
+    caption_all = os.environ.get("RECAP_VISUAL_ALL", "0").lower() in ("1", "true", "yes")
+    todo = [i for i, e in enumerate(frame_entries)
+            if caption_all or not (dialogue[i] or "").strip()]
+    if not todo:
+        return [""] * len(frame_entries)
+
+    is_local = label.startswith(("ollama", "smolvlm"))
+    is_cloud = not is_local
+    # Hard per-chapter cap so a mis-set local run can't balloon into hours.
+    # Cloud is fast enough to leave effectively uncapped. Local defaults to
+    # the first 40 silent panels/chapter; RECAP_VISUAL_MAX overrides (0 = no cap).
+    _cap = int(os.environ.get("RECAP_VISUAL_MAX", "0" if is_cloud else "40"))
+    if _cap and len(todo) > _cap:
+        log.info("[%s] --describe-visuals: capping %d -> %d frames "
+                 "(RECAP_VISUAL_MAX; raise it or use a cloud key for full coverage)",
+                 chapter.tag, len(todo), _cap)
+        todo = todo[:_cap]
+
+    # SmolVLM2 is one in-process torch model — concurrent generate() calls just
+    # thrash the same 4 cores and double memory, so pin it to 1 worker.
+    _default_workers = "6" if is_cloud else ("1" if label.startswith("smolvlm") else "2")
+    workers = max(1, int(os.environ.get("RECAP_VISUAL_WORKERS", _default_workers)))
+    log.info("[%s] --describe-visuals: captioning %d/%d frames via %s (%d-way)",
+             chapter.tag, len(todo), len(frame_entries), label, workers)
+
+    def _prep(path: str) -> bytes:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            if max(im.size) > 768:            # small = faster + plenty for a caption
+                im.thumbnail((768, 768), Image.LANCZOS)
+            b = _io.BytesIO()
+            im.save(b, format="JPEG", quality=85)
+            return b.getvalue()
+
+    out = [""] * len(frame_entries)
+    t0 = time.time()
+
+    def _one(i: int):
+        e = frame_entries[i]
+        try:
+            # the FULL composed frame — not e.ocr_path, which is the tight
+            # text-only crop used for OCR (captioning that would just re-read
+            # the speech bubble).
+            cap = call(_prep(e.path))
+        except Exception as exc:
+            log.debug("[%s] visual caption failed for frame %d (%s)", chapter.tag, i, exc)
+            return
+        cap = re.sub(r"\s+", " ", cap).strip().strip('"“”').strip()
+        if not cap or cap.upper().startswith("SKIP") or len(cap) < 8:
+            return
+        # Models (llava especially) ignore "don't mention it's a comic" and
+        # open with "The image is a comic book panel featuring X ..." or "This
+        # panel shows X ...". Strip that framing clause down to X.
+        cap = re.sub(
+            r"^(the|this)\s+(image|panel|picture|artwork|art|scene|illustration|drawing|comic)"
+            r"[^,.:;]*?(?:\b(?:show(?:s|ing|n)?|depict(?:s|ing)?|featur(?:es|ing)|"
+            r"is|appears to (?:show|depict|be)|portrays?)\b)\s*",
+            "", cap, flags=re.I).strip()
+        cap = re.sub(r"^(?:a |an )?(?:comic |manhwa |manga |webtoon )?panel\s+(?:show(?:s|ing)?|of|with)\s+",
+                     "", cap, flags=re.I).strip()
+        cap = re.sub(r"\b(comic|manhwa|manga|webtoon)\s+(book\s+)?(panel|page|strip)\b", "scene", cap, flags=re.I)
+        cap = cap.strip().strip('"“”,').strip()
+        # drop a dangling half-sentence from num_predict truncation
+        if len(cap) > 40 and cap[-1:] not in ".!?…":
+            cut = max(cap.rfind("."), cap.rfind("!"), cap.rfind("?"))
+            if cut > 20:
+                cap = cap[:cut + 1]
+        if cap and len(cap) >= 8:
+            out[i] = cap[0].upper() + cap[1:]
+
+    _done = [0]
+    _n = len(todo)
+
+    def _one_tracked(i):
+        _one(i)
+        _done[0] += 1
+        if phase_cb and _done[0] % 5 == 0:
+            try:
+                phase_cb("visual", 0.55 + 0.44 * (_done[0] / max(1, _n)))
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_one_tracked, todo))
+    got = sum(1 for c in out if c)
+    log.info("[%s] --describe-visuals: %d/%d captioned in %.1fs",
+             chapter.tag, got, len(todo), time.time() - t0)
+    return out
+
+
 def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
-                                    frame_entries: List["FrameEntry"]) -> bool:
+                                    frame_entries: List["FrameEntry"], phase_cb=None) -> bool:
     """OCR each composed frame with the local PaddleOCR/RapidOCR service and
     rewrite narration.json keyed by frame filename, so downstream narration is
     exactly this panel's transcribed words (word-for-word, per panel) instead
@@ -2760,9 +4381,12 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
     if not paths:
         return False
     try:
+        _series = (getattr(cfg, "recap_title", None)
+                   or os.environ.get("RECAP_OCR_SERIES")
+                   or (cfg.input_dir.name if getattr(cfg, "input_dir", None) else ""))
         req = urllib.request.Request(
             f"{base}/ocr/batch",
-            data=_json.dumps({"images": paths}).encode(),
+            data=_json.dumps({"images": paths, "series": _series}).encode(),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=max(120, len(paths) * 8)) as r:
@@ -2799,18 +4423,51 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
         if best:
             texts[i + 1][0] = " ".join(bw[best:]).strip()
 
+    # OPTIONAL: fold in a one-line visual caption per panel so action panels
+    # aren't just silence. Off unless --describe-visuals. The caption is
+    # prepended to any dialogue ("He raises his blade. 'You will not pass.'")
+    # and a caption-only panel flips NO_TEXT -> SUCCESS so it gets narrated.
+    captions = None
+    if getattr(cfg, "describe_visuals", False):
+        if phase_cb:
+            try:
+                phase_cb("visual", 0.55)
+            except Exception:
+                pass
+        try:
+            captions = _describe_frames(cfg, chapter, frame_entries, [t[0] for t in texts], phase_cb=phase_cb)
+        except Exception as exc:
+            log.warning("[%s] --describe-visuals failed wholesale (%s) — OCR-only", chapter.tag, exc)
+            captions = None
+
     narration = []
     for i, e in enumerate(frame_entries):
         text, status = texts[i]
         if not text and status == "SUCCESS":
             status = "NO_TEXT"
+        visual = (captions[i] if captions else "") or ""
+        if visual:
+            cap = visual.rstrip(" .") + "."
+            dlg = text.strip()
+            if dlg:
+                dlg_p = dlg if dlg[-1:] in ".!?…\"'”" else dlg + "."
+                text = f"{cap} {dlg_p}"
+            else:
+                text = cap
+            if status in ("NO_TEXT", "FAILED", "UNCERTAIN"):
+                status = "SUCCESS"
         e.ocr_text, e.ocr_status = text, status
-        narration.append({"image": e.filename, "text": text, "status": status})
+        entry = {"image": e.filename, "text": text, "status": status}
+        if visual:
+            entry["visual"] = visual
+        narration.append(entry)
 
     (chapter.folder / "narration.json").write_text(_json.dumps(narration, indent=2), encoding="utf-8")
     chapter.image_narrations = {n["image"]: n for n in narration}
     got = sum(1 for n in narration if n["text"])
-    log.info("[%s] per-frame OCR: %d/%d frames transcribed (RapidOCR)", chapter.tag, got, len(narration))
+    vgot = sum(1 for n in narration if n.get("visual"))
+    log.info("[%s] per-frame narration: %d/%d have text (%d with visual caption)",
+             chapter.tag, got, len(narration), vgot)
 
     # the upscaled raw-crop OCR images have served their purpose — reclaim the space
     for e in frame_entries:
@@ -2823,9 +4480,13 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
     return True
 
 
-def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
+def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter, phase_cb=None) -> List[tuple]:
     """
     Slice each source image into individual panel frames.
+
+    `phase_cb(substage: str, frac: float)` — optional; called at the frame /
+    ocr / visual sub-phase boundaries so a caller can drive a smooth progress
+    bar through this (slow) step instead of only jumping at chapter edges.
 
     Default (RECAP_FRAME_MODE=page): one frame per source page, tall pages
     split on gutter rows — reproduces the reference recap style (whole
@@ -2852,9 +4513,18 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     log.info("[%s] manifest invalid or missing (%s) — slicing source pages into canonical frames", chapter.tag, reason)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    def _ph(name, frac):
+        if phase_cb:
+            try:
+                phase_cb(name, frac)
+            except Exception:
+                pass
+
     if os.environ.get("RECAP_FRAME_MODE", "page").lower() != "panel":
+        _ph("frame", 0.0)
         frame_entries = _frame_pages_reference_style(cfg, chapter, out_dir)
-        _ocr_frames_into_narration_json(cfg, chapter, frame_entries)
+        _ph("ocr", 0.40)
+        _ocr_frames_into_narration_json(cfg, chapter, frame_entries, phase_cb=phase_cb)
         manifest = CanonicalManifest(
             manifest_version=MANIFEST_VERSION,
             job_id=cfg.job_id,
@@ -3353,27 +5023,58 @@ def _compose_canvas(crop):
     _b *= (1.0 - 0.22 * np.clip(_r, 0, 1))[..., None]
     canvas = Image.fromarray(np.clip(_b, 0, 255).astype(np.uint8)).convert("RGB")
 
-    # Contain-fit: scale to fit ENTIRELY within canvas, centered — the whole
-    # panel (bubbles, character head and feet) always visible, over the
-    # blurred backdrop. This is how the reference recap frames each view.
-    # NOTE: NO cover-crop for tall panels — cropping a tall webtoon panel to
-    # fill more width was clipping speech bubbles ("text sliced through").
-    # A tall panel letterboxes on its own blurred backdrop; that is the
-    # reference look and it never loses a word.
-    fg_scale = min(CANVAS_W / cw, CANVAS_H / ch) * PANEL_FIT_MARGIN
+    # Contain-fit by default (whole panel visible over its blurred backdrop).
+    # But a MODERATELY tall panel (aspect ~1.5–2.9) contain-fits to a thin
+    # centre ribbon that reads as a broken "small strip". For those, fill the
+    # width and crop the vertical overflow — biased to KEEP THE TOP (a webtoon
+    # tall panel puts the face/bubble up top, background/legs below). An
+    # EXTREME aspect (>2.9) is genuine tall scroll art — keep contain so
+    # nothing is lost. RECAP_TALL_COVER=0 forces contain everywhere.
+    # A mildly-tall panel (aspect ~1.45–1.9) contain-fits to a thin ribbon
+    # that reads as a broken "small strip". Fill the width instead and crop
+    # the vertical overflow — but ONLY the rows that are near-empty (a plain
+    # margin), and never a row that carries ink (a bubble / face / SFX). If
+    # neither the top nor the bottom overflow is safe to drop, fall back to
+    # contain and keep the whole panel. Taller than ~1.9 is genuine scroll
+    # art: contain, lose nothing. RECAP_TALL_COVER=0 disables cover entirely.
+    aspect = ch / max(1, cw)
+    want_cover = (os.environ.get("RECAP_TALL_COVER", "1").lower() not in ("0", "false", "no")
+                  and 1.45 <= aspect <= 1.95)
+    fg_contain = min(CANVAS_W / cw, CANVAS_H / ch) * PANEL_FIT_MARGIN
+    fg_scale = fg_contain
+    crop_top = crop_bot = 0
+    if want_cover:
+        cover_scale = (CANVAS_W / cw) * PANEL_FIT_MARGIN
+        fh_cov = int(ch * cover_scale)
+        overflow = max(0, fh_cov - CANVAS_H)
+        if overflow > 0:
+            # inspect the source rows that a cover crop would remove
+            band_src = max(1, int(overflow / cover_scale))
+            gg = cv2.cvtColor(np.asarray(crop), cv2.COLOR_RGB2GRAY)
+            def _inky(a, b):
+                seg = gg[max(0, a):min(ch, b)]
+                return seg.size and float((np.abs(seg.astype(np.int16) - 245) > 30).mean()) > 0.02
+            top_inky, bot_inky = _inky(0, band_src), _inky(ch - band_src, ch)
+            if not top_inky and not bot_inky:
+                fg_scale = cover_scale; crop_top = overflow // 2; crop_bot = overflow - crop_top
+            elif not top_inky:
+                fg_scale = cover_scale; crop_top = overflow
+            elif not bot_inky:
+                fg_scale = cover_scale; crop_bot = overflow
+            # else: both sides carry content -> stay contain
 
     fw, fh = max(1, int(cw * fg_scale)), max(1, int(ch * fg_scale))
     fg = crop.resize((fw, fh), Image.LANCZOS)
-    fx = (CANVAS_W - fw) // 2
-    fy = (CANVAS_H - fh) // 2
-    # Crop any residual overflow so the pasted foreground never exceeds canvas.
+    if crop_top or crop_bot:
+        fg = fg.crop((0, crop_top, fw, fh - crop_bot))
+        fw, fh = fg.size
     if fw > CANVAS_W or fh > CANVAS_H:
         left = max(0, (fw - CANVAS_W) // 2)
         top = max(0, (fh - CANVAS_H) // 2)
         fg = fg.crop((left, top, left + min(fw, CANVAS_W), top + min(fh, CANVAS_H)))
         fw, fh = fg.size
-        fx = (CANVAS_W - fw) // 2
-        fy = (CANVAS_H - fh) // 2
+    fx = (CANVAS_W - fw) // 2
+    fy = (CANVAS_H - fh) // 2
     canvas.paste(fg, (fx, fy))
 
     return canvas
@@ -3422,57 +5123,21 @@ def translate_text(cfg: PipelineConfig, text: str, cache_tag: str) -> str:
         out_path.write_text(text, encoding="utf-8")
         return text
 
-    # Try Groq first (fast, free tier available), then Ollama as fallback
-    providers_tried = []
-
-    if cfg.groq_api_key:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=cfg.groq_api_key, base_url=GROQ_BASE_URL)
-            resp = client.chat.completions.create(
-                model=cfg.groq_model,
-                messages=[
-                    {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.2,
-                timeout=60,
-            )
-            translated = resp.choices[0].message.content.strip()
-            if not translated:
-                translated = text
-            out_path.write_text(translated, encoding="utf-8")
-            log.info("[%s] translated via Groq (%d chars)", cache_tag, len(translated))
-            return translated
-        except Exception as e:
-            log.warning("[%s] Groq translation failed (%s)", cache_tag, e)
-            providers_tried.append("Groq")
-
-    # Fallback: Ollama (local, free)
-    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
-    ollama_model = os.environ.get("OLLAMA_TEXT_MODEL", "llama3.2:3b")
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key="ollama", base_url=ollama_url)
-        resp = client.chat.completions.create(
-            model=ollama_model,
-            messages=[
-                {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.2,
-            timeout=120,
-        )
-        translated = resp.choices[0].message.content.strip()
-        if not translated:
-            translated = text
+    # Provider cascade (groq -> gemini(free) -> openrouter(free) -> ollama).
+    translated, prov = _llm_chat(
+        cfg,
+        [{"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+         {"role": "user", "content": text}],
+        temperature=0.2, timeout=90, purpose=f"{cache_tag}-translate",
+    )
+    if translated:
+        translated = translated.strip() or text
         out_path.write_text(translated, encoding="utf-8")
-        log.info("[%s] translated via Ollama/%s (%d chars)", cache_tag, ollama_model, len(translated))
+        log.info("[%s] translated via %s (%d chars)", cache_tag, prov, len(translated))
         return translated
-    except Exception as e:
-        log.warning("[%s] Ollama translation also failed (%s) — using raw text", cache_tag, e)
-        out_path.write_text(text, encoding="utf-8")
-        return text
+    log.warning("[%s] all translation providers failed — using raw text", cache_tag)
+    out_path.write_text(text, encoding="utf-8")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -3565,6 +5230,12 @@ _CREDIT_PATTERNS = [
     r"\bnext (?:chapter|episode)\b.*",
     r"\bthanks for reading\b.*",
     r"\bplease (?:support|rate|comment|subscribe)\b.*",
+    # chapter / episode title cards — "CHAPTER 3. ENTERING THE DEMONIC
+    # ACADEMY", "EPISODE 12", "PROLOGUE", "SEASON 2 CHAPTER 1". Front-matter,
+    # not story dialogue; narrating it verbatim ("Chapter 3. Entering the
+    # demonic academy.") reads as an error in a recap. Anchored to the start
+    # so a mid-sentence "…this chapter of my life…" is untouched.
+    r"^\W*(?:(?:season\s*\d+\s*)?(?:chapter|episode)\s*\d+|prologue|epilogue)\b[\s.:\-—]*.*",
 ]
 
 # strong markers — a known studio / author name, or a "Role:" label — that
@@ -3844,52 +5515,58 @@ def _text_has_garble(text: str) -> bool:
             continue                                      # "Wang", "Shen" — a name
         unknowns += 1
         if re.search(r"(.)\1\1", tl):
-            continue
+            return True
         if (not re.search(r"[aeiou]", tl)
                 or re.search(r"[bcdfghjklmnpqrstvwxyz]{4,}", tl)
                 or _RARE_BIGRAMS.search(tl)
-                or (len(tl) >= 5 and len(set(tl)) <= 2)):
+                or (len(tl) >= 5 and len(set(tl)) <= 2)
+                or (len(tl) >= 5 and sum(c not in "aeiouy" for c in tl) / len(tl) >= 0.78)):
             return True
+    # Otherwise only fire when SEVERAL tokens are unknown (a badly-recognised
+    # panel). A lone short all-caps non-word ("EHOH", "TOTN") is left alone —
+    # in an all-caps comic it's indistinguishable from a character name, and
+    # the observer's guard would refuse to touch it anyway. This also keeps
+    # observer LLM calls to ~1-2 per chapter so a big job stays inside a free
+    # API tier.
     return unknowns >= 3
 
 
-def _observer_fix_ocr(cfg: "PipelineConfig", text: str, cache_tag: str) -> str:
-    """Optional tiny-LLM 'observer' (ollama llama3.2:3b): repair garbled OCR
-    tokens IN PLACE — spelling only, never rewording. Hard-guarded: the output
-    is accepted only if it keeps the same length, word count and ~all of the
-    original tokens, so the model physically cannot paraphrase, translate or
-    invent. Any failure -> the original text, unchanged."""
+def _observer_fix_ocr(cfg: "PipelineConfig", text: str, cache_tag: str,
+                      context: str = "") -> str:
+    """Optional LLM 'observer': repair garbled OCR tokens IN PLACE — spelling
+    only, never rewording. Hard-guarded: the output is accepted only if it
+    keeps the same word count (±1) and every clean word / name from the
+    input, so the model physically cannot paraphrase, translate or invent.
+    `context` (the preceding narration) is given to the model as a hint for
+    what a mangled word should be, but it must not appear in the output.
+    Any failure -> the original text, unchanged."""
     if not text or len(text) < 8 or not _text_has_garble(text):
         return text
-    try:
-        client, model, provider = _resolve_llm_client(cfg)
-    except Exception:
-        return text
-    if client is None:
-        return text
     sys_p = (
-        "You are an OCR spell-checker for comic-book text. You are given one "
-        "line transcribed from a comic panel; some words are mis-recognised "
-        "(e.g. 'ANYYG YTYOL' -> 'ANYTHING YOU', 'dunngoeoon' -> 'dungeon'). "
+        "You are an OCR spell-checker for comic-book dialogue. You are given "
+        "one line transcribed from a comic panel; some words are mis-recognised "
+        "(e.g. 'ANYYG YTYOL' -> 'ANYTHING YOU', 'dunngoeoon' -> 'dungeon', "
+        "'EHOH DID YOU' -> 'HOW DID YOU', 'I CTNOHS DO' -> 'I SHOULD DO'). "
         "Fix ONLY clearly garbled words to the real word they were meant to "
-        "be. Keep EVERYTHING else exactly: same words, same order, same "
-        "punctuation, same capitalisation, same sound effects. Do not add, "
-        "remove, reorder, translate or rephrase anything. If a word is a name "
-        "or you are unsure, leave it. Reply with the corrected line only."
+        "be, using the surrounding words (and the earlier line, if given) to "
+        "decide. Keep EVERYTHING else exactly: same number of words, same "
+        "order, same punctuation, same capitalisation, same sound effects. Do "
+        "NOT add, remove, reorder, translate or rephrase anything. If a word "
+        "is a character name or you are unsure, leave it unchanged. Reply with "
+        "the corrected line ONLY — no quotes, no explanation."
     )
-    try:
-        r = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": sys_p},
-                      {"role": "user", "content": text}],
-            temperature=0.0,
-            max_tokens=min(400, len(text) + 80),
-            timeout=40,
-        )
-        out = (r.choices[0].message.content or "").strip().strip('"').strip()
-    except Exception as e:
-        log.info("[%s] observer unavailable (%s) — keeping raw OCR", cache_tag, e)
+    user_msg = text if not context else (
+        f"Earlier line (context, do NOT include in your reply): {context[-160:]}\n"
+        f"Line to fix: {text}")
+    out, _prov = _llm_chat(
+        cfg,
+        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_msg}],
+        temperature=0.0, max_tokens=min(400, len(text) + 80), timeout=40,
+        purpose=f"{cache_tag}-observer",
+    )
+    if not out:
         return text
+    out = out.strip().strip('"').strip()
     out = re.sub(r"\s+", " ", out.splitlines()[0] if out else "").strip()
     if not out or "[" in out or "]" in out or "SYSTEM" in out.upper():
         return text
@@ -3905,21 +5582,27 @@ def _observer_fix_ocr(cfg: "PipelineConfig", text: str, cache_tag: str) -> str:
     # other input token (real words, and — crucially — character NAMES, which
     # the model loves to "correct" into English words) must survive verbatim,
     # same casing. This makes a name→word substitution impossible.
-    def _garbled(tok: str) -> bool:
+    _english = _english_words()
+    _common_cap = {c.lower() for c in _COMMON_CAPITALIZED}
+
+    # A token carries a STRONG garble signature (no vowel, a 4+ consonant run,
+    # a rare bigram, >=78% consonants) — safe for the LLM to rewrite, it can't
+    # be a plausible name. A merely-unknown short token ("EHOH", "JANG") is
+    # left protected: structurally a name and a mis-read look identical, so
+    # only the full cleanup/recap rewrite (or GOT-OCR2) can touch those.
+    def _strong_garble(tok: str) -> bool:
         tl = tok.lower().strip("'")
-        w = _english_words()
-        if tl in {c.lower() for c in _COMMON_CAPITALIZED} or (w and tl in w):
+        if tl in _common_cap or (_english and tl in _english):
             return False
-        if len(tok) <= 4 and tok[:1].isupper():
-            return False
-        if re.search(r"(.)\1\1", tl):
+        if re.search(r"(.)\1\1", tl) or len(tl) < 4:
             return False
         return (not re.search(r"[aeiou]", tl)
                 or bool(re.search(r"[bcdfghjklmnpqrstvwxyz]{4,}", tl))
                 or bool(_RARE_BIGRAMS.search(tl))
-                or (len(tl) >= 5 and len(set(tl)) <= 2))
+                or (len(tl) >= 5 and len(set(tl)) <= 2)
+                or (len(tl) >= 5 and sum(c not in "aeiouy" for c in tl) / len(tl) >= 0.78))
 
-    protected = {t for t in in_toks if not _garbled(t)}
+    protected = {t for t in in_toks if not _strong_garble(t)}
     out_set = set(out_toks)
     if any(t not in out_set for t in protected):
         return text          # a clean word / name went missing -> reject
@@ -3962,68 +5645,21 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
     if style == "verbatim":
         narration = _strip_forbidden(text)
         if getattr(cfg, "observer", False):
-            narration = _observer_fix_ocr(cfg, narration, cache_tag)
+            narration = _observer_fix_ocr(cfg, narration, cache_tag, context=prev_tail or "")
         out_path.write_text(narration, encoding="utf-8")
         return narration
 
-    # Resolve which provider + key + base_url + model to actually use.
-    provider = cfg.narration_provider
-    openai_key = cfg.openai_api_key or os.environ.get("OPENAI_API_KEY")
-    # cleanup needs an LLM even if the caller passed provider=none.
-    if provider in ("auto", "none") and style == "cleanup":
-        provider = "auto"
-    if provider == "auto":
-        if openai_key:
-            provider = "openai"
-        elif cfg.groq_api_key:
-            provider = "groq"
-        elif os.environ.get("OLLAMA_BASE_URL") or os.path.exists("/usr/local/bin/ollama") or os.path.exists("/usr/bin/ollama"):
-            provider = "ollama"
-        else:
-            provider = "none"
-
-    if provider == "none":
+    # Provider cascade: openai -> groq -> gemini(free) -> openrouter(free) ->
+    # ollama(local). A daily-quota / rate-limit on one provider rolls to the
+    # next instead of silently dropping the whole job to raw verbatim (the
+    # exact failure on the 328-chapter run).
+    chain = _llm_provider_chain(cfg)
+    if not chain:
         log.warning(
-            "[%s] [RAW/VERBATIM MODE ACTIVE] narration provider=none — using raw text verbatim without recap narration. "
-            "If production recap narration is required, configure an upstream LLM provider.",
+            "[%s] [RAW/VERBATIM MODE] no LLM provider key configured — using raw text. "
+            "Set GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY (all have free tiers).",
             cache_tag,
         )
-        narration = _strip_forbidden(text)
-        out_path.write_text(narration, encoding="utf-8")
-        return narration
-
-    from openai import OpenAI
-
-    if provider == "ollama":
-        # Ollama exposes an OpenAI-compatible API at localhost:11434/v1
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1"
-        ollama_model = os.environ.get("OLLAMA_TEXT_MODEL", "llama3.2:3b")
-        log.info("[%s] using Ollama narration: %s at %s", cache_tag, ollama_model, ollama_url)
-        try:
-            client = OpenAI(api_key="ollama", base_url=ollama_url)
-            model = cfg.narration_model or ollama_model
-        except Exception as e:
-            log.warning("[%s] Ollama client creation failed (%s) — falling back to verbatim", cache_tag, e)
-            narration = _strip_forbidden(text)
-            out_path.write_text(narration, encoding="utf-8")
-            return narration
-    elif provider == "openai":
-        if not openai_key:
-            log.error("[%s] narration provider=openai but no OPENAI_API_KEY — falling back to verbatim", cache_tag)
-            narration = _strip_forbidden(text)
-            out_path.write_text(narration, encoding="utf-8")
-            return narration
-        client = OpenAI(api_key=openai_key)
-        model = cfg.narration_model or cfg.openai_model
-    elif provider == "groq":
-        if not cfg.groq_api_key:
-            log.error("[%s] narration provider=groq but no GROQ_API_KEY — falling back to verbatim", cache_tag)
-            narration = _strip_forbidden(text)
-            out_path.write_text(narration, encoding="utf-8")
-            return narration
-        client = OpenAI(api_key=cfg.groq_api_key, base_url=GROQ_BASE_URL)
-        model = cfg.narration_model or cfg.groq_model
-    else:
         narration = _strip_forbidden(text)
         out_path.write_text(narration, encoding="utf-8")
         return narration
@@ -4047,17 +5683,19 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
             )
         temperature = 0.45
 
+    provider = "cascade"
+    model = chain[0][3]
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-            timeout=90,
+        raw_out, _prov = _llm_chat(
+            cfg,
+            [{"role": "system", "content": sys_prompt},
+             {"role": "user", "content": user_prompt}],
+            temperature=temperature, timeout=90, purpose=cache_tag,
         )
-        raw_out = (resp.choices[0].message.content or "").strip()
+        if raw_out is None:
+            raise RuntimeError("all providers failed")
+        provider = _prov
+        raw_out = raw_out.strip()
         candidate = _strip_forbidden(raw_out)
         if style == "cleanup":
             # strip bracketed tags the small model likes to inject ("[SYSTEM]")
@@ -4128,7 +5766,23 @@ def split_into_segments(text: str, n: int) -> List[str]:
 # that one clip to divide it across frames — no re-synthesis, no seams.
 
 def get_audio_duration(path: Path) -> float:
-    """Probe an audio file's duration in seconds via ffprobe."""
+    """Audio duration in seconds.
+
+    Fast path: for a PCM WAV (every per-segment clip in the render loop is
+    one — mono/16-bit/AUDIO_SAMPLE_RATE), read nframes/framerate straight
+    from the header. That is exactly what ffprobe's `format=duration`
+    returns for PCM, sample-accurate, but with no ~80 ms subprocess spawn —
+    and this is called O(frames) times per chapter. Falls back to ffprobe
+    for any non-WAV input or on any read error.
+    """
+    if str(path).lower().endswith(".wav"):
+        try:
+            with wave.open(str(path), "rb") as w:
+                fr = w.getframerate()
+                if fr > 0:
+                    return w.getnframes() / float(fr)
+        except Exception:
+            pass  # fall through to ffprobe
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -4145,6 +5799,22 @@ def get_audio_duration(path: Path) -> float:
 def _generate_silence(path: Path, duration: float) -> None:
     # Output as WAV (not MP3) to avoid encoder delay/padding that causes
     # sync drift when concatenated. WAV is raw PCM — sample-accurate.
+    #
+    # Fast path: silent PCM is just zero samples — write them with the stdlib
+    # `wave` module (mono / 16-bit / AUDIO_SAMPLE_RATE, byte-identical to the
+    # old `ffmpeg anullsrc -t ... -ac 1` output) instead of spawning ffmpeg
+    # once per silent panel (~34 of 100 frames on a typical chapter).
+    if str(path).lower().endswith(".wav"):
+        try:
+            n = max(0, int(round(duration * AUDIO_SAMPLE_RATE)))
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(AUDIO_SAMPLE_RATE)
+                w.writeframes(b"\x00\x00" * n)
+            return
+        except Exception as exc:
+            log.debug("pure-python silence write failed (%s) — using ffmpeg", exc)
     run_ffmpeg(
         [
             "ffmpeg", "-y", "-f", "lavfi",
@@ -4219,6 +5889,141 @@ def _synthesize_with_piper(text: str, out_wav: Path) -> None:
         raise RuntimeError("piper timed out after 120s")
     if proc.returncode != 0:
         raise RuntimeError(f"piper failed: {err[-200:]}")
+
+
+_kokoro_python_cache: Optional[str] = None
+_kokoro_unavailable_logged = False
+
+
+def _kokoro_python() -> Optional[str]:
+    """Path to the Python that has kokoro-onnx, or None. Prefers an explicit
+    RECAP_KOKORO_PYTHON, then the isolated pipeline/.venv-kokoro venv."""
+    global _kokoro_python_cache
+    if _kokoro_python_cache is not None:
+        return _kokoro_python_cache or None
+    cand = os.environ.get("RECAP_KOKORO_PYTHON", "").strip()
+    if cand and Path(cand).exists():
+        _kokoro_python_cache = cand
+        return cand
+    if KOKORO_VENV_PYTHON.exists():
+        _kokoro_python_cache = str(KOKORO_VENV_PYTHON)
+        return _kokoro_python_cache
+    _kokoro_python_cache = ""
+    return None
+
+
+_KOKORO_VOICE_RE = re.compile(r"^[abhijpef][fm]_[a-z][a-z_]*$")
+
+
+def _kokoro_voice_requested(cfg) -> Optional[str]:
+    """The Kokoro voice to use, or None to leave TTS on edge-tts. Kokoro is
+    selected either by RECAP_TTS_ENGINE=kokoro (voice from RECAP_KOKORO_VOICE)
+    or by cfg.voice being a Kokoro voice id (am_michael, af_bella, bm_george,
+    …) — which is how the website's voice picker turns it on."""
+    v = (getattr(cfg, "voice", "") or "").strip()
+    if v and _KOKORO_VOICE_RE.match(v):
+        return v
+    if os.environ.get("RECAP_TTS_ENGINE", "").strip().lower() == "kokoro":
+        return os.environ.get("RECAP_KOKORO_VOICE", "am_michael")
+    return None
+
+
+def _synthesize_with_kokoro(text: str, out_wav: Path,
+                            voice: Optional[str] = None) -> Optional[List[dict]]:
+    """Synthesize `text` to a 24 kHz mono PCM WAV at `out_wav` using Kokoro-82M
+    in its isolated venv (see pipeline/kokoro_tts.py). Returns the per-sentence
+    timing list [{"text","start","end"}, ...] on success, or None on ANY failure
+    (not installed, model missing, subprocess error) so the caller falls
+    through to its normal TTS cascade with no behaviour change."""
+    global _kokoro_unavailable_logged
+    py = _kokoro_python()
+    if not py or not KOKORO_TTS_SCRIPT.exists():
+        if not _kokoro_unavailable_logged:
+            log.info("RECAP_TTS_ENGINE=kokoro set but Kokoro venv not found "
+                     "(run pipeline/setup_kokoro.sh) — using edge-tts")
+            _kokoro_unavailable_logged = True
+        return None
+    model_ok = (KOKORO_MODEL_DIR / "kokoro-v1.0.onnx").exists() and \
+               (KOKORO_MODEL_DIR / "voices-v1.0.bin").exists()
+    if not model_ok:
+        if not _kokoro_unavailable_logged:
+            log.info("Kokoro model files missing under %s — using edge-tts", KOKORO_MODEL_DIR)
+            _kokoro_unavailable_logged = True
+        return None
+
+    req = {
+        "text": text,
+        "voice": voice or os.environ.get("RECAP_KOKORO_VOICE", "am_michael"),
+        "speed": float(os.environ.get("RECAP_KOKORO_SPEED", "1.0") or 1.0),
+        "lang": os.environ.get("RECAP_KOKORO_LANG", "en-us"),
+        "out_wav": str(out_wav),
+        "model_dir": str(KOKORO_MODEL_DIR),
+        "sample_rate": 24000,
+        "sentence_pause": float(os.environ.get("RECAP_KOKORO_SENT_PAUSE", "0.18") or 0.18),
+    }
+    # Generous ceiling: ~4x real-time on this box, plus init/spawn slack.
+    timeout = max(60.0, len(text) * 0.12 + 25.0)
+    try:
+        proc = subprocess.run(
+            [py, str(KOKORO_TTS_SCRIPT)],
+            input=json.dumps(req), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Kokoro synthesis timed out after %.0fs — falling back", timeout)
+        return None
+    except Exception as e:
+        log.warning("Kokoro subprocess failed to launch (%s) — falling back", e)
+        return None
+
+    out = (proc.stdout or "").strip().splitlines()
+    payload = None
+    for line in reversed(out):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+                break
+            except Exception:
+                continue
+    if not payload or not payload.get("ok"):
+        err = (payload or {}).get("error") if payload else (proc.stderr or "")[-200:]
+        log.info("Kokoro synthesis unavailable (%s) — using edge-tts", err)
+        return None
+    if not out_wav.exists() or out_wav.stat().st_size < 200:
+        return None
+    return payload.get("sentences") or []
+
+
+def _kokoro_word_boundaries(text: str, sentences: List[dict]) -> Optional[List[dict]]:
+    """Turn Kokoro's per-sentence timing into a per-word {"text","start","end"}
+    list aligned 1:1 with text.split() — split_frame_timings needs that exact
+    count to use real timing instead of an even word-count estimate. Kokoro
+    gives no word timestamps, so each sentence's measured span is distributed
+    across its words weighted by word length (a decent proxy for syllables).
+    Returns None if the counts don't line up (caller keeps the estimate)."""
+    words = text.split()
+    if not words or not sentences:
+        return None
+    wb: List[dict] = []
+    wi = 0
+    for s in sentences:
+        sw = (s.get("text") or "").split()
+        if not sw:
+            continue
+        span = max(0.01, float(s.get("end", 0.0)) - float(s.get("start", 0.0)))
+        weights = [max(1, len(w)) for w in sw]
+        tot = float(sum(weights))
+        cur = float(s.get("start", 0.0))
+        for w, wt in zip(sw, weights):
+            d = span * (wt / tot)
+            if wi < len(words):
+                wb.append({"text": words[wi], "start": cur, "end": cur + d})
+                wi += 1
+            cur += d
+    if len(wb) != len(words):
+        return None
+    return wb
 
 
 def _srt_to_vtt(srt_content: str) -> str:
@@ -4316,6 +6121,14 @@ def _prewarm_segment_audio(cfg: "PipelineConfig", chapter: "Chapter", segments: 
     # concurrent connections means less scheduler contention locally AND
     # less chance of tripping Microsoft's endpoint-side throttling.
     workers = max(2, min(int(os.environ.get("RECAP_TTS_WORKERS", "2")), len(todo)))
+    # Kokoro synthesis is CPU-bound (each worker runs the 82M ONNX model), NOT
+    # network-I/O like edge-tts — so a high RECAP_TTS_WORKERS (tuned for
+    # edge-tts's parallel connections) just oversubscribes the cores and
+    # thrashes. Cap it near the core count when Kokoro is the engine.
+    if _kokoro_voice_requested(cfg):
+        _kc = max(2, min(int(os.environ.get("RECAP_KOKORO_WORKERS",
+                         str(max(2, min(3, (os.cpu_count() or 4) - 1))))), len(todo)))
+        workers = min(workers, _kc)
 
     def _one(item):
         try:
@@ -4364,10 +6177,53 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
 
     failures = []
 
+    # Kokoro-82M neural TTS, tried BEFORE edge-tts when the job's voice is a
+    # Kokoro voice id (set by the website's voice picker) or RECAP_TTS_ENGINE=
+    # kokoro. Isolated venv + subprocess (see _synthesize_with_kokoro /
+    # pipeline/kokoro_tts.py). Any failure appends to `failures` and falls
+    # straight through to the edge-tts cascade below — zero behaviour change
+    # when it is not selected or not installed.
+    _kok_voice = _kokoro_voice_requested(cfg)
+    if _kok_voice:
+        kok_wav = seg_audio_dir / f"{tag}_kok.wav"
+        kok_wav.unlink(missing_ok=True)
+        try:
+            sentences = _synthesize_with_kokoro(text, kok_wav, voice=_kok_voice)
+            if sentences is not None and kok_wav.exists() and kok_wav.stat().st_size > 200:
+                raw_dur = get_audio_duration(kok_wav)
+                fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
+                seg_af = (f"afade=t=in:st=0:d={SEGMENT_FADE_IN},"
+                          f"afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}")
+                run_ffmpeg(["ffmpeg", "-y", "-i", str(kok_wav), "-af", seg_af,
+                            "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+                if _audio_qa(tmp_path, allow_silence=False):
+                    os.replace(tmp_path, final_path)
+                    wb = _kokoro_word_boundaries(text, sentences)
+                    log.info("[%s] Kokoro TTS synthesised segment %s (%.1fs, %d sentence(s), timing=%s)",
+                             chapter.tag, tag, raw_dur, len(sentences),
+                             "real" if wb else "estimate")
+                    return final_path, False, wb
+                raise RuntimeError("kokoro output failed audio QA")
+            failures.append("kokoro: unavailable / empty output")
+        except Exception as e:
+            failures.append(f"kokoro: {e}")
+            log.info("[%s] Kokoro TTS unavailable for segment %s (%s) — using edge-tts",
+                     chapter.tag, tag, e)
+        finally:
+            kok_wav.unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
+
     import asyncio
     import edge_tts
 
+    # If the job picked a Kokoro voice and we reached here, Kokoro failed —
+    # don't hand its id to edge-tts (invalid), use a close edge-tts stand-in.
     voice = cfg.voice or "en-US-ChristopherNeural"
+    if _KOKORO_VOICE_RE.match(voice):
+        voice = ("en-GB-RyanNeural" if voice.startswith("bm_")
+                 else "en-GB-SoniaNeural" if voice.startswith("bf_")
+                 else "en-US-AvaNeural" if voice.startswith("af_")
+                 else "en-US-AndrewNeural")
     raw_path = seg_audio_dir / f"{tag}_raw.mp3"
     srt_path = seg_audio_dir / f"{tag}.srt"
     vtt_path = seg_audio_dir / f"{tag}.vtt"
@@ -4839,6 +6695,13 @@ def render_chapter(
         f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,"
         f"pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2,fps={FPS}"
     )
+    # --motion kenburns is applied as a SEPARATE second pass on the finished,
+    # QA-validated chapter mp4 (see _apply_motion below) — NOT here. Putting a
+    # zoompan into this filter graph re-times the VFR concat stream and
+    # desyncs video from audio (duration_out_of_tolerance -> black-placeholder
+    # fallback; observed directly). The post-pass reframes an already-correct
+    # video, copying the audio, so timing is untouchable.
+    _tune = "stillimage"
     if getattr(cfg, "watermark", None):
         wm = str(cfg.watermark).replace("\\", "").replace("'", "").replace(":", " ")
         video_filters += (
@@ -4867,7 +6730,7 @@ def render_chapter(
             "-i", str(audio_path),
             "-vf", video_filters,
             "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
             "-vsync", "vfr",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-shortest",
@@ -4886,7 +6749,7 @@ def render_chapter(
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-vf", video_filters,
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
             "-vsync", "vfr",
             "-f", "mp4",
             str(tmp_path),
@@ -4945,9 +6808,81 @@ def render_chapter(
         )
         return None
 
+    if getattr(cfg, "motion", "none") == "kenburns":
+        if _apply_motion(tmp_path):
+            log.info("[%s] applied Ken Burns motion pass", chapter.tag)
+        else:
+            log.warning("[%s] Ken Burns motion pass failed — keeping the static render", chapter.tag)
+
     atomic_promote(tmp_path, out_path)
     log.info("[%s] chapter video rendered + QA-validated -> %s", chapter.tag, out_path.name)
     return out_path
+
+
+def _load_excluded_frames(cfg: "PipelineConfig") -> "set":
+    """Set of 'chap_XXX/frame_NNNNN.jpg' the user dropped in the review step.
+    Empty (and cached) when there is no exclusion file."""
+    cached = getattr(_load_excluded_frames, "_cache", None)
+    if cached is not None:
+        return cached
+    out = set()
+    try:
+        f = cfg.work_dir / "excluded_frames.json"
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                out = {str(x).strip() for x in data if str(x).strip()}
+            elif isinstance(data, dict) and isinstance(data.get("excluded"), list):
+                out = {str(x).strip() for x in data["excluded"] if str(x).strip()}
+    except Exception as e:  # pragma: no cover
+        log.warning("could not read excluded_frames.json (%s) — rendering all panels", e)
+    _load_excluded_frames._cache = out  # type: ignore
+    if out:
+        log.info("manual review: %d panel(s) excluded from render", len(out))
+    return out
+
+
+def _apply_motion(video_path: Path) -> bool:
+    """Ken Burns as a SECOND pass on an already-rendered, QA-passed chapter mp4.
+
+    Upscales the frame ~13% and slowly pans a 1920x1080 window around inside
+    that margin on a slow Lissajous path — reads as a gentle drifting camera.
+    Audio is stream-copied and the frame timing is never touched, so this
+    cannot desync anything (the reason it is NOT a filter in the concat
+    render). Rewrites video_path in place. Returns False on any failure so
+    the caller can fall back to the static cut.
+    """
+    over = 1.13
+    sw, sh = int(round(CANVAS_W * over / 2) * 2), int(round(CANVAS_H * over / 2) * 2)
+    mx, my = (sw - CANVAS_W) / 2.0, (sh - CANVAS_H) / 2.0
+    vf = (
+        f"scale={sw}:{sh},"
+        f"crop={CANVAS_W}:{CANVAS_H}:"
+        f"'(in_w-{CANVAS_W})/2 + {mx * 0.75:.1f}*sin(t*0.33)':"
+        f"'(in_h-{CANVAS_H})/2 + {my * 0.75:.1f}*sin(t*0.24 + 1.1)'"
+    )
+    out = video_path.with_suffix(".motion.mp4")
+    out.unlink(missing_ok=True)
+    try:
+        run_ffmpeg([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "film",
+            "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-f", "mp4", str(out),
+        ])
+    except RuntimeError as e:
+        log.debug("motion pass ffmpeg failed: %s", e)
+        out.unlink(missing_ok=True)
+        return False
+    try:
+        if out.exists() and out.stat().st_size > 1024:
+            out.replace(video_path)
+            return True
+    except OSError:
+        pass
+    out.unlink(missing_ok=True)
+    return False
 
 
 def render_chapter_with_retry(
@@ -5024,6 +6959,27 @@ def pad_audio_with_silence(audio_path: Path, target_duration: float) -> Path:
         return audio_path
     padding_dur = target_duration - current
     out = audio_path.with_suffix('.padded.wav')
+    # Fast path: append zero PCM frames in the input's own format (no
+    # re-encode, sample-accurate) rather than spawning an ffmpeg
+    # filter_complex concat per short segment. ffmpeg fallback on any error
+    # or a non-WAV input.
+    if str(audio_path).lower().endswith(".wav"):
+        try:
+            with wave.open(str(audio_path), "rb") as w:
+                nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                data = w.readframes(w.getnframes())
+            pad_frames = max(0, int(round(padding_dur * fr)))
+            with wave.open(str(out), "wb") as w:
+                w.setnchannels(nch)
+                w.setsampwidth(sw)
+                w.setframerate(fr)
+                w.writeframes(data)
+                w.writeframes(b"\x00" * (pad_frames * nch * sw))
+            log.debug("Padded %s from %.1fs to %.1fs (+%.1fs silence, wave)",
+                      audio_path.name, current, target_duration, padding_dur)
+            return out
+        except Exception as exc:
+            log.debug("pure-python pad failed (%s) — using ffmpeg", exc)
     run_ffmpeg([
         "ffmpeg", "-y",
         "-i", str(audio_path),
@@ -5051,6 +7007,90 @@ def run_ffmpeg(cmd: List[str]) -> None:
         err_msg = (result.stderr or result.stdout or "").strip()
         last_lines = "\n".join(err_msg.splitlines()[-20:])
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode}):\n{last_lines}")
+
+
+def _llm_provider_chain(cfg: "PipelineConfig"):
+    """Ordered [(provider, api_key, base_url, model), ...] to try for a text
+    LLM call. Free tiers are included so a large job doesn't stall when one
+    provider's daily quota runs out (the exact failure on the 328-ch run):
+
+        openai (paid)  ->  groq (free 200k tok/day)  ->  gemini flash-lite
+        (free ~1k req/day, no card)  ->  openrouter free models  ->  ollama (local)
+
+    An explicit `cfg.narration_provider` is moved to the front but the rest
+    stay as fallbacks.
+    """
+    chain = []
+    _ok = cfg.openai_api_key or os.environ.get("OPENAI_API_KEY")
+    if _ok:
+        chain.append(("openai", _ok, None, cfg.narration_model or cfg.openai_model))
+    _gk = cfg.groq_api_key or os.environ.get("GROQ_API_KEY")
+    if _gk:
+        chain.append(("groq", _gk, GROQ_BASE_URL, cfg.narration_model or cfg.groq_model))
+    _gem = getattr(cfg, "gemini_api_key", None) or os.environ.get("GEMINI_API_KEY")
+    if _gem:
+        chain.append(("gemini", _gem, GEMINI_BASE_URL,
+                      os.environ.get("RECAP_GEMINI_TEXT_MODEL", "gemini-2.5-flash-lite")))
+    _orr = getattr(cfg, "openrouter_api_key", None) or os.environ.get("OPENROUTER_API_KEY")
+    if _orr:
+        chain.append(("openrouter", _orr, OPENROUTER_BASE_URL,
+                      os.environ.get("RECAP_OPENROUTER_TEXT_MODEL",
+                                     "meta-llama/llama-3.3-70b-instruct:free")))
+    if os.environ.get("OLLAMA_BASE_URL") or shutil.which("ollama"):
+        chain.append(("ollama", "ollama",
+                      os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434") + "/v1",
+                      cfg.narration_model or os.environ.get("OLLAMA_TEXT_MODEL", "llama3.2:3b")))
+    p = getattr(cfg, "narration_provider", "auto")
+    if p not in ("auto", "none", None):
+        chain.sort(key=lambda t: 0 if t[0] == p else 1)
+    return chain
+
+
+_LLM_RATE_RE = re.compile(
+    r"429|rate.?limit|quota|resource_exhausted|too many requests|"
+    r"\b50[0-9]\b|overloaded|unavailable|timeout|timed out|connection", re.IGNORECASE)
+
+
+def _llm_chat(cfg, messages, temperature: float = 0.4, max_tokens: Optional[int] = None,
+              timeout: int = 90, purpose: str = "llm"):
+    """Run one chat completion, walking the provider chain until one answers.
+    A rate-limit / quota / 5xx / timeout jumps straight to the next provider;
+    a transient error gets one local retry first. Returns (text, provider) or
+    (None, None) — callers keep their existing 'None -> verbatim' fallback."""
+    from openai import OpenAI
+    chain = _llm_provider_chain(cfg)
+    if not chain:
+        return None, None
+    last_err = "no provider"
+    for (prov, key, base, model) in chain:
+        for attempt in (1, 2):
+            try:
+                client = OpenAI(api_key=key, base_url=base) if base else OpenAI(api_key=key)
+                kw = dict(model=model, messages=messages, temperature=temperature, timeout=timeout)
+                if max_tokens:
+                    kw["max_tokens"] = max_tokens
+                r = client.chat.completions.create(**kw)
+                _m = r.choices[0].message
+                txt = (_m.content or "").strip()
+                # some Groq "reasoning" models (gpt-oss) put the answer in a
+                # separate field; others (qwen3.6) leak a <think> block.
+                if not txt:
+                    txt = (getattr(_m, "reasoning", "") or "").strip()
+                txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+                txt = re.sub(r"^<think>.*$", "", txt, flags=re.DOTALL).strip()
+                if txt:
+                    if prov != chain[0][0]:
+                        log.info("[%s] LLM via fallback %s/%s", purpose, prov, model)
+                    return txt, prov
+                last_err = f"{prov}: empty response"
+            except Exception as e:
+                last_err = f"{prov}: {e}"
+                if _LLM_RATE_RE.search(str(e)):
+                    break  # this provider is out — next one
+                if attempt == 1:
+                    time.sleep(0.6)
+    log.warning("[%s] all %d LLM provider(s) failed (%s)", purpose, len(chain), last_err)
+    return None, None
 
 
 def _resolve_llm_client(cfg: "PipelineConfig"):
@@ -5297,6 +7337,29 @@ def merge_chapters(cfg: PipelineConfig, chapter_videos: List[Path]) -> Path:
 
     atomic_promote(tmp_path, merged_path)
     log.info("Merge complete + QA-validated -> %s", merged_path.name)
+
+    # Chapter markers for the player scrubber: cumulative start time of each
+    # chapter video (the intro, if present, is chapter_videos[0]).
+    try:
+        marks, offset = [], 0.0
+        for i, cv in enumerate(chapter_videos):
+            name = cv.stem
+            if name.startswith("intro") or "intro" in name:
+                label = "Intro"
+            else:
+                m = re.search(r"(\d+)", name)
+                label = f"Chapter {int(m.group(1))}" if m else name
+            marks.append({"index": i, "title": label, "start": round(offset, 2)})
+            offset += max(0.0, get_audio_duration(cv))
+        out_dir = cfg.output_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "chapters.json").write_text(
+            json.dumps({"chapters": marks, "total": round(offset, 2)}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:  # pragma: no cover
+        log.debug("chapter-marker generation skipped (%s)", e)
+
     return merged_path
 
 
@@ -5487,8 +7550,13 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
         try:
-            cfg.write_progress("slice", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: slicing panels...")
+            # NOTE: stage is "render" here, not "slice" — in the render phase this
+            # is just a fast manifest re-verify (slices already exist from the
+            # --slice-only pass). Reporting "slice" would drop the progress bar
+            # back into the 10-45% band mid-render.
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: preparing panels…",
+                               frac=0.02, substage="frame")
             frame_data = slice_chapter_panels(cfg, chapter)
 
             manifest_path = cfg.temp_slices_dir / chapter.tag / "manifest.json"
@@ -5500,9 +7568,123 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 frame_paths = [fp for fp, _ in frame_data]
                 frame_sources = [si for _, si in frame_data]
 
+            # OPTIONAL: honour a manual-review exclusion list (work/excluded_frames.json,
+            # written by the "Review panels" step). Entries are "chap_XXX/frame_NNNNN.jpg".
+            # Drop those frames + their narration so they never reach the render.
+            _excluded = _load_excluded_frames(cfg)
+            if _excluded:
+                _keep = [i for i, fp in enumerate(frame_paths)
+                         if f"{chapter.tag}/{fp.name}" not in _excluded]
+                if len(_keep) < len(frame_paths):
+                    dropped = len(frame_paths) - len(_keep)
+                    frame_paths = [frame_paths[i] for i in _keep]
+                    frame_sources = [frame_sources[i] for i in _keep]
+                    if manifest and manifest.frames:
+                        manifest.frames = [manifest.frames[i] for i in _keep if i < len(manifest.frames)]
+                    log.info("[%s] manual review: dropped %d panel(s), rendering %d",
+                             chapter.tag, dropped, len(frame_paths))
+                    cfg.write_progress("render", chapter.index - 1, total,
+                                       f"Chapter {chapter.index}/{total}: dropped {dropped} reviewed panel(s)",
+                                       frac=0.03, substage="frame")
+
+            if not frame_paths:
+                log.warning("[%s] every panel was excluded in review — skipping chapter", chapter.tag)
+                continue
+
+            # F3: drop a leading/trailing frame that is a scanlator credits /
+            # studio / chapter-title card — otherwise it renders as 1-2 s of
+            # silent filler at every chapter boundary. Signal: OCR *did* read
+            # text from it, but `_clean_source_text` strips the whole thing as
+            # scanlation noise (studio name, URL, "Chapter N"). A genuine
+            # silent establishing shot has NO OCR text at all, so it's safe —
+            # this only fires on frames that are literally all-watermark.
+            if (os.environ.get("RECAP_DROP_BOUNDARY_CREDITS", "1").lower() not in ("0", "false", "no")
+                    and len(frame_paths) > 3 and chapter.image_narrations):
+                def _boundary_credits(i: int) -> bool:
+                    fp = frame_paths[i]
+                    fe = manifest.frames[i] if (manifest and i < len(manifest.frames)) else None
+                    if fe:
+                        ne = (chapter.image_narrations.get(fe.frame_id)
+                              or chapter.image_narrations.get(fe.filename)
+                              or chapter.image_narrations.get(fp.name))
+                    else:
+                        ne = chapter.image_narrations.get(fp.name)
+                    raw = parse_narration_item(ne)["text"].strip()
+                    if not raw or len(re.sub(r"[^A-Za-z]", "", raw)) < 4:
+                        return False  # no real OCR text → could be a silent panel, keep
+                    if _clean_source_text(raw).strip():
+                        return False  # real narratable text survives cleaning → keep
+                    # OCR read a card's worth of text and it ALL cleaned away as
+                    # credits / studio / "CHAPTER N …" front-matter. In the tight
+                    # first/last-few window that's card enough to drop; the
+                    # visual check is a tie-breaker for the borderline case of a
+                    # story panel whose only text is a stamped watermark.
+                    if _is_credits_blob(raw) or re.match(
+                            r"^\W*(?:(?:season\s*\d+\s*)?(?:chapter|episode)\s*\d+|prologue|epilogue)\b",
+                            raw, re.IGNORECASE):
+                        return True
+                    try:
+                        from PIL import Image as _PILImage
+                        arr = np.array(_PILImage.open(fp).convert("RGB"))
+                        return _looks_like_credits_panel(arr) or _looks_like_scanlator_card(arr)
+                    except Exception:
+                        return True
+
+                # scan the first few and last few frames — the studio/title
+                # card usually sits behind a cold-open panel or two, and the
+                # end-of-chapter credits card behind the final story beat.
+                _drop = set()
+                _n = len(frame_paths)
+                _window = min(4, _n // 3)
+                for i in list(range(_window)) + list(range(_n - _window, _n)):
+                    if 0 <= i < _n and i not in _drop and _boundary_credits(i):
+                        _drop.add(i)
+                if _drop:
+                    _keep = [i for i in range(len(frame_paths)) if i not in _drop]
+                    frame_paths = [frame_paths[i] for i in _keep]
+                    frame_sources = [frame_sources[i] for i in _keep]
+                    if manifest and manifest.frames:
+                        manifest.frames = [manifest.frames[i] for i in _keep if i < len(manifest.frames)]
+                    log.info("[%s] dropped %d boundary credits/title frame(s)", chapter.tag, len(_drop))
+
+            # Near-duplicate drop: webtoons repeat panels ("previously on…"
+            # strips, flashbacks). Keep the FIRST occurrence, drop repeats.
+            # In-chapter always; cross-chapter (flashbacks) only when
+            # RECAP_DEDUP_CROSS=1 and with a tighter threshold. Never drops
+            # below a 55%%-of-frames floor.
+            if (os.environ.get("RECAP_DEDUP_FRAMES", "1").lower() not in ("0", "false", "no")
+                    and len(frame_paths) > 6):
+                _in_dist = int(os.environ.get("RECAP_DEDUP_DIST", "26"))   # of 512 bits (~95%)
+                _x_dist = int(os.environ.get("RECAP_DEDUP_CROSS_DIST", "16"))
+                _cross = os.environ.get("RECAP_DEDUP_CROSS", "0").lower() in ("1", "true", "yes")
+                _hashes = [_frame_dhash(p) for p in frame_paths]
+                _kept_h: List[int] = []
+                _keep, _ddrop = [], 0
+                _floor = max(6, int(0.55 * len(frame_paths)))
+                for i, h in enumerate(_hashes):
+                    if h is None:
+                        _keep.append(i); continue
+                    dup = any(_ham64(h, kh) <= _in_dist for kh in _kept_h)
+                    if not dup and _cross:
+                        dup = any(_ham64(h, sh) <= _x_dist for sh in _RECAP_SEEN_HASHES)
+                    if dup and (len(_keep) + (len(_hashes) - i - 1)) > _floor:
+                        _ddrop += 1
+                        continue
+                    _keep.append(i)
+                    _kept_h.append(h)
+                if _ddrop:
+                    frame_paths = [frame_paths[i] for i in _keep]
+                    frame_sources = [frame_sources[i] for i in _keep]
+                    if manifest and manifest.frames:
+                        manifest.frames = [manifest.frames[i] for i in _keep if i < len(manifest.frames)]
+                    log.info("[%s] dropped %d near-duplicate frame(s) (%d -> %d)",
+                             chapter.tag, _ddrop, len(_keep) + _ddrop, len(_keep))
+                _RECAP_SEEN_HASHES.extend(h for h in _kept_h if h is not None)
+
             log.info("[%s] %d canonical frames from %d source pages", chapter.tag, len(frame_paths), len(chapter.panel_paths))
-            cfg.write_progress("slice", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: {len(frame_paths)} panels ready",
+                               frac=0.05, substage="tts")
 
             # Build an ordered list of (tag, text, frame_positions) "segments" —
             # each one gets exactly ONE continuous edge-tts synthesis call, then
@@ -5658,7 +7840,9 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 ocr_st = seg_item[3] if len(seg_item) > 3 else (OcrStatus.SUCCESS if text.strip() else OcrStatus.NO_TEXT)
 
                 cfg.write_progress("render", chapter.index - 1, total,
-                                   f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
+                                   f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}",
+                                   frac=0.05 + 0.50 * ((seg_idx + 1) / max(1, len(segments))),
+                                   substage="tts")
 
                 is_silent_segment = not text.strip() or ocr_st in (OcrStatus.NO_TEXT, OcrStatus.FAILED)
                 if not is_silent_segment:
@@ -5760,7 +7944,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                 manifest.save(manifest_path)
 
             cfg.write_progress("render", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: building audio track")
+                               f"Chapter {chapter.index}/{total}: building audio track",
+                               frac=0.62, substage="audio")
             audio_path = build_chapter_audio_track(
                 cfg, chapter, segment_audio_paths, narration_expected=tts_attempted > 0,
             ) if segment_audio_paths else None
@@ -5792,7 +7977,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                     log.warning("[%s] could not verify final audio duration: %s", chapter.tag, e)
 
             cfg.write_progress("render", chapter.index - 1, total,
-                               f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
+                               f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames",
+                               frac=0.72, substage="encode")
             video_path = render_chapter_with_retry(cfg, chapter, frame_paths, frame_durations, audio_path)
 
             if not video_path:
@@ -5986,6 +8172,33 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
              "OCR words in place. Hard-guarded to spelling fixes — cannot reword or add.",
     )
     parser.add_argument(
+        "--describe-visuals", action="store_true",
+        help="OPTIONAL: caption each panel's visual action with a vision model and "
+             "fold it into the narration (so action panels aren't silent). Off by default.",
+    )
+    parser.add_argument(
+        "--visual-provider", default="auto",
+        choices=["auto", "ollama", "smolvlm", "groq", "gemini", "openrouter", "none"],
+        help="Vision engine for --describe-visuals (default: auto = cloud key if set, "
+             "else off). 'smolvlm' = local SmolVLM2-500M, ~3.5s/panel on CPU, no key.",
+    )
+    parser.add_argument(
+        "--visual-model", default=None,
+        help="Override the vision model name (e.g. 'moondream', 'llava:7b', 'llama-3.2-90b-vision-preview').",
+    )
+    parser.add_argument(
+        "--gemini-api-key", default=os.environ.get("GEMINI_API_KEY"),
+        help="Google Gemini API key (free tier) — used for --describe-visuals / narration if set.",
+    )
+    parser.add_argument(
+        "--openrouter-api-key", default=os.environ.get("OPENROUTER_API_KEY"),
+        help="OpenRouter API key — used for --describe-visuals / narration if set.",
+    )
+    parser.add_argument(
+        "--motion", default="none", choices=["none", "kenburns"],
+        help="none (default): fast static slideshow. kenburns: subtle slow camera drift over each panel.",
+    )
+    parser.add_argument(
         "--progress-file", type=Path, default=None,
         help="JSON file path to write progress updates to (polled by the Node orchestrator).",
     )
@@ -5996,7 +8209,7 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
              "If omitted, translation is skipped and raw text is used as-is.",
     )
     parser.add_argument(
-        "--groq-model", default="llama-3.3-70b-versatile",
+        "--groq-model", default=os.environ.get("GROQ_TEXT_MODEL", "qwen/qwen3.8-27b"),
         help="Groq model used for translation (default: llama-3.3-70b-versatile).",
     )
     parser.add_argument(
@@ -6065,6 +8278,12 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         narration_model=args.narration_model,
         narration_style=args.narration_style,
         observer=args.observer,
+        describe_visuals=args.describe_visuals,
+        visual_provider=args.visual_provider,
+        visual_model=args.visual_model,
+        gemini_api_key=args.gemini_api_key,
+        openrouter_api_key=args.openrouter_api_key,
+        motion=args.motion,
         progress_file=args.progress_file,
         slice_only=args.slice_only,
         production_mode=args.production_mode,
@@ -6115,21 +8334,31 @@ def run_slice_only(cfg: PipelineConfig) -> None:
         log.error("No chapters found under %s", cfg.input_dir)
         return
     log.info("=== SLICE-ONLY MODE: %d chapter(s) ===", total)
-    cfg.write_progress("slice", 0, total, f"Slicing {total} chapter(s)…")
+    cfg.write_progress("slice", 0, total, f"Preparing {total} chapter(s)…", substage="frame")
     total_frames = 0
-    for chapter in chapters:
+    _SUB_LABEL = {"frame": "Slicing panels", "ocr": "Reading panel text",
+                  "visual": "Describing panels"}
+    for _idx, chapter in enumerate(chapters):
         t0 = time.time()
         log.info("--- Chapter %d/%d (%s) ---", chapter.index, total, chapter.name)
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: slicing panels…")
-        frame_data = slice_chapter_panels(cfg, chapter)
+
+        def _cb(sub, frac, _ci=_idx, _cn=chapter.index):
+            cfg.write_progress(
+                "slice", _ci, total,
+                f"Chapter {_cn}/{total}: {_SUB_LABEL.get(sub, sub)}…",
+                frac=frac, substage=sub,
+            )
+
+        _cb("frame", 0.0)
+        frame_data = slice_chapter_panels(cfg, chapter, phase_cb=_cb)
         n = len(frame_data)
         total_frames += n
         dt = time.time() - t0
         log.info("[%s] %d frames from %d source panels (%.1fs)",
                  chapter.tag, n, len(chapter.panel_paths), dt)
-        cfg.write_progress("slice", chapter.index - 1, total,
-                           f"Chapter {chapter.index}/{total}: sliced {n} frames")
+        cfg.write_progress("slice", _idx, total,
+                           f"Chapter {chapter.index}/{total}: {n} panels ready",
+                           frac=1.0, substage="ocr")
     log.info("=== SLICE-ONLY DONE: %d chapters, %d total frames in %.1fs ===",
              total, total_frames, time.time() - start)
     cfg.write_progress("done", total, total,

@@ -1,0 +1,44 @@
+# Run the whole stack locally with Docker Desktop:
+#
+#   docker compose up -d --build
+#   open http://localhost:7860
+#
+# Everything (Next.js UI + pipeline-service + OCR + Caddy) runs in the one
+# container from ./Dockerfile. ./data is a bind mount so your jobs, the
+# SQLite DB, the BGM folder and model caches all survive `docker compose down`.
+#
+# This is the same image Hugging Face Spaces uses — it is NOT HF-only. The HF
+# "paid users" limit is a Spaces hosting thing, not a limit on the image.
+
+services:
+  app:
+    build: .
+    image: manhwa-recap-studio:local
+    ports:
+      - "7860:7860"          # web UI (Caddy → Next.js :3000 / socket.io :3001 / OCR :3002)
+    volumes:
+      - ./data:/data         # jobs, db, cache, bgm  (created on first run)
+    environment:
+      # All optional. Leave unset for the fully-local path (RapidOCR + verbatim
+      # narration, no visual captioning). Add a FREE key to unlock the rest:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}       # aistudio.google.com/apikey  — recap narration + --describe-visuals
+      GROQ_API_KEY: ${GROQ_API_KEY:-}           # console.groq.com/keys       — recap narration + --describe-visuals
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Point at an Ollama running on the host (optional local LLM / vision):
+      #   OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # Optional: local Ollama for --describe-visuals / recap narration with no API
+  # key. CPU-only is slow (~1 min/panel for vision) — a free cloud key above is
+  # far faster. Enable with:  docker compose --profile ollama up -d
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    restart: unless-stopped

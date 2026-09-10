@@ -43,6 +43,8 @@ import {
   getSourceFromId,
   fetchChaptersForSource,
   fetchImagesForSource,
+  fetchChapterImagesCrossSource,
+  resolveSeriesCrossSource,
   downloadImageForSource,
   extFromFilename,
   generateImageNarrations,
@@ -156,7 +158,8 @@ async function httpHandler(req: IncomingMessage, res: ServerResponse) {
   if (req.method === 'GET' && url === '/preview/voice') {
     const fullUrl = new URL(req.url || '', 'http://localhost')
     const voice = fullUrl.searchParams.get('voice') || ''
-    const VOICE_ID_RE = /^[a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural$/
+    // edge-tts ids ("en-US-AndrewNeural") OR Kokoro ids ("am_michael", "af_bella")
+    const VOICE_ID_RE = /^([a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural|[abhijpef][fm]_[a-z][a-z_]*)$/
     if (!VOICE_ID_RE.test(voice)) {
       sendJson(res, 400, { error: 'Invalid or missing voice parameter.' })
       return
@@ -367,66 +370,81 @@ async function emitStatus(jobId: string): Promise<void> {
   io.to(`job:${jobId}`).emit('status', { type: 'status', job })
 }
 
+// A logging write must NEVER be able to fail a job. Every DB call here is
+// wrapped: a transient SQLite/query-engine timeout under a write burst used to
+// reject out of a `void emitLog(...)` call, trip `unhandledRejection`, and mark
+// a perfectly healthy running job as `error` (see F4 in research/overnight-bug-log.md).
 async function emitLog(
   jobId: string,
   level: 'info' | 'warn' | 'error' | 'success',
   stage: string | null,
   message: string,
 ): Promise<void> {
-  const log = await db.jobLog.create({
-    data: { jobId, level, stage, message },
-  })
-  const entry = {
-    id: log.id,
-    jobId: log.jobId,
-    level: log.level as 'info' | 'warn' | 'error' | 'success',
-    stage: log.stage,
-    message: log.message,
-    createdAt: log.createdAt.toISOString(),
+  try {
+    const log = await db.jobLog.create({
+      data: { jobId, level, stage, message },
+    })
+    io.to(`job:${jobId}`).emit('log', {
+      type: 'log',
+      log: {
+        id: log.id,
+        jobId: log.jobId,
+        level: log.level as 'info' | 'warn' | 'error' | 'success',
+        stage: log.stage,
+        message: log.message,
+        createdAt: log.createdAt.toISOString(),
+      },
+    })
+  } catch (err) {
+    console.warn(`[emitLog] jobLog write failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`)
   }
-  io.to(`job:${jobId}`).emit('log', { type: 'log', log: entry })
 
   // Also update Job.message so subscribers get it on next status poll.
-  await db.job.update({
-    where: { id: jobId },
-    data: { message: message.slice(0, 500), stage: stage ?? undefined },
-  }).catch(() => undefined)
+  try {
+    await db.job.update({
+      where: { id: jobId },
+      data: { message: message.slice(0, 500), stage: stage ?? undefined },
+    })
+  } catch {
+    /* non-fatal */
+  }
 }
 
 async function emitProgress(
   jobId: string,
   fields: {
     progress: number
-    doneChapters: number
-    totalChapters: number
-    doneImages: number
-    totalImages: number
     stage: string
     message: string
+    doneChapters?: number
+    totalChapters?: number
+    doneImages?: number
+    totalImages?: number
+    substage?: string   // fine-grained tag for the UI stage rail; socket-only
   },
 ): Promise<void> {
-  await db.job.update({
-    where: { id: jobId },
-    data: {
-      progress: Math.max(0, Math.min(100, Math.round(fields.progress))),
-      doneChapters: fields.doneChapters,
-      totalChapters: fields.totalChapters,
-      doneImages: fields.doneImages,
-      totalImages: fields.totalImages,
-      stage: fields.stage,
-      message: fields.message.slice(0, 500),
-    },
-  }).catch(() => undefined)
+  const pct = Math.max(0, Math.min(100, Math.round(fields.progress)))
+  const data: Record<string, unknown> = {
+    progress: pct,
+    stage: fields.stage,
+    message: fields.message.slice(0, 500),
+  }
+  if (fields.doneChapters !== undefined) data.doneChapters = fields.doneChapters
+  if (fields.totalChapters !== undefined) data.totalChapters = fields.totalChapters
+  if (fields.doneImages !== undefined) data.doneImages = fields.doneImages
+  if (fields.totalImages !== undefined) data.totalImages = fields.totalImages
+  await db.job.update({ where: { id: jobId }, data }).catch(() => undefined)
 
   io.to(`job:${jobId}`).emit('progress', {
     type: 'progress',
     jobId,
-    progress: Math.max(0, Math.min(100, Math.round(fields.progress))),
+    progress: pct,
     doneChapters: fields.doneChapters,
     totalChapters: fields.totalChapters,
     doneImages: fields.doneImages,
     totalImages: fields.totalImages,
     stage: fields.stage,
+    substage: fields.substage,
     message: fields.message,
   })
 }
@@ -648,7 +666,23 @@ async function cancelJob(jobId: string): Promise<void> {
  * Returns true on success, false on failure (non-fatal — the caller falls
  * back to full-page VLM transcription).
  */
+/** Count frame_*.jpg under work/temp_slices for a job (for the review prompt). */
+async function countSlicedFrames(jobId: string): Promise<number> {
+  const root = path.join(workDir(jobId), 'temp_slices')
+  let n = 0
+  try {
+    for (const d of await fs.readdir(root)) {
+      if (!/^chap_\d+$/i.test(d)) continue
+      try {
+        n += (await fs.readdir(path.join(root, d))).filter((f) => /^frame_\d+\.jpe?g$/i.test(f)).length
+      } catch { /* skip */ }
+    }
+  } catch { /* no slices */ }
+  return n
+}
+
 async function sliceJobChapters(jobId: string): Promise<boolean> {
+  const job = await db.job.findUnique({ where: { id: jobId } })
   const args = [
     PIPELINE_SCRIPT,
     '--input-dir', datasetDir(jobId),
@@ -657,10 +691,24 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
     '--voice', 'en-US-AndrewNeural', // unused by slice-only, but required by argparse
     '--narration-provider', 'none',
     '--job-id', jobId,
+    '--progress-file', progressFilePath(jobId),
+    // series name → the OCR service's per-series known-mistakes correction
+    // dictionary (data/ocr-corrections/<slug>.json). OCR runs in THIS phase.
+    '--recap-title', job?.mangaTitle || 'Recap',
     ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
     '--slice-only',
     '--keep-temp',
   ]
+  // OPTIONAL per-panel visual captioning happens INSIDE the slice phase
+  // (it writes narration.json alongside the OCR text), so the flags belong
+  // on this invocation, not the render one. Vision engine: a per-job cloud
+  // key if given, else local Ollama (free). Off unless describeVisuals.
+  if (job?.describeVisuals) {
+    args.push('--describe-visuals', '--visual-provider', job.visualProvider || 'auto')
+    if (job.groqKey) args.push('--groq-api-key', job.groqKey)
+    if (job.geminiKey) args.push('--gemini-api-key', job.geminiKey)
+    if (job.openRouterKey) args.push('--openrouter-api-key', job.openRouterKey)
+  }
 
   await emitLog(jobId, 'info', 'slice', `Slicing chapters into individual panels (python --slice-only)…`)
 
@@ -718,10 +766,49 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
   child.stdout?.on('data', (d) => { stdoutBuf += d.toString() })
   child.stderr?.on('data', (d) => { stderrBuf += d.toString() })
 
+  // Live progress for the slice+OCR+caption phase — the longest single stretch
+  // of a job (~40% of wall time) that used to sit frozen because nothing read
+  // the Python side's progress file here. Maps that file's per-chapter +
+  // in-chapter fraction into the 10→45% band and passes the substage tag
+  // ('frame'/'ocr'/'visual') straight through for the UI stage rail.
+  const sliceProgFile = progressFilePath(jobId)
+  let sliceLogMark = 0
+  const slicePoll = setInterval(() => {
+    void (async () => {
+      try {
+        const raw = await fs.readFile(sliceProgFile, 'utf8')
+        const p = JSON.parse(raw) as {
+          stage?: string; substage?: string
+          chapter_index?: number; chapter_frac?: number; total_chapters?: number
+          message?: string
+        }
+        if (p.stage !== 'slice') return
+        const done = (p.chapter_index ?? 0) + Math.max(0, Math.min(1, p.chapter_frac ?? 0))
+        const frac = done / Math.max(1, p.total_chapters ?? 1)
+        await emitProgress(jobId, {
+          progress: 10 + Math.max(0, Math.min(1, frac)) * 35,
+          stage: 'slice',
+          substage: p.substage || 'frame',
+          message: p.message || 'Slicing panels…',
+        })
+        // A JobLog breadcrumb every 10 chapters — the slice+OCR pass is ~40%
+        // of wall time and used to leave a single log line for hours.
+        const ci = p.chapter_index ?? 0
+        if (ci >= sliceLogMark + 10 && (p.total_chapters ?? 0) > 15) {
+          sliceLogMark = ci
+          await emitLog(jobId, 'info', 'slice', `Sliced + transcribed ${ci}/${p.total_chapters} chapters`)
+        }
+      } catch {
+        /* file not written yet / mid-rewrite */
+      }
+    })()
+  }, 1500)
+
   const { code, spawnError } = await new Promise<{ code: number; spawnError?: Error }>((resolve) => {
     child.on('exit', (c) => resolve({ code: c ?? -1 }))
     child.on('error', (err) => resolve({ code: -1, spawnError: err }))
   })
+  clearInterval(slicePoll)
   clearTimeout(killTimer)
   childProcesses.delete(jobId)
 
@@ -794,9 +881,25 @@ async function processJob(jobId: string): Promise<void> {
       throw new Error(`Cannot determine scraping source from manga ID: ${job.mangaId}`)
     }
     await emitLog(jobId, 'info', 'scrape', `Fetching chapter list from ${source}`)
-    const fetched = await fetchChaptersForSource(source, job.mangaId, job.chapterLimit)
+    let fetched: Awaited<ReturnType<typeof fetchChaptersForSource>> = []
+    try {
+      fetched = await fetchChaptersForSource(source, job.mangaId, job.chapterLimit)
+    } catch (e) {
+      await emitLog(jobId, 'warn', 'scrape',
+        `${source} chapter list failed (${(e instanceof Error ? e.message : String(e)).slice(0, 140)})`)
+    }
+    if (fetched.length === 0 && source !== 'comick' && source !== 'weebcentral') {
+      const alt = await resolveSeriesCrossSource(job.mangaTitle, job.chapterLimit, [source])
+      if (alt) {
+        await emitLog(jobId, 'info', 'scrape',
+          `No chapters on ${source} — using ${alt.source} instead (${alt.chapters.length} chapters)`)
+        await db.job.update({ where: { id: jobId }, data: { mangaId: alt.mangaId } })
+        job.mangaId = alt.mangaId
+        fetched = alt.chapters
+      }
+    }
     if (fetched.length === 0) {
-      throw new Error(`No chapters found for manga ${job.mangaId} on ${source}`)
+      throw new Error(`No chapters found for "${job.mangaTitle}" on ${source} or any mirror`)
     }
     // Create Chapter rows.
     for (let i = 0; i < fetched.length; i++) {
@@ -869,12 +972,32 @@ async function processJob(jobId: string): Promise<void> {
       if (!source) {
         throw new Error(`Cannot determine scraping source from manga ID: ${job.mangaId}`)
       }
-      const imageUrls = await fetchImagesForSource(source, job.mangaId, ch.mangadexId)
+      // The job's source lists the chapter but may not serve its pages (a
+      // MangaDex entry hosted on the scanlator's own site is the usual case).
+      // On an empty/failed page list, re-resolve the same title + chapter
+      // number on a mirror (WeebCentral, then Comick) and scrape from there.
+      let imageUrls: string[] = []
+      let dlSource = source
+      try {
+        imageUrls = await fetchImagesForSource(source, job.mangaId, ch.mangadexId)
+      } catch (e) {
+        await emitLog(jobId, 'warn', 'scrape',
+          `Chapter ${ch.index}: ${source} page list failed (${(e instanceof Error ? e.message : String(e)).slice(0, 140)}) — trying other sources`)
+      }
+      if (imageUrls.length === 0 && source !== 'comick' && source !== 'weebcentral') {
+        const fb = await fetchChapterImagesCrossSource(job.mangaTitle, ch.chapterNum, [source])
+        if (fb && fb.images.length > 0) {
+          imageUrls = fb.images
+          dlSource = fb.source
+          await emitLog(jobId, 'info', 'scrape',
+            `Chapter ${ch.index}: recovered ${fb.images.length} pages from ${fb.source} (${source} had none)`)
+        }
+      }
       if (imageUrls.length === 0) {
-        await emitLog(jobId, 'warn', 'scrape', `Chapter ${ch.index} has 0 pages, skipping`)
+        await emitLog(jobId, 'warn', 'scrape', `Chapter ${ch.index}: no pages on any source, skipping`)
         await db.chapter.update({
           where: { id: ch.id },
-          data: { status: 'error', error: 'No pages' },
+          data: { status: 'error', error: `No pages (${source} + fallbacks)` },
         })
         continue
       }
@@ -893,7 +1016,7 @@ async function processJob(jobId: string): Promise<void> {
           continue
         }
         try {
-          await downloadImageForSource(source, imageUrls[i], destPath)
+          await downloadImageForSource(dlSource, imageUrls[i], destPath)
           downloaded++
           doneImages++
           // Rate limit: 300ms between images.
@@ -907,10 +1030,14 @@ async function processJob(jobId: string): Promise<void> {
           )
         }
         totalImages++
-        // Emit progress every few images.
+        // Emit progress every few images. Base it on CHAPTERS completed (we
+        // never know the total image count until the whole scrape is done, so
+        // the old image-ratio formula sat frozen near 10% for the entire
+        // multi-hundred-chapter scrape).
         if (i % 3 === 0 || i === imageUrls.length - 1) {
+          const chFrac = (ch.index - 1 + (i + 1) / Math.max(1, imageUrls.length)) / chapters.length
           await emitProgress(jobId, {
-            progress: 5 + (doneImages / Math.max(1, totalImages + (imageUrls.length - i - 1))) * 25,
+            progress: 1 + Math.max(0, Math.min(1, chFrac)) * 9,
             doneChapters: 0,
             totalChapters: chapters.length,
             doneImages,
@@ -979,6 +1106,34 @@ async function processJob(jobId: string): Promise<void> {
     await emitLog(jobId, 'success', 'slice', 'Canonical frames created and manifest validated.')
   } else {
     await emitLog(jobId, 'warn', 'slice', 'Canonical frame creation failed — falling back to full-page images.')
+  }
+
+  if (cancelledJobs.has(jobId)) return
+
+  // -----------------------------
+  // OPTIONAL PAUSE: manual panel review (job.reviewPanels).
+  // After slicing, stop and wait for the user to drop cover/ad/junk panels.
+  // A `.review_done` marker (written by /api/jobs/:id/review) means we've
+  // already been through here — resume straight past it. Zero effect when
+  // reviewPanels is false: one boolean check, nothing else.
+  // -----------------------------
+  if (job.reviewPanels) {
+    const reviewMarker = path.join(workDir(jobId), '.review_done')
+    if (!(await fileExists(reviewMarker))) {
+      const frameCount = await countSlicedFrames(jobId)
+      await db.job.update({
+        where: { id: jobId },
+        data: {
+          status: 'awaiting_review',
+          stage: 'review',
+          message: `${frameCount} panels ready — review and drop any covers / ads, then render.`,
+        },
+      })
+      await emitStatus(jobId)
+      await emitLog(jobId, 'info', 'review',
+        `Paused for panel review — ${frameCount} panels sliced. Open the job to choose which to keep.`)
+      return
+    }
   }
 
   // Slicing now runs as a cancellable async spawn (was blocking spawnSync,
@@ -1339,7 +1494,7 @@ async function processJob(jobId: string): Promise<void> {
     }
 
     await emitProgress(jobId, {
-      progress: 30 + (transcribedCount / Math.max(1, scrapedChapters.length)) * 15,
+      progress: 44 + (transcribedCount / Math.max(1, scrapedChapters.length)) * 1,
       doneChapters: transcribedCount,
       totalChapters: chapters.length,
       doneImages,
@@ -1396,6 +1551,13 @@ async function processJob(jobId: string): Promise<void> {
     // falls back to cleaned source text if the model drifts.
     '--narration-provider',
     job.narrate === false ? 'none' : (process.env.NARRATION_PROVIDER || 'auto'),
+    // Narration style is a per-job CHOICE (default verbatim = OCR words as-is,
+    // no LLM). 'cleanup'/'recap' invoke the LLM rewrite (local Ollama, or a
+    // free Groq/Gemini key if the job carries one). A legacy narrate:false
+    // pins verbatim regardless.
+    '--narration-style',
+    job.narrate === false ? 'verbatim' : (job.narrationStyle || 'verbatim'),
+    ...(job.motionStyle && job.motionStyle !== 'none' ? ['--motion', job.motionStyle] : []),
     '--job-id', jobId,
     // Reference-recap style: series title on the intro card + a small
     // channel watermark on every frame. RECAP_WATERMARK overrides the
@@ -1412,11 +1574,30 @@ async function processJob(jobId: string): Promise<void> {
   if (job.groqKey) {
     args.push('--groq-api-key', job.groqKey)
   }
+  if (job.geminiKey) {
+    args.push('--gemini-api-key', job.geminiKey)
+  }
+  if (job.openRouterKey) {
+    args.push('--openrouter-api-key', job.openRouterKey)
+  }
   if (job.openaiKey) {
     args.push('--openai-api-key', job.openaiKey)
   }
   if (!job.translate) {
     args.push('--no-translate')
+  }
+  // Verbatim narration: run the LLM "observer" that repairs garbled OCR words
+  // in place (hard-guarded to spelling fixes — can't reword/add). Only worth
+  // it with a CAPABLE model — a local llama3.2:3b fixes nothing and just
+  // burns render time, so gate on a real cloud key (Groq/Gemini/OpenRouter/
+  // OpenAI), NOT bare Ollama. RECAP_OBSERVER=1 forces it on regardless.
+  const hasCloudLLM =
+    job.groqKey || job.geminiKey || job.openRouterKey || job.openaiKey ||
+    process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY ||
+    process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY
+  const wantObserver = hasCloudLLM || process.env.RECAP_OBSERVER === '1'
+  if (wantObserver && (job.narrate === false || (job.narrationStyle || 'verbatim') === 'verbatim')) {
+    args.push('--observer')
   }
   // BGM: job.bgmPath is just a filename inside data/bgm/ (see
   // src/app/api/bgm/route.ts) — resolve it to an absolute path and only
@@ -1467,13 +1648,15 @@ async function processJob(jobId: string): Promise<void> {
         status: string
         updated_at: number
       }
-      let pct = 40
+      let pct = 45
       let stage = 'render'
+      const _cf = (prog as { chapter_frac?: number }).chapter_frac ?? 0
+      const _done = (prog.chapter_index ?? 0) + Math.max(0, Math.min(1, _cf))
       if (prog.stage === 'slice') {
-        pct = 40 + (prog.chapter_index / Math.max(1, prog.total_chapters)) * 5
+        pct = 10 + (_done / Math.max(1, prog.total_chapters)) * 35
         stage = 'slice'
       } else if (prog.stage === 'render') {
-        pct = 45 + (prog.chapter_index / Math.max(1, prog.total_chapters)) * 50
+        pct = 45 + (_done / Math.max(1, prog.total_chapters)) * 50
         stage = 'render'
       } else if (prog.stage === 'merge') {
         pct = 95
@@ -1485,6 +1668,13 @@ async function processJob(jobId: string): Promise<void> {
         pct = 100
         stage = 'done'
       }
+      // derive a fine substage from the message when the Python side didn't tag one
+      const _sub = (prog as { substage?: string }).substage
+        || (/TTS\s/i.test(prog.message || '') ? 'tts'
+          : /audio track/i.test(prog.message || '') ? 'audio'
+          : /rendering|render/i.test(prog.message || '') ? 'encode'
+          : /Ken Burns|motion/i.test(prog.message || '') ? 'motion'
+          : undefined)
       await emitProgress(jobId, {
         progress: pct,
         doneChapters: transcribedCount,
@@ -1492,6 +1682,7 @@ async function processJob(jobId: string): Promise<void> {
         doneImages,
         totalImages,
         stage,
+        substage: _sub,
         message: prog.message || `${stage} phase`,
       })
     } catch {
@@ -1500,8 +1691,40 @@ async function processJob(jobId: string): Promise<void> {
   }, 1000)
 
   // Stream stdout/stderr line-by-line into JobLog and collect ring buffer of stderr lines.
+  //
+  // F4: the pipeline prints one INFO line per frame at render start (~26k lines
+  // for a 328-chapter job). One JobLog row + one Job.update per line = ~50k DB
+  // writes in a burst, which times out the SQLite query engine. So: keep every
+  // stderr line in the in-memory ring buffer (free, used for the failure
+  // report), but only WRITE a line to the DB when it's genuinely interesting
+  // (error/phase/QA/progress) or when the throttle window has elapsed — noise
+  // is coalesced to ~1 line every LOG_MIN_INTERVAL_MS so the log viewer still
+  // shows the pipeline is alive without hammering the DB.
   const lineBuffers: { stdout: string; stderr: string } = { stdout: '', stderr: '' }
   const stderrHistory: string[] = []
+  const LOG_MIN_INTERVAL_MS = 1500
+  const lastEmitAt: { stdout: number; stderr: number } = { stdout: 0, stderr: 0 }
+  const INTERESTING = /\b(error|traceback|exception|fail(ed|ure|s)?|critical|abort|❌|✗|QA|warn(ing)?|complete[d]?|finaliz|merg(e|ing)|reconstruct|phase|chapter \d+\s*\/\s*\d+|written|skipp?ed|credits)\b/i
+  const NOISE = /translation disabled|NO_TEXT confirmed|using raw text as-is|per-frame narration|entirely credits\/watermark noise/i
+
+  const streamLine = (src: 'stdout' | 'stderr', line: string) => {
+    if (!line) return
+    if (src === 'stderr') {
+      stderrHistory.push(line)
+      if (stderrHistory.length > 200) stderrHistory.shift()
+    }
+    const hard = INTERESTING.test(line) && !NOISE.test(line)
+    const now = Date.now()
+    if (!hard && now - lastEmitAt[src] < LOG_MIN_INTERVAL_MS) return
+    lastEmitAt[src] = now
+    const level: 'info' | 'warn' | 'error' =
+      /\b(error|traceback|exception|critical|abort|fail(ed|ure)?)\b/i.test(line) && !NOISE.test(line)
+        ? 'error'
+        : src === 'stderr' && hard
+          ? 'warn'
+          : 'info'
+    void emitLog(jobId, level, 'render', line)
+  }
 
   child.stdout?.on('data', (chunk: Buffer) => {
     lineBuffers.stdout += chunk.toString('utf8')
@@ -1509,7 +1732,7 @@ async function processJob(jobId: string): Promise<void> {
     while ((idx = lineBuffers.stdout.indexOf('\n')) >= 0) {
       const line = lineBuffers.stdout.slice(0, idx).trim()
       lineBuffers.stdout = lineBuffers.stdout.slice(idx + 1)
-      if (line) void emitLog(jobId, 'info', 'render', line)
+      streamLine('stdout', line)
     }
   })
   child.stderr?.on('data', (chunk: Buffer) => {
@@ -1518,11 +1741,7 @@ async function processJob(jobId: string): Promise<void> {
     while ((idx = lineBuffers.stderr.indexOf('\n')) >= 0) {
       const line = lineBuffers.stderr.slice(0, idx).trim()
       lineBuffers.stderr = lineBuffers.stderr.slice(idx + 1)
-      if (line) {
-        stderrHistory.push(line)
-        if (stderrHistory.length > 100) stderrHistory.shift()
-        void emitLog(jobId, 'warn', 'render', line)
-      }
+      streamLine('stderr', line)
     }
   })
 
@@ -1724,6 +1943,7 @@ async function processJob(jobId: string): Promise<void> {
         progress: 100,
         stage: 'done',
         message: 'Pipeline complete',
+        error: null, // F4: clear any stale transient error now that we finished OK
         outputDir: outputDir(jobId),
         outputVideo: outName,
         r2Key,
@@ -1920,6 +2140,17 @@ function handleFatalError(err: unknown, origin: string) {
   if (currentlyRunning) {
     const jobId = currentlyRunning
     const msg = err instanceof Error ? err.message : String(err)
+
+    // F4: when the pipeline subprocess is still alive it OWNS the job's
+    // outcome — its exit code decides done/error. A stray rejected promise
+    // here (almost always a transient logging DB write) must NOT overwrite a
+    // running job's status; that produced a 6-hour spurious "failed" while
+    // the render was completing fine. Log it and let the child finish.
+    if (childProcesses.has(jobId)) {
+      console.warn(`[pipeline-service] ${origin} while job ${jobId} subprocess is alive — NOT failing the job: ${msg.slice(0, 300)}`)
+      return
+    }
+
     db.job.update({
       where: { id: jobId },
       data: { status: 'error', error: msg.slice(0, 2000), stage: 'fatal' },
