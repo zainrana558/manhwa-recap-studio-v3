@@ -9,3 +9,6 @@
 {"from": "HEEEE", "to": "HERE", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037036, "last": 1789037036, "src": {"tight-unclip": 1}}
 {"from": "HLOH", "to": "CHOPSTICKS", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037109, "last": 1789037109, "src": {"tight-unclip": 1}}
 {"from": "AASKING", "to": "ASKING", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037170, "last": 1789037170, "src": {"tight-unclip": 1}}
+{"from": "HUAS", "to": "HUA", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037378, "last": 1789037378, "src": {"tight-unclip": 1}}
+{"from": "SSWSIN", "to": "DISMISS", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037378, "last": 1789037378, "src": {"tight-unclip": 1}}
+{"from": "KTO", "to": "THEN", "kind": "tok", "weight": 0.55, "count": 1, "first": 1789037385, "last": 1789037385, "src": {"tight-unclip": 1}}

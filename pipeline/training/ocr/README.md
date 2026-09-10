@@ -42,16 +42,27 @@ and merge-into-narration.json step. `ab_ocr.py` — RapidOCR vs Baberu A/B harne
 - `kaggle_api.py` — REST client for the `KGAT_` bearer token (the `kaggle` CLI
   1.7.x can't use it): `kernel-push`, `kernel-status`, `kernel-output`.
 
-## Kaggle datasets (private)
+## Kaggle datasets (private, `zainrana1122/`)
 
 | dataset | contents |
 |---|---|
 | `nm-ocr-byt5-data` | ByT5 corrector `train/val/eval_real.jsonl` |
-| `manhwa-ocr-synth` | `synth/` bubble crops + `rec_synth/` line crops |
-| `manhwa-ocr-raw-scrapes` | scraped chapter pages (11 titles × 10 ch) |
-| `manhwa-ocr-slice-frames` | sliced 1920×1080 frames + manifests |
-| `manhwa-ocr-qwen-batches` | curated Qwen batches + `INDEX.json` |
-| `manhwa-ocr-rec-data` | merged synthetic + verified-real line crops for `krec` |
+| `manhwa-ocr-synth` | `bubbles.zip` (14k) + `lines.zip` (40k) synthetic crops |
+| `manhwa-ocr-raw-scrapes` | scraped chapter pages, 9 titles × 10 ch |
+| `manhwa-ocr-slice-frames` | sliced 1920×1080 frames + manifests (per-title zips) |
+| `manhwa-ocr-qwen-batches` | 8 batches × 180 curated frames + `INDEX.json` + prompt |
+| `manhwa-ocr-corrector-pairs` | `corrected_pairs.jsonl` + `panel_vision.json` |
+| `manhwa-ocr-rec-data` | *(pending)* merged synthetic + verified-real line crops |
+
+**Titles used** (hard murim / action manhwa, no manga, no webtoons — the
+`webtoons` source scraper returns thumbnail sprites, not pages): Return of the
+Mount Hua Sect, Legend of the Northern Blade, Reaper of the Drifting Moon,
+The Great Mage Returns After 4000 Years, Damn Reincarnation, SSS-Class Suicide
+Hunter (all AsuraScans), The Breaker / The Beginning After the End (mgeko).
+Slicing was paused after 6 titles (~5,200 frames); the Qwen batches draw from
+those. Re-run `slice_all.sh` for the rest.
+
+`kaggle_push.sh <synth|scrapes|byt5|pairs|frames|qwen|all>` uploads them.
 
 ## Corrector pairs
 
