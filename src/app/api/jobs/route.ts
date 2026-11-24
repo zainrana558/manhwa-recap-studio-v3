@@ -132,11 +132,13 @@ export async function POST(req: NextRequest) {
     )
       ? (body.narrationStyle as string)
       : "verbatim";
-    const narrationSpeed = (["slow", "normal", "fast", "brisk"] as const).includes(
+    const narrationSpeed = (["slow", "normal", "fast", "brisk", "turbo", "2x"] as const).includes(
       body.narrationSpeed as never
     )
       ? (body.narrationSpeed as string)
       : "normal";
+    const rawSilent = typeof body.silentPanelDuration === "number" ? body.silentPanelDuration : parseFloat(String(body.silentPanelDuration ?? ""));
+    const silentPanelDuration = Number.isFinite(rawSilent) ? Math.max(0.8, Math.min(6.0, rawSilent)) : 2.4;
     const frameStyle = (["blur", "cover", "dark"] as const).includes(
       body.frameStyle as never
     )
@@ -306,6 +308,7 @@ export async function POST(req: NextRequest) {
           {
             narrationStyle,
             narrationSpeed,
+            silentPanelDuration,
             frameStyle,
             bgmVolume,
             includeIntro,

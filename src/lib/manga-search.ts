@@ -133,7 +133,7 @@ async function searchJikan(query: string, limit = 12): Promise<MangadexManga[]> 
       availableTranslatedLanguages: [],
       tags,
       contentRating,
-      lastChapter: null,
+      lastChapter: (m as { chapters?: number | null }).chapters ? String((m as { chapters?: number | null }).chapters) : null,
       source: "mal" as const,
       externalUrl: m.url ?? `https://myanimelist.net/manga/${m.mal_id}`,
     };
@@ -262,7 +262,7 @@ async function searchAniList(query: string, limit = 12): Promise<MangadexManga[]
       availableTranslatedLanguages: [],
       tags,
       contentRating: "safe",
-      lastChapter: null,
+      lastChapter: (m as { chapters?: number | null }).chapters ? String((m as { chapters?: number | null }).chapters) : null,
       source: "anilist" as const,
       externalUrl: m.siteUrl ?? null,
     };
@@ -480,20 +480,20 @@ export async function searchAllManga(
 
   const bestByTitle = new Map<
     string,
-    { coverUrl?: string; description?: string; year?: number; tags?: string[] }
+    { coverUrl?: string; description?: string; year?: number; tags?: string[]; lastChapter?: string }
   >();
   for (const m of [
+    ...asurascans,
+    ...comick,
+    ...mangadex,
     ...thunderscans,
     ...vortexscans,
     ...rizzfables,
-    ...mangadex,
     ...anilist,
     ...mal,
-    ...comick,
     ...mgeko,
     ...mangapill,
     ...weebcentral,
-    ...asurascans,
     ...webtoons,
     ...mangahere,
     ...fanfox,
@@ -505,6 +505,13 @@ export async function searchAllManga(
     if (!cur.description && m.description) cur.description = m.description;
     if (!cur.year && m.year) cur.year = m.year;
     if ((!cur.tags || cur.tags.length === 0) && m.tags?.length) cur.tags = m.tags;
+    if (m.lastChapter) {
+      const nNew = parseFloat(m.lastChapter);
+      const nCur = cur.lastChapter ? parseFloat(cur.lastChapter) : -1;
+      if (!cur.lastChapter || (!Number.isNaN(nNew) && nNew > nCur)) {
+        cur.lastChapter = m.lastChapter;
+      }
+    }
     bestByTitle.set(k, cur);
   }
 
@@ -515,6 +522,7 @@ export async function searchAllManga(
     if (!item.description && best.description) item.description = best.description;
     if (!item.year && best.year) item.year = best.year;
     if ((!item.tags || item.tags.length === 0) && best.tags?.length) item.tags = best.tags;
+    if (!item.lastChapter && best.lastChapter) item.lastChapter = best.lastChapter;
   }
 
   // No hiding: every result from every source is returned. The relevance sort

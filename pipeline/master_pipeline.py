@@ -304,7 +304,7 @@ def _ort_session(model_path, tag: str = ""):
 TALL_IMAGE_SPLIT_ASPECT_RATIO = 2.0
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
-SILENT_FRAME_DURATION = 1.4  # seconds a no-text panel holds on screen — deliberately SHORTER
+SILENT_FRAME_DURATION = 2.4  # seconds a no-text panel holds on screen (readable even at 2x playback) — deliberately SHORTER
                           # than narrated panels (MIN_FRAME_DURATION) so text-less art panels don't
                           # drag. Lowered from 2.0: real jobs over-sliced pages into many panels and
                           # a long run of textless art frames at 2.0s each padded the video with
@@ -8333,6 +8333,12 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     _spd = max(0.5, min(2.0, float(os.environ.get("RECAP_KOKORO_SPEED", "1.0") or 1.0)))
     if abs(_spd - 1.0) > 0.01:
         globals()["MIN_FRAME_DURATION"] = max(1.2, round(2.4 / _spd, 2))
+    _sil_env = os.environ.get("RECAP_SILENT_FRAME_DURATION")
+    if _sil_env:
+        try:
+            globals()["SILENT_FRAME_DURATION"] = max(0.8, min(6.0, float(_sil_env)))
+        except ValueError:
+            pass
     if getattr(cfg, "narration_style", "verbatim") == "dramatic" and not os.environ.get("RECAP_KOKORO_SENT_PAUSE"):
         os.environ["RECAP_KOKORO_SENT_PAUSE"] = "0.30"
     start = time.time()

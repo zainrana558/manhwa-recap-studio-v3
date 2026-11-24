@@ -695,6 +695,7 @@ async function countSlicedFrames(jobId: string): Promise<number> {
 interface RecapOptionsFile {
   narrationStyle?: string
   narrationSpeed?: string
+  silentPanelDuration?: number
   frameStyle?: string
   bgmVolume?: string
   includeIntro?: boolean
@@ -714,8 +715,7 @@ const SPEED_MAP: Record<string, string> = {
   slow: '0.9',
   normal: '1.0',
   fast: '1.15',
-  brisk: '1.25',
-}
+  brisk: '1.25', turbo: '1.5', '2x': '2.0' }
 
 const BGM_VOL_MAP: Record<string, string> = {
   subtle: '0.20',
@@ -1696,6 +1696,9 @@ async function processJob(jobId: string): Promise<void> {
   if (recapOpts.frameStyle) renderEnv.RECAP_FRAME_STYLE = recapOpts.frameStyle
   if (recapOpts.narrationSpeed && SPEED_MAP[recapOpts.narrationSpeed]) {
     renderEnv.RECAP_KOKORO_SPEED = SPEED_MAP[recapOpts.narrationSpeed]
+  }
+  if (typeof recapOpts.silentPanelDuration === 'number' && Number.isFinite(recapOpts.silentPanelDuration)) {
+    renderEnv.RECAP_SILENT_FRAME_DURATION = String(recapOpts.silentPanelDuration)
   }
   if (recapOpts.bgmVolume && BGM_VOL_MAP[recapOpts.bgmVolume]) {
     renderEnv.RECAP_BGM_VOLUME = BGM_VOL_MAP[recapOpts.bgmVolume]

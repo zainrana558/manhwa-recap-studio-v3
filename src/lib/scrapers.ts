@@ -287,20 +287,19 @@ interface WebtoonsTitle {
   title: string;
   genre: string;
   url: string;
+  coverUrl: string | null;
 }
 
 export async function searchWebtoons(
   query: string,
   limit = 10
 ): Promise<MangadexManga[]> {
-  // Webtoons search requires a headless browser or their API.
-  // We use the public search endpoint that returns HTML.
   const res = await fetchWithTimeout(
     `${WEBTOONS_BASE}/en/search?keyword=${encodeURIComponent(query)}&searchType=ALL`,
     {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
       },
     }
@@ -308,27 +307,32 @@ export async function searchWebtoons(
   if (!res.ok) throw new Error(`Webtoons search ${res.status}`);
   const html = await res.text();
 
-  // Parse search results: links like /en/{genre}/{title-slug}/list?title_no={n}
-  // The title text is in nested elements, so we extract the title from the URL slug.
   const titles: WebtoonsTitle[] = [];
   const seen = new Set<number>();
-  const regex = /href="([^"]*\/en\/([^"]+)\/list\?title_no=(\d+))"/gi;
+
+  // Match full <a> card blocks so we capture the real poster <img src="https://webtoon-phinf.pstatic.net/..."> and <strong class="title">
+  const cardRe = /<a\s+[^>]*href="([^"]*\/en\/([^"]+)\/list\?title_no=(\d+))"[^>]*>([\s\S]*?)<\/a>/gi;
   let match;
-  while ((match = regex.exec(html)) !== null) {
+  while ((match = cardRe.exec(html)) !== null) {
     const titleNo = parseInt(match[3], 10);
     if (seen.has(titleNo)) continue;
     seen.add(titleNo);
-    // Extract title from the URL path: /en/{genre}/{title-slug}/list?title_no=N
-    // match[2] is the genre/title-slug part, e.g. "fantasy/tower-of-god"
     const pathParts = match[2].split("/");
-    const titleSlug = pathParts[pathParts.length - 1]; // e.g. "tower-of-god"
-    const title = titleSlug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    if (!title) continue;
+    const titleSlug = pathParts[pathParts.length - 1];
+    const inner = match[4] ?? "";
+    const titleM = inner.match(/<strong[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/strong>/i);
+    const rawTitle = titleM
+      ? titleM[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').trim()
+      : titleSlug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    if (!rawTitle) continue;
+    const imgM = inner.match(/<img[^>]+src="([^"]+)"/i);
+    const coverUrl = imgM && /^https?:\/\//i.test(imgM[1]) ? imgM[1] : null;
     titles.push({
       titleNo,
-      title,
+      title: rawTitle,
       genre: pathParts[0] ?? "",
       url: match[1].startsWith("http") ? match[1] : `${WEBTOONS_BASE}${match[1]}`,
+      coverUrl,
     });
   }
 
@@ -336,12 +340,12 @@ export async function searchWebtoons(
     id: `wt-${t.titleNo}`,
     title: t.title,
     description: "",
-    coverUrl: null,
+    coverUrl: t.coverUrl,
     status: "Ongoing",
     year: null,
     originalLanguage: "ko",
     availableTranslatedLanguages: ["en"],
-    tags: [],
+    tags: t.genre ? [t.genre.charAt(0).toUpperCase() + t.genre.slice(1)] : [],
     contentRating: "safe",
     lastChapter: null,
     source: "webtoons" as const,
@@ -1515,15 +1519,15 @@ export async function searchThunderScans(query: string, limit = 12): Promise<Man
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`ThunderScans search HTTP ${res.status}`);
-  const html = await res.text();
-  const cards = html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
+  const html = (await res.text()).replace(/<script[\s\S]*?<\/script>/gi, "");
+  const cards = html.match(/<div class="bsx">[\s\S]*?<\/a>\s*<\/div>/g) ?? html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
   const seen = new Set<string>();
   const out: MangadexManga[] = [];
   for (const card of cards) {
     const hrefM = card.match(/href="https:\/\/en-thunderscans\.com\/comics\/([^"\/?]+)\/?"/i);
     if (!hrefM) continue;
     const slug = hrefM[1];
-    if (seen.has(slug)) continue;
+    if (seen.has(slug) || slug.includes("+")) continue;
     seen.add(slug);
     const titleM =
       card.match(/<div class="tt">\s*([^<]+?)\s*<\/div>/i) ||
@@ -1533,8 +1537,11 @@ export async function searchThunderScans(query: string, limit = 12): Promise<Man
       .replace(/&amp;/g, "&")
       .replace(/&quot;/g, '"')
       .trim();
+    if (!title || title.includes("value.title") || title.includes("'+")) continue;
     const imgM = card.match(/<img[^>]+src="([^"]+)"/i);
     const coverUrl = imgM ? imgM[1] : null;
+    const chM = card.match(/class="epxs"[^>]*>[^0-9]*([0-9]+(?:\.[0-9]+)?)/i) || card.match(/Chapter\s+([0-9]+(?:\.[0-9]+)?)/i);
+    const lastChapter = chM ? chM[1] : null;
     out.push({
       id: `ts-${slug}`,
       title,
@@ -1546,7 +1553,7 @@ export async function searchThunderScans(query: string, limit = 12): Promise<Man
       availableTranslatedLanguages: ["en"],
       tags: [],
       contentRating: "safe",
-      lastChapter: null,
+      lastChapter,
       source: "thunderscans" as const,
       externalUrl: `${THUNDER_WEB}/comics/${slug}/`,
     });
@@ -1638,6 +1645,9 @@ export async function searchVortexScans(query: string, limit = 12): Promise<Mang
       featuredImage?: string | null;
       seriesStatus?: string | null;
       genres?: Array<{ name?: string }>;
+      _count?: { chapters?: number };
+      chapters?: Array<{ number?: number | string }>;
+      chapterCount?: number;
     }>;
   };
   return (body.posts ?? [])
@@ -1654,7 +1664,12 @@ export async function searchVortexScans(query: string, limit = 12): Promise<Mang
       availableTranslatedLanguages: ["en"],
       tags: (p.genres ?? []).map((g) => g.name).filter((n): n is string => Boolean(n)),
       contentRating: "safe",
-      lastChapter: null,
+      lastChapter:
+        p.chapters?.[0]?.number != null
+          ? String(p.chapters[0].number)
+          : (p._count?.chapters ?? p.chapterCount)
+            ? String(p._count?.chapters ?? p.chapterCount)
+            : null,
       source: "vortexscans" as const,
       externalUrl: `${VORTEX_WEB}/series/${p.slug}`,
     }));
@@ -1729,15 +1744,15 @@ export async function searchRizzFables(query: string, limit = 12): Promise<Manga
     cache: "no-store",
   });
   if (!res.ok) throw new Error(`RizzFables search HTTP ${res.status}`);
-  const html = await res.text();
-  const cards = html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
+  const html = (await res.text()).replace(/<script[\s\S]*?<\/script>/gi, "");
+  const cards = html.match(/<div class="bsx">[\s\S]*?<\/a>\s*<\/div>/g) ?? html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
   const seen = new Set<string>();
   const out: MangadexManga[] = [];
   for (const card of cards) {
     const hrefM = card.match(/href="https:\/\/rizzfables\.com\/series\/([^"\/]+)\/?"/i);
     if (!hrefM) continue;
     const slug = hrefM[1];
-    if (seen.has(slug)) continue;
+    if (seen.has(slug) || slug.includes("+")) continue;
     seen.add(slug);
     const titleM =
       card.match(/<div class="tt">\s*([^<]+?)\s*<\/div>/i) ||
@@ -1747,11 +1762,14 @@ export async function searchRizzFables(query: string, limit = 12): Promise<Manga
       .replace(/&amp;/g, "&")
       .replace(/&quot;/g, '"')
       .trim();
+    if (!title || title.includes("value.title") || title.includes("'+")) continue;
     const imgM = card.match(/<img[^>]+src="([^"]+)"/i);
     let coverUrl = imgM ? imgM[1] : null;
     if (coverUrl && coverUrl.startsWith("/")) {
       coverUrl = `${RIZZ_WEB}${coverUrl}`;
     }
+    const chM = card.match(/class="epxs"[^>]*>[^0-9]*([0-9]+(?:\.[0-9]+)?)/i) || card.match(/Chapter\s+([0-9]+(?:\.[0-9]+)?)/i);
+    const lastChapter = chM ? chM[1] : null;
     out.push({
       id: `rf-${slug}`,
       title,
@@ -1763,7 +1781,7 @@ export async function searchRizzFables(query: string, limit = 12): Promise<Manga
       availableTranslatedLanguages: ["en"],
       tags: [],
       contentRating: "safe",
-      lastChapter: null,
+      lastChapter,
       source: "rizzfables" as const,
       externalUrl: `${RIZZ_WEB}/series/${slug}`,
     });

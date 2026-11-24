@@ -12,7 +12,9 @@ export async function GET(req: NextRequest) {
     const res = await fetch(raw, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        Referer: `${parsed.origin}/`,
+        Referer: parsed.hostname.endsWith("pstatic.net")
+          ? "https://www.webtoons.com/"
+          : `${parsed.origin}/`,
       },
       signal: AbortSignal.timeout(10000),
     });

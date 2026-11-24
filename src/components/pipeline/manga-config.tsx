@@ -74,7 +74,8 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [autoArchive, setAutoArchive] = useState(false);
   const [translate, setTranslate] = useState(false);
   const [narrationStyle, setNarrationStyle] = useState<"verbatim" | "cleanup" | "recap" | "dramatic" | "concise">("verbatim");
-  const [narrationSpeed, setNarrationSpeed] = useState<"slow" | "normal" | "fast" | "brisk">("normal");
+  const [narrationSpeed, setNarrationSpeed] = useState<"slow" | "normal" | "fast" | "brisk" | "turbo" | "2x">("normal");
+  const [silentPanelDuration, setSilentPanelDuration] = useState<string>("2.4");
   const [frameStyle, setFrameStyle] = useState<"blur" | "cover" | "dark">("blur");
   const [useBgm, setUseBgm] = useState(true);
   const [bgmPath, setBgmPath] = useState("default_cinematic.mp3");
@@ -256,6 +257,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           narrate: narrationStyle !== "verbatim",
           narrationStyle,
           narrationSpeed,
+          silentPanelDuration: parseFloat(silentPanelDuration) || 2.4,
           frameStyle,
           bgmVolume,
           includeIntro,
@@ -287,7 +289,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
     } finally {
       setStarting(false);
     }
-  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrationStyle, narrationSpeed, frameStyle, useBgm, bgmPath, bgmVolume, includeIntro, watermark, describeVisuals, visualProvider, motionStyle, reviewPanels, manga, onJobCreated]);
+  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrationStyle, narrationSpeed, silentPanelDuration, frameStyle, useBgm, bgmPath, bgmVolume, includeIntro, watermark, describeVisuals, visualProvider, motionStyle, reviewPanels, manga, onJobCreated]);
 
   // --- Voice preview ---
   // Fetches a short edge-tts sample for the selected voice and plays it.
@@ -710,6 +712,30 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
                 <SelectItem value="normal">Normal (1.0x)</SelectItem>
                 <SelectItem value="fast">Fast (1.15x)</SelectItem>
                 <SelectItem value="brisk">Brisk (1.25x)</SelectItem>
+                <SelectItem value="turbo">Turbo (1.5x)</SelectItem>
+                <SelectItem value="2x">Double (2.0x)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Non-dialogue / silent panel hold duration */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <Gauge className="h-3.5 w-3.5 text-muted-foreground" />
+                Non-dialogue panel hold
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                How long silent / action panels stay on screen (higher keeps art readable at 2x playback).
+              </p>
+            </div>
+            <Select value={silentPanelDuration} onValueChange={setSilentPanelDuration}>
+              <SelectTrigger className="w-36 shrink-0"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="1.5">Snappy (1.5s)</SelectItem>
+                <SelectItem value="2.4">Balanced (2.4s)</SelectItem>
+                <SelectItem value="3.2">Relaxed (3.2s)</SelectItem>
+                <SelectItem value="4.0">Slow (4.0s)</SelectItem>
               </SelectContent>
             </Select>
           </div>
