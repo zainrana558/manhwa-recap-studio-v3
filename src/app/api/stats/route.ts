@@ -8,6 +8,21 @@ export async function GET() {
   try {
     const totalJobs = await db.job.count();
     const completedJobs = await db.job.count({ where: { status: "done" } });
+    const activeJobs = await db.job.count({
+      where: {
+        status: {
+          in: [
+            "pending",
+            "awaiting_review",
+            "scraping",
+            "transcribing",
+            "translating",
+            "rendering",
+            "merging",
+          ],
+        },
+      },
+    });
     const totalChapters = await db.chapter.count();
     const totalImages = await db.job.aggregate({ _sum: { totalImages: true } });
     const archivedJobs = await db.job.count({ where: { status: "done", NOT: { archiveProvider: null } } });
@@ -15,6 +30,7 @@ export async function GET() {
     return NextResponse.json({
       totalJobs,
       completedJobs,
+      activeJobs,
       totalChapters,
       totalImages: totalImages._sum.totalImages ?? 0,
       archivedJobs,

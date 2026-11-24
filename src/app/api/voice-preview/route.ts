@@ -1,3 +1,4 @@
+import { getPrivateExt } from "@/lib/private-loader";
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -26,7 +27,7 @@ const VOICE_ID_RE = /^([a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural|[abhijpef][fm]_[a-z]
 export async function GET(req: NextRequest) {
   const voice = req.nextUrl.searchParams.get("voice");
 
-  if (!voice || !VOICE_ID_RE.test(voice)) {
+  if (!voice || (!VOICE_ID_RE.test(voice) && !getPrivateExt()?.isValidVoiceId(voice))) {
     return NextResponse.json(
       { error: "Invalid or missing 'voice' parameter. Expected format like 'en-US-AndrewNeural'." },
       { status: 400 }

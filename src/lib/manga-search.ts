@@ -1,12 +1,15 @@
+import { getPrivateExt } from "@/lib/private-loader";
 import type { MangadexManga } from "@/types/pipeline";
 import {
   searchMangaHere,
   searchFanFox,
   searchWebtoons,
   searchAsuraScans,
+  searchThunderScans,
+  searchVortexScans,
+  searchRizzFables,
   searchMangaDex,
   searchMangaPill,
-  searchToonily,
   searchComick,
   searchWeebCentral,
   searchMgeko,
@@ -302,12 +305,15 @@ export interface MangaSearchSources {
   mal: number;
   anilist: number;
   asurascans: number;
+  thunderscans: number;
+  vortexscans: number;
+  rizzfables: number;
   mangadex: number;
   mangapill: number;
-  toonily: number;
   comick: number;
   weebcentral: number;
   mgeko: number;
+  [key: string]: number;
 }
 
 export interface UnifiedSearchResult {
@@ -323,35 +329,48 @@ export interface UnifiedSearchResult {
  */
 export async function searchAllManga(
   query: string,
-  limit = 12
+  limit = 12,
+  opts?: { adult?: boolean; genre?: string }
 ): Promise<UnifiedSearchResult> {
   const safeLimit = Math.min(Math.max(limit, 1), 25);
+  const adult = Boolean(opts?.adult);
+  const genre = (opts?.genre || "").trim();
+  const qWithGenre = [query.trim(), genre].filter(Boolean).join(" ");
 
-  const [mhRes, ffRes, wtRes, asRes, mdRes, mpRes, tlRes, cmRes, wcRes, mgRes, malRes, alRes] = await Promise.allSettled([
-    searchMangaHere(query, safeLimit),
-    searchFanFox(query, safeLimit),
-    searchWebtoons(query, safeLimit),
-    searchAsuraScans(query, safeLimit),
-    searchMangaDex(query, safeLimit),
-    searchMangaPill(query, safeLimit),
-    searchToonily(query, safeLimit),
-    searchComick(query, safeLimit),
-    searchWeebCentral(query, safeLimit),
-    searchMgeko(query, safeLimit),
-    searchJikan(query, safeLimit),
-    searchAniList(query, safeLimit),
+  const ext = adult ? getPrivateExt() : null;
+  const [mhRes, ffRes, wtRes, asRes, fcRes, vsRes, rfRes, mdRes, mpRes, cmRes, wcRes, mgRes, privRes, malRes, alRes] = await Promise.allSettled([
+    qWithGenre ? searchMangaHere(qWithGenre, safeLimit) : Promise.resolve([]),
+    qWithGenre ? searchFanFox(qWithGenre, safeLimit) : Promise.resolve([]),
+    adult || !query.trim() ? Promise.resolve([]) : searchWebtoons(query, safeLimit),
+    adult || !query.trim() ? Promise.resolve([]) : searchAsuraScans(query, safeLimit),
+    adult || !query.trim() ? Promise.resolve([]) : searchThunderScans(query, safeLimit),
+    adult || !query.trim() ? Promise.resolve([]) : searchVortexScans(query, safeLimit),
+    adult || !query.trim() ? Promise.resolve([]) : searchRizzFables(query, safeLimit),
+    searchMangaDex(query, safeLimit, adult, genre),
+    qWithGenre ? searchMangaPill(qWithGenre, safeLimit) : Promise.resolve([]),
+    qWithGenre ? searchComick(qWithGenre, safeLimit) : Promise.resolve([]),
+    query.trim() ? searchWeebCentral(query, safeLimit) : Promise.resolve([]),
+    qWithGenre ? searchMgeko(qWithGenre, safeLimit) : Promise.resolve([]),
+    ext ? ext.searchPrivate({ query, genre, limit: safeLimit }) : Promise.resolve({ items: [], counts: {} }),
+    adult || !query.trim() ? Promise.resolve([]) : searchJikan(query, safeLimit),
+    adult || !query.trim() ? Promise.resolve([]) : searchAniList(query, safeLimit),
   ]);
 
   const mangahere = mhRes.status === "fulfilled" ? mhRes.value : [];
   const fanfox = ffRes.status === "fulfilled" ? ffRes.value : [];
   const webtoons = wtRes.status === "fulfilled" ? wtRes.value : [];
   const asurascans = asRes.status === "fulfilled" ? asRes.value : [];
+  const thunderscans = fcRes.status === "fulfilled" ? fcRes.value : [];
+  const vortexscans = vsRes.status === "fulfilled" ? vsRes.value : [];
+  const rizzfables = rfRes.status === "fulfilled" ? rfRes.value : [];
   const mangadex = mdRes.status === "fulfilled" ? mdRes.value : [];
   const mangapill = mpRes.status === "fulfilled" ? mpRes.value : [];
-  const toonily = tlRes.status === "fulfilled" ? tlRes.value : [];
   const comick = cmRes.status === "fulfilled" ? cmRes.value : [];
   const weebcentral = wcRes.status === "fulfilled" ? wcRes.value : [];
   const mgeko = mgRes.status === "fulfilled" ? mgRes.value : [];
+  const priv = privRes.status === "fulfilled" ? privRes.value : { items: [], counts: {} };
+  const privItems: MangadexManga[] = priv.items ?? [];
+  const privCounts: Record<string, number> = priv.counts ?? {};
   const mal = malRes.status === "fulfilled" ? malRes.value : [];
   const anilist = alRes.status === "fulfilled" ? alRes.value : [];
 
@@ -366,21 +385,24 @@ export async function searchAllManga(
   //      scrapeable card doesn't (MAL/AniList with NO scrapeable twin are
   //      kept: handleSelect re-resolves them to a scrapeable source on click)
   const scrapeableTitles = new Set<string>();
-  for (const m of [...mgeko, ...mangadex, ...webtoons, ...asurascans, ...mangapill,
-                   ...comick, ...weebcentral, ...toonily, ...mangahere, ...fanfox]) {
+  for (const m of [...asurascans, ...thunderscans, ...vortexscans, ...rizzfables, ...webtoons,
+                   ...mgeko, ...mangadex, ...mangapill, ...comick, ...weebcentral, ...privItems, ...mangahere, ...fanfox]) {
     const k = normalizeTitle(m.title);
     if (k) scrapeableTitles.add(k);
   }
   const seen = new Map<string, MangadexManga>();
   for (const m of [
+    ...asurascans,
+    ...thunderscans,
+    ...vortexscans,
+    ...rizzfables,
+    ...webtoons,
     ...mgeko,
     ...mangadex,
-    ...webtoons,
-    ...asurascans,
     ...mangapill,
     ...comick,
     ...weebcentral,
-    ...toonily,
+    ...privItems,
     ...mangahere,
     ...fanfox,
     ...mal,
@@ -407,18 +429,20 @@ export async function searchAllManga(
   // Sort: by relevance to the query first (exact title match > starts-with >
   // contains > no match), then by source priority (scrapeable first).
   const sourceOrder: Record<string, number> = {
-    mgeko: 0,
-    mangadex: 1,
-    webtoons: 2,
-    asurascans: 3,
-    mangahere: 4,
-    fanfox: 5,
-    mangapill: 6,
-    comick: 7,
-    weebcentral: 8,
-    toonily: 9,
-    mal: 10,
-    anilist: 11,
+    asurascans: 0,
+    thunderscans: 1,
+    vortexscans: 2,
+    rizzfables: 3,
+    webtoons: 4,
+    mgeko: adult ? 8 : 5,
+    mangadex: adult ? 9 : 6,
+    mangahere: 7,
+    fanfox: 8,
+    mangapill: 9,
+    comick: 10,
+    weebcentral: 11,
+    mal: 13,
+    anilist: 14,
   };
   const STOP = new Set(["and", "the", "of", "a", "an", "to", "in", "vs", "or"]);
   const qNorm = normalizeTitle(query);
@@ -449,6 +473,50 @@ export async function searchAllManga(
     const sb = sourceOrder[b.source ?? "mangahere"] ?? 99;
     return sa - sb;
   });
+  // Enrich missing or Cloudflare-blocked (cdn.asurascans.com) covers and
+  // empty metadata across sources sharing the same normalized title.
+  const isGoodCover = (u?: string | null): u is string =>
+    Boolean(u && !u.includes("cdn.asurascans.com"));
+
+  const bestByTitle = new Map<
+    string,
+    { coverUrl?: string; description?: string; year?: number; tags?: string[] }
+  >();
+  for (const m of [
+    ...thunderscans,
+    ...vortexscans,
+    ...rizzfables,
+    ...mangadex,
+    ...anilist,
+    ...mal,
+    ...comick,
+    ...mgeko,
+    ...mangapill,
+    ...weebcentral,
+    ...asurascans,
+    ...webtoons,
+    ...mangahere,
+    ...fanfox,
+  ]) {
+    const k = normalizeTitle(m.title);
+    if (!k) continue;
+    const cur = bestByTitle.get(k) ?? {};
+    if (!cur.coverUrl && isGoodCover(m.coverUrl)) cur.coverUrl = m.coverUrl;
+    if (!cur.description && m.description) cur.description = m.description;
+    if (!cur.year && m.year) cur.year = m.year;
+    if ((!cur.tags || cur.tags.length === 0) && m.tags?.length) cur.tags = m.tags;
+    bestByTitle.set(k, cur);
+  }
+
+  for (const item of deduped) {
+    const best = bestByTitle.get(normalizeTitle(item.title));
+    if (!best) continue;
+    if (!isGoodCover(item.coverUrl) && best.coverUrl) item.coverUrl = best.coverUrl;
+    if (!item.description && best.description) item.description = best.description;
+    if (!item.year && best.year) item.year = best.year;
+    if ((!item.tags || item.tags.length === 0) && best.tags?.length) item.tags = best.tags;
+  }
+
   // No hiding: every result from every source is returned. The relevance sort
   // above already floats the real matches to the top; weaker keyword hits sit
   // at the bottom where the source-filter chips and the eye can skip them.
@@ -461,12 +529,15 @@ export async function searchAllManga(
       fanfox: fanfox.length,
       webtoons: webtoons.length,
       asurascans: asurascans.length,
+      thunderscans: thunderscans.length,
+      vortexscans: vortexscans.length,
+      rizzfables: rizzfables.length,
       mangadex: mangadex.length,
       mangapill: mangapill.length,
-      toonily: toonily.length,
       comick: comick.length,
       weebcentral: weebcentral.length,
       mgeko: mgeko.length,
+      ...privCounts,
       mal: mal.length,
       anilist: anilist.length,
     },
@@ -479,7 +550,7 @@ export async function searchAllManga(
  */
 export async function searchSingleSource(
   query: string,
-  source: "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "asurascans" | "mangadex" | "mangapill" | "toonily" | "comick" | "weebcentral" | "mgeko",
+  source: "asurascans" | "thunderscans" | "vortexscans" | "rizzfables" | "mangahere" | "fanfox" | "webtoons" | "mal" | "anilist" | "mangadex" | "mangapill" | "comick" | "weebcentral" | "mgeko",
   limit = 12
 ): Promise<MangadexManga[]> {
   switch (source) {
@@ -491,12 +562,16 @@ export async function searchSingleSource(
       return searchWebtoons(query, limit);
     case "asurascans":
       return searchAsuraScans(query, limit);
+    case "thunderscans":
+      return searchThunderScans(query, limit);
+    case "vortexscans":
+      return searchVortexScans(query, limit);
+    case "rizzfables":
+      return searchRizzFables(query, limit);
     case "mangadex":
       return searchMangaDex(query, limit);
     case "mangapill":
       return searchMangaPill(query, limit);
-    case "toonily":
-      return searchToonily(query, limit);
     case "comick":
       return searchComick(query, limit);
     case "weebcentral":

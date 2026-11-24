@@ -106,6 +106,15 @@ OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 # recaps run ~10fps). 12fps roughly halves encode time vs 24 with zero quality
 # loss on still images. Override with RECAP_FPS if a motion effect is ever added.
 FPS = int(os.environ.get("RECAP_FPS", "12"))
+
+
+def _is_turbo() -> bool:
+    p = os.environ.get("RECAP_PERF_PROFILE", "auto").strip().lower()
+    if p == "turbo":
+        return True
+    if p in ("low_cpu", "low-cpu", "safe", "legacy"):
+        return False
+    return (os.cpu_count() or 2) >= 4
 # per-frame OCR of the tight raw crop (see _ocr_frames_into_narration_json /
 # _emit). On by default; the raw-crop image is only written when this is set.
 _OCR_FRAMES_ENABLED = os.environ.get("RECAP_OCR_FRAMES", "1").lower() not in ("0", "false", "no")
@@ -550,6 +559,14 @@ class FrameEntry:
     # the crop spans a page seam (cross-page stitch). Purely informational:
     # nothing in the render path reads it.
     source_box: Optional[list] = None
+    dhash: Optional[str] = None
+    layout: str = "panel"
+    angle_top: int = 0
+    angle_bot: int = 0
+    cy_top: Optional[int] = None
+    cy_bot: Optional[int] = None
+    w: Optional[int] = None
+    h: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -566,6 +583,14 @@ class FrameEntry:
             "audio_path": self.audio_path,
             "duration": self.duration,
             "source_box": self.source_box,
+            "dhash": self.dhash,
+            "layout": self.layout,
+            "angle_top": self.angle_top,
+            "angle_bot": self.angle_bot,
+            "cy_top": self.cy_top,
+            "cy_bot": self.cy_bot,
+            "w": self.w,
+            "h": self.h,
         }
 
     @classmethod
@@ -597,6 +622,14 @@ class FrameEntry:
             narration_text=str(data.get("narration_text") or ""),
             audio_path=data.get("audio_path"),
             duration=float(data["duration"]) if data.get("duration") is not None else None,
+            dhash=data.get("dhash"),
+            layout=str(data.get("layout") or "panel"),
+            angle_top=int(data.get("angle_top", 0) or 0),
+            angle_bot=int(data.get("angle_bot", 0) or 0),
+            cy_top=int(data["cy_top"]) if data.get("cy_top") is not None else None,
+            cy_bot=int(data["cy_bot"]) if data.get("cy_bot") is not None else None,
+            w=int(data["w"]) if data.get("w") is not None else None,
+            h=int(data["h"]) if data.get("h") is not None else None,
         )
 
 
@@ -1570,7 +1603,44 @@ def _looks_like_scanlator_card(arr_rgb) -> bool:
 # 512-bit combined dHash+vHash on a 16x16 grey — hashed on the TIGHT panel
 # content (the *_ocr.jpg crop), not the composed canvas: the blurred backdrop
 # on the canvas is low-entropy and makes unrelated frames look alike. Pure numpy.
-_RECAP_SEEN_HASHES: List[int] = []
+from collections import deque as _deque
+
+_RECAP_SEEN_WINDOW = max(200, int(os.environ.get("RECAP_DEDUP_WINDOW", "3000") or 3000))
+_RECAP_SEEN_HASHES = _deque(maxlen=_RECAP_SEEN_WINDOW)
+_RECAP_SEEN_SET = set()
+
+
+def _record_seen_hashes(hashes) -> None:
+    for h in hashes:
+        if h is None:
+            continue
+        if len(_RECAP_SEEN_HASHES) == _RECAP_SEEN_HASHES.maxlen:
+            oldest = _RECAP_SEEN_HASHES[0]
+            _RECAP_SEEN_HASHES.append(h)
+            if oldest not in _RECAP_SEEN_HASHES:
+                _RECAP_SEEN_SET.discard(oldest)
+        else:
+            _RECAP_SEEN_HASHES.append(h)
+        _RECAP_SEEN_SET.add(h)
+
+
+def _dhash_from_array(rgb_arr) -> Optional[str]:
+    """Compute 512-bit dHash+vHash hex directly from tight raw RGB crop before canvas padding."""
+    try:
+        from PIL import Image
+        if rgb_arr is None or getattr(rgb_arr, "size", 0) == 0:
+            return None
+        im = Image.fromarray(rgb_arr).convert("L")
+        a = np.asarray(im.resize((17, 16), Image.BILINEAR), dtype=np.int16)
+        dh = (a[:16, 1:] > a[:16, :-1]).flatten()
+        vv = np.asarray(im.resize((16, 17), Image.BILINEAR), dtype=np.int16)
+        dv = (vv[1:, :16] > vv[:-1, :16]).flatten()
+        bits = 0
+        for v in np.concatenate([dh, dv]):
+            bits = (bits << 1) | int(v)
+        return f"{bits:0128x}"
+    except Exception:
+        return None
 
 
 def _frame_dhash(path) -> Optional[int]:
@@ -1713,6 +1783,90 @@ def _is_featureless_vfx(arr_gray) -> bool:
     if text_components < 4 and edge_density < 0.02:
         return True
 
+    return False
+
+
+def _is_filler_slice_crop(crop_rgb, arr_gray, orig_w: int = 0, text_boxes=None) -> bool:
+    """Reject decorative skinny vertical slivers, divider line strips, and
+    featureless speedline/aura gradient cuts that lack dialogue bubbles.
+    Preserves any crop overlapping a detected text box and preserves full-width
+    establishing/story art panels."""
+    if os.environ.get("RECAP_DROP_FILLER_SLICES", "1").lower() in ("0", "false", "no"):
+        return False
+    if crop_rgb is None or arr_gray is None or crop_rgb.ndim < 2:
+        return True
+    if text_boxes:
+        return False
+    ch, cw = crop_rgb.shape[:2]
+    aspect = ch / max(1.0, float(cw))
+    if text_boxes is None and cw >= 80:
+        # Guard against dropping narrow vertical speech-bubble columns on light paper
+        _, _bin = cv2.threshold(arr_gray, 160, 255, cv2.THRESH_BINARY_INV)
+        _nl, _, _st, _ = cv2.connectedComponentsWithStats(_bin, connectivity=8)
+        _char_blobs = sum(
+            1 for idx_c in range(1, _nl)
+            if 10 <= int(_st[idx_c, cv2.CC_STAT_AREA]) <= 600
+            and 4 <= int(_st[idx_c, cv2.CC_STAT_WIDTH]) <= 50
+            and 4 <= int(_st[idx_c, cv2.CC_STAT_HEIGHT]) <= 50
+        )
+        if _char_blobs >= 6:
+            return False
+    # Ultra-narrow tall vertical sliver (e.g., ~15% strip width after margin trim)
+    if orig_w > 0 and cw < max(165, int(0.35 * orig_w)) and aspect >= 2.8:
+        return True
+    if cw < 120 and aspect >= 3.0:
+        return True
+    if _is_lines_only_crop(arr_gray):
+        return True
+    # Apply _is_featureless_vfx only to tall/narrow slivers or clearly sparse frames
+    # so wide colorful establishing landscapes are never touched.
+    is_wide_scene = (orig_w <= 0 or cw >= 0.55 * orig_w) and (0.35 <= aspect <= (2.2 if orig_w > 0 and cw >= 0.80 * orig_w else 1.55))
+    if not is_wide_scene and _is_featureless_vfx(arr_gray):
+        return True
+    return False
+
+
+def _is_empty_sfx_filler(fp: Path, fe: Optional["FrameEntry"], ne) -> bool:
+    """True when an empty-OCR frame (no dialogue, no visual caption) is a skinny
+    vertical/horizontal SFX strip or a sparse monochrome Korean-SFX cutout rather
+    than a full story art panel."""
+    if os.environ.get("RECAP_DROP_SFX_FILLER", "1").lower() in ("0", "false", "no"):
+        return False
+    info = parse_narration_item(ne)
+    if info["text"].strip():
+        return False
+    if isinstance(ne, dict) and (ne.get("visual") or "").strip():
+        return False
+    if fe and fe.scroll_group:
+        return False
+    if fe and fe.source_box and len(fe.source_box) == 4:
+        try:
+            bx1, by1, bx2, by2 = [int(float(v)) for v in fe.source_box]
+        except (TypeError, ValueError):
+            bx1 = by1 = bx2 = by2 = 0
+        bw = max(0, bx2 - bx1)
+        bh = max(0, by2 - by1)
+        if bw > 0 and bh > 0:
+            if bw < 270 and (bh / bw) >= 2.5:
+                return True
+            if bh < 170 and (bw / bh) >= 3.2:
+                return True
+    sfx_flagged = isinstance(ne, dict) and bool(ne.get("sfx_or_noise"))
+    if sfx_flagged:
+        try:
+            from PIL import Image as _PILImage
+            arr = np.array(_PILImage.open(fp).convert("RGB"))
+            # Composed 1920x1080 frames only mark sfx_or_noise safely when white/monochrome sparse
+            # (never drop dark/colorful sword action art panels like ch228_f00072_er.jpg)
+            g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+            sat = float(hsv[..., 1].mean())
+            if sat <= 14.0 and float((g >= 220).mean()) >= 0.65:
+                edges = cv2.Canny(g, 60, 160)
+                if float((edges > 0).mean()) <= 0.06:
+                    return True
+        except Exception:
+            pass
     return False
 
 
@@ -2991,61 +3145,71 @@ def _reading_order_boxes(boxes: "List[tuple]") -> "List[tuple]":
 def _pages_are_webtoon_chunks(page_paths: "List[Path]") -> bool:
     """True when the 'pages' are really one long vertical webtoon strip that
     the source host sliced into fixed-height chunks at ARBITRARY pixel rows
-    (not panel/scene boundaries). Signature: uniform width, and a good share
-    of page-to-page seams land in the middle of artwork (ink on both sides of
-    the seam) instead of on a white gutter. Gates the seam-stitch in
-    _frame_pages_reference_style — a properly paginated comic never needs it."""
+    (not panel/scene boundaries). Signature: uniform core width (tolerating
+    boundary credits banners or ad icons), and a good share of page-to-page
+    seams land in the middle of artwork (ink on both sides of the seam)."""
     from PIL import Image
     if len(page_paths) < 3:
         return False
-    widths, seam_hits, seams = [], 0, 0
-    prev_bottom = None
+    meta = []
     for p in page_paths:
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+        except Exception:
+            continue
+        if w >= 200 and h >= 200:
+            meta.append((p, w, h))
+    if len(meta) < 3:
+        return False
+    med_w = float(np.median([w for _, w, _ in meta]))
+    tol = max(6.0, 0.03 * med_w)
+    core = [p for p, w, _ in meta if abs(w - med_w) <= tol]
+    if len(core) < max(3, int(0.70 * len(meta))):
+        return False
+    seam_hits, seams = 0, 0
+    prev_bottom = None
+    for p in core:
         try:
             with Image.open(p) as im:
                 g = np.asarray(im.convert("L"))
         except Exception:
-            return False
-        widths.append(g.shape[1])
+            continue
         top_ink = float((g[:6] < 235).mean())
         if prev_bottom is not None:
             seams += 1
-            # both sides of the seam carry ink => the cut is mid-artwork
             if prev_bottom > 0.05 and top_ink > 0.05:
                 seam_hits += 1
         prev_bottom = float((g[-6:] < 235).mean())
-    if max(widths) - min(widths) > 3:
-        return False
     return seams > 0 and seam_hits / seams >= 0.34
 
 
 def _pages_are_webtoon_strip(page_paths: "List[Path]") -> bool:
     """True when the 'pages' are a long vertical webtoon chapter served as
     several tall, uniform-width strip images — whether the host cut them at
-    arbitrary rows (mid-art, → _pages_are_webtoon_chunks) OR politely on a
-    gutter (AsuraScans, Webtoons mirrors, …). Either way each 'page' is a
-    multi-panel column, not a single comic page, so the right move is to glue
-    them and cut the whole strip with the conservative gutter rule instead of
-    running per-page panel detection (which orphans every floating bubble).
-
-    Signature: ≥3 pages, near-uniform width, and the typical page is TALL
-    (median aspect ≥ 2.2) — a normally paginated comic page is ~1.3–1.6."""
+    arbitrary rows OR politely on a gutter. Ignores tiny ad icons and tolerates
+    front/back landscape credit banners when >=70% of core pages share the
+    strip width with tall median aspect (>= 2.2)."""
     from PIL import Image
     if len(page_paths) < 3:
         return False
-    widths, aspects = [], []
+    dims = []
     for p in page_paths:
         try:
             with Image.open(p) as im:
                 w, h = im.size
         except Exception:
-            return False
-        if w <= 0 or h <= 0:
-            return False
-        widths.append(w)
-        aspects.append(h / w)
-    if max(widths) - min(widths) > max(4, 0.02 * float(np.median(widths))):
+            continue
+        if w >= 200 and h >= 200:
+            dims.append((w, h))
+    if len(dims) < 3:
         return False
+    med_w = float(np.median([w for w, _ in dims]))
+    tol = max(6.0, 0.03 * med_w)
+    core = [(w, h) for (w, h) in dims if abs(w - med_w) <= tol]
+    if len(core) < max(3, int(0.70 * len(dims))):
+        return False
+    aspects = [h / w for w, h in core]
     return float(np.median(aspects)) >= 2.2
 
 
@@ -3272,24 +3436,41 @@ def _frame_presliced_tiles(cfg: "PipelineConfig", chapter: "Chapter",
 def _reconstruct_strip(page_paths):
     """Concatenate chunk images into one tall RGB array. Cross-correlates each
     seam to drop duplicated rows (some CDNs repeat a strip of pixels across the
-    join); a genuine gutter gap is left alone. Returns (strip_rgb, spans) where
-    spans = [(page_name, y0, y1)] for mapping a panel back to its source page."""
+    join); skips tiny ad icons and boundary landscape credit cards. Returns
+    (strip_rgb, spans) where spans = [(page_name, y0, y1)]."""
     from PIL import Image
-    imgs, names = [], []
+    raw_imgs, raw_names = [], []
     for p in page_paths:
         try:
             with Image.open(p) as im:
-                imgs.append(np.array(im.convert("RGB")))
-                names.append(p.name)
+                arr = np.array(im.convert("RGB"))
+                if arr.shape[1] < 200:
+                    log.info("reconstruct: skipped narrow non-story image %s (%dx%d)", p.name, arr.shape[1], arr.shape[0])
+                    continue
+                raw_imgs.append(arr)
+                raw_names.append(p.name)
         except Exception as exc:
             log.warning("reconstruct: unreadable %s (%s)", p.name, exc)
-    if not imgs:
+    if not raw_imgs:
         return None, []
-    W = int(np.median([a.shape[1] for a in imgs]))
+    W = int(np.median([a.shape[1] for a in raw_imgs]))
+    imgs, names = [], []
+    n_raw = len(raw_imgs)
+    for idx_r, (a, nm) in enumerate(zip(raw_imgs, raw_names)):
+        if n_raw >= 3 and (idx_r == 0 or idx_r >= n_raw - 2):
+            is_wide_banner = (a.shape[1] > 1.12 * W and 200 <= a.shape[0] < 1.05 * W)
+            if is_wide_banner or _looks_like_credits_panel(a):
+                log.info("reconstruct: skipped boundary banner/credits chunk %s (%dx%d)", nm, a.shape[1], a.shape[0])
+                continue
+        imgs.append(a)
+        names.append(nm)
+    if not imgs:
+        imgs, names = raw_imgs, raw_names
     norm = []
     for a in imgs:
-        if a.shape[1] != W:
-            a = cv2.resize(a, (W, int(a.shape[0] * W / a.shape[1])), interpolation=cv2.INTER_AREA)
+        if a.shape[1] != W and a.shape[1] > 0:
+            new_h = max(1, int(round(a.shape[0] * W / a.shape[1])))
+            a = cv2.resize(a, (max(1, W), new_h), interpolation=cv2.INTER_AREA)
         norm.append(a)
     parts, spans, y = [], [], 0
     for i, a in enumerate(norm):
@@ -3328,30 +3509,28 @@ def _cut_strip_into_panels(gray, texts, W, H, nocut=None):
     """
     MIN_GUT = int(os.environ.get("RECAP_STRIP_MIN_GUTTER", "34"))
     MIN_PANEL = int(os.environ.get("RECAP_STRIP_MIN_PANEL", "170"))
-    MAX_PANEL = int(os.environ.get("RECAP_STRIP_MAX_PANEL", "3800"))
+    MAX_PANEL = int(os.environ.get("RECAP_STRIP_MAX_PANEL", str(max(1100, int(1.65 * W)))))
     g = gray.astype(np.int16)
     std = g.std(axis=1)
     ink = (g < 205).mean(axis=1)
+    edges = (cv2.Canny(gray.astype(np.uint8), 60, 160) > 0).mean(axis=1)
 
     tboxes = [(int(ty1), int(ty2)) for (tx1, ty1, tx2, ty2, *_r) in (texts or [])
               if 0 <= ty1 < ty2 <= H]
     txt_rows = np.zeros(H, dtype=bool)
+    split_txt_rows = np.zeros(H, dtype=bool)
     for (ty1, ty2) in tboxes:
         txt_rows[max(0, ty1 - 4):min(H, ty2 + 4)] = True
+        split_txt_rows[max(0, ty1 - 6):min(H, ty2 + 6)] = True
 
-    # `nocut` is the HARD no-cut mask — faces (and bubbles when
-    # RECAP_BUBBLE_DETECT=1). A cut may never pass through it. Speech-bubble
-    # TEXT is NOT a no-cut zone: a bubble floating in a gutter has to be
-    # ASSIGNED to one of the two neighbouring panels, never used to suppress
-    # the gutter — suppressing it is exactly what merged THWT conversations
-    # into one tall strip.
     face_rows = (np.asarray(nocut, dtype=bool)[:H] if nocut is not None
                  else np.zeros(H, dtype=bool))
 
-    # clean gutter row: near-uniform full-width white OR black, not through a face
+    # clean gutter row: near-uniform full-width white, black, or flat low-edge transition band
     white = ((g >= 244).mean(axis=1) >= 0.97) & (std <= 16)
     black = ((g <= 18).mean(axis=1) >= 0.95) & (std <= 14)
-    gut = (white | black) & ~face_rows
+    flat_band = (std <= 13.5) & (edges <= 0.012) & ~txt_rows
+    gut = (white | black | flat_band) & ~face_rows
 
     # raw clean-gutter bands
     raw, i = [], 0
@@ -3405,17 +3584,29 @@ def _cut_strip_into_panels(gray, texts, W, H, nocut=None):
     if not segs:
         segs = [[0, H]]
 
-    # split an over-tall gutterless block once at its emptiest internal row
+    # Split any over-tall gutterless block along the lowest composite row cost
+    # (std + edges + ink) outside face/text guards so dark & colored backgrounds split cleanly too.
+    row_cost = (std / 60.0) + (edges * 8.0) + (ink * 0.4)
+    row_cost = np.convolve(row_cost, np.ones(15, dtype=np.float32) / 15.0, mode="same")
     out = []
     for (a, b) in segs:
-        while b - a > MAX_PANEL:
-            lo, hi = a + int(0.30 * (b - a)), b - int(0.30 * (b - a))
-            seg = ink[lo:hi]
-            k = lo + int(np.argmin(seg))
-            if seg.min() > 0.055 or face_rows[k] or txt_rows[k]:
+        cur_a = a
+        while b - cur_a > MAX_PANEL:
+            lo = cur_a + max(int(0.55 * W), int(0.22 * (b - cur_a)))
+            hi = min(cur_a + int(1.45 * W), b - max(int(0.45 * W), int(0.20 * (b - cur_a))))
+            if hi <= lo + 20:
+                lo, hi = cur_a + int(0.25 * (b - cur_a)), b - int(0.25 * (b - cur_a))
+            if hi <= lo:
                 break
-            out.append([a, k]); a = k
-        out.append([a, b])
+            cand_cost = row_cost[lo:hi].copy()
+            blocked = face_rows[lo:hi] | split_txt_rows[lo:hi]
+            if blocked.all():
+                break
+            cand_cost[blocked] = 1e9
+            k = lo + int(np.argmin(cand_cost))
+            out.append([cur_a, k])
+            cur_a = k
+        out.append([cur_a, b])
     out.sort()
 
     def _artf(a, b):
@@ -3425,41 +3616,40 @@ def _cut_strip_into_panels(gray, texts, W, H, nocut=None):
     def _nbox(a, b):
         return sum(1 for (t1, t2) in tboxes if t1 < b - 2 and t2 > a + 2)
 
-    # A segment that must NOT stand on its own as a frame: a sliver, a near-
-    # blank band, a bubble/text run over almost no drawn art, or a tall stack
-    # of ≥3 bubbles with little art (an orphan speech ribbon). A segment that
-    # carries real art of its own — e.g. a face close-up under one bubble —
-    # is NOT needy and is never folded away, even when it's tall.
     def _needy(a, b):
         if b - a < MIN_PANEL:
             return True
         af = _artf(a, b)
-        if af < 0.10:
+        if af < 0.08:
             return True
-        if af < 0.24 and _nbox(a, b) >= 1:          # bubbles/caption over sparse art
+        if (b - a) >= int(0.55 * W) and af >= 0.08:
+            return False
+        if af < 0.24 and _nbox(a, b) >= 1:
             return True
         if (b - a) > int(1.8 * W) and _nbox(a, b) >= 3 and af < 0.28:
             return True
         return False
 
-    # Fold each needy segment into the neighbour with the most drawn art —
-    # i.e. toward the speaker. A speech bubble in this genre sits just below
-    # (or beside) whoever said it far more often than above the next shot, so
-    # "always fold down" kept handing a bubble to the beat AFTER the one it
-    # belongs to ("ghalat panel ko ghalat bubble"). One left-to-right pass;
-    # each merged block is locked (index skips past it) so a big orphan ribbon
-    # can't chain-eat a whole column of panels.
     i = 0
     while i < len(out) and len(out) > 1:
         if not _needy(*out[i]):
             i += 1
             continue
-        if i == 0:
-            j = 1
-        elif i == len(out) - 1:
-            j = i - 1
-        else:
-            j = i - 1 if _artf(*out[i - 1]) >= _artf(*out[i + 1]) else i + 1
+        cands = []
+        if i > 0:
+            cands.append((i - 1, _artf(*out[i - 1])))
+        if i + 1 < len(out):
+            cands.append((i + 1, _artf(*out[i + 1])))
+        cands.sort(key=lambda t: t[1], reverse=True)
+        j = None
+        for cand_idx, _ in cands:
+            comb_h = max(out[i][1], out[cand_idx][1]) - min(out[i][0], out[cand_idx][0])
+            if comb_h <= MAX_PANEL or (out[i][1] - out[i][0] < MIN_PANEL) or (_artf(*out[i]) < 0.05):
+                j = cand_idx
+                break
+        if j is None:
+            i += 1
+            continue
         lo, hi = min(i, j), max(i, j)
         out[lo] = [min(out[lo][0], out[hi][0]), max(out[lo][1], out[hi][1])]
         del out[hi]
@@ -3655,7 +3845,7 @@ def _tall_display_window(rgb, max_aspect=2.5, target_aspect=1.85):
 
     Returns (y0, y1). Falls back to the whole crop when the panel isn't tall,
     or has no clear art concentration (a genuine tall scroll shot)."""
-    if os.environ.get("RECAP_STRIP_TALL_WINDOW", "1").lower() in ("0", "false", "no"):
+    if os.environ.get("RECAP_STRIP_TALL_WINDOW", "0").lower() in ("0", "false", "no"):
         return 0, rgb.shape[0]
     H, W = rgb.shape[:2]
     if rgb.ndim != 3 or H <= int(max_aspect * W):
@@ -3696,8 +3886,99 @@ def _tall_display_window(rgb, max_aspect=2.5, target_aspect=1.85):
 
 
 def _frame_reconstructed_strip(cfg, chapter, out_dir):
-    """Reconstruct the chapter strip, cut it whole, emit one frame per panel."""
+    """Reconstruct the chapter strip, cut it whole, emit one frame per panel.
+    Controlled by RECAP_SLICER_ENGINE (default 'v3' -> Slicer_C YOLO11n-seg ONNX in pipeline/slicer_c_module.py;
+    set RECAP_SLICER_ENGINE=v2 for Slicer_B or v1 for instant rollback to the unmodified baseline path).
+    """
     from PIL import Image
+    _slicer_engine = os.environ.get("RECAP_SLICER_ENGINE", "v3").strip().lower()
+    if _slicer_engine != "v1":
+        if _slicer_engine == "v3":
+            try:
+                import pipeline.slicer_c_module as _sc
+            except Exception:
+                import importlib.util as _ilu
+                _spec_c = _ilu.spec_from_file_location("slicer_c_module", str(Path(__file__).parent / "slicer_c_module.py"))
+                _sc = _ilu.module_from_spec(_spec_c)
+                _spec_c.loader.exec_module(_sc)
+            _frames_b, _strip_b, _spans_b, _dt_b = _sc.run_slicer_c_on_chapter(
+                chapter.panel_paths, chapter_tag=chapter.tag, return_crops=True
+            )
+        else:
+            try:
+                import pipeline.slicer_b_module as _sb
+            except Exception:
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location("slicer_b_module", str(Path(__file__).parent / "slicer_b_module.py"))
+                _sb = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_sb)
+            _frames_b, _strip_b, _spans_b, _dt_b = _sb.run_slicer_b_on_chapter(
+                chapter.panel_paths, chapter_tag=chapter.tag, return_crops=True
+            )
+        if _frames_b:
+            out_dir = Path(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _save_raw_crop = os.environ.get("RECAP_V2_SAVE_RAW_CROP", "0").strip().lower() in ("1", "true", "yes")
+
+            def _emit_v2(item_pair):
+                _idx, _f = item_pair
+                _crop_rgb = _f["crop_rgb"]
+                _fp = out_dir / f"frame_{_idx:05d}.jpg"
+                # Save crop_rgb DIRECTLY (preserving slanted corner masks & whitespace squeeze; never re-slice strip!)
+                if _save_raw_crop:
+                    Image.fromarray(_crop_rgb).save(_fp, quality=92)
+                else:
+                    _compose_canvas(Image.fromarray(_crop_rgb)).save(_fp, quality=92)
+                _ocr_path = ""
+                if _OCR_FRAMES_ENABLED:
+                    _ocr_fp = out_dir / f"frame_{_idx:05d}_ocr.jpg"
+                    try:
+                        _oc = _crop_rgb
+                        _tgt = int(os.environ.get("RECAP_OCR_MAX_SIDE", "1100"))
+                        _hh, _ww = _oc.shape[:2]
+                        _s = _tgt / max(1, _ww)
+                        if _hh * _s > _tgt * 6:
+                            _s = (_tgt * 6) / max(1, _hh)
+                        if abs(_s - 1.0) > 0.05:
+                            _oc = cv2.resize(_oc, (max(1, int(_ww * _s)), max(1, int(_hh * _s))),
+                                             interpolation=cv2.INTER_AREA if _s < 1 else cv2.INTER_CUBIC)
+                        Image.fromarray(_oc).save(_ocr_fp, quality=94)
+                        _ocr_path = str(_ocr_fp.resolve())
+                    except Exception:
+                        _ocr_path = ""
+                return FrameEntry(
+                    frame_id=f"{chapter.tag}_frame_{_idx:05d}",
+                    filename=_fp.name,
+                    path=str(_fp.resolve()),
+                    ocr_path=_ocr_path,
+                    source_page=str(_f.get("source_page") or ""),
+                    source_index=int(_f.get("source_index", 0)),
+                    frame_kind="scroll_frame",
+                    source_box=_f.get("source_box"),
+                    dhash=_dhash_from_array(_crop_rgb),
+                    layout=str(_f.get("layout") or "panel"),
+                    angle_top=int(_f.get("angle_top", 0)),
+                    angle_bot=int(_f.get("angle_bot", 0)),
+                    cy_top=int(_f["cy_top"]) if _f.get("cy_top") is not None else None,
+                    cy_bot=int(_f["cy_bot"]) if _f.get("cy_bot") is not None else None,
+                    w=int(_crop_rgb.shape[1]),
+                    h=int(_crop_rgb.shape[0]),
+                )
+
+            _sw = int(os.environ.get("RECAP_SLICE_WORKERS", "4" if _is_turbo() else "1"))
+            _indexed = list(enumerate(_frames_b))
+            if _sw > 1 and len(_indexed) > 2:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(_sw, len(_indexed))) as _ex:
+                    _entries = list(_ex.map(_emit_v2, _indexed))
+            else:
+                _entries = [_emit_v2(it) for it in _indexed]
+            log.info("[%s] Slicer_B (v2): %d chunks -> %d panel frames in %.2fs (pans=%d)",
+                     chapter.tag, len(chapter.panel_paths), len(_entries), _dt_b,
+                     sum(1 for e in _entries if e.layout == "vertical_pan"))
+            _slice_qa_check(chapter.tag, _entries, [])
+            return _entries
+        log.warning("[%s] Slicer_B (v2) returned 0 frames — falling back to v1 baseline", chapter.tag)
     strip, spans = _reconstruct_strip(chapter.panel_paths)
     if strip is None:
         return []
@@ -3725,30 +4006,33 @@ def _frame_reconstructed_strip(cfg, chapter, out_dir):
                 return nm, y0
         return (spans[-1][0], spans[-1][1]) if spans else ("001.jpg", 0)
 
-    entries, counter = [], 0
+    work_items = []
+    counter = 0
     for (x1, y1, x2, y2) in boxes:
         crop = strip[max(0, y1):min(H, y2), max(0, x1):min(W, x2)]
         t, b, l, r = _border_trim_amounts(crop)
-        if (t or b or l or r) and crop.shape[0] - t - b >= 24:
+        if (t or b or l or r) and crop.shape[0] - t - b >= 24 and crop.shape[1] - l - r >= 24:
             crop = crop[t:crop.shape[0] - b, l:crop.shape[1] - r]
             y1 += t
+            x1 += l
+            x2 = x1 + crop.shape[1]
+            y2 = y1 + crop.shape[0]
         crop, _ct = _trim_edge_whitespace(crop)
         y1 += _ct
         crop = _squeeze_internal_whitespace(crop)
         gc = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         if _is_blank_crop(gc) or crop.shape[0] < 24 or crop.shape[1] < 24:
             continue
+        _raw_tboxes = [t for t in texts if t[1] < y2 and t[3] > y1 and t[0] < x2 and t[2] > x1]
+        if _is_filler_slice_crop(crop, gc, orig_w=W, text_boxes=_raw_tboxes):
+            log.info("[%s] strip: skipped skinny/VFX filler slice (%dx%d)", chapter.tag, crop.shape[1], crop.shape[0])
+            continue
         pi = int(spans and next((k for k, (_n, a, bb) in enumerate(spans) if a <= y1 < bb), 0))
         if (pi <= 1 or pi >= len(chapter.panel_paths) - 2) and _looks_like_credits_panel(crop):
             log.info("[%s] strip: skipped credits panel near chunk %d", chapter.tag, pi + 1)
             continue
-        # the displayed frame focuses on the art of a very tall grouped panel;
-        # OCR still sees the whole crop so every bubble is transcribed
         dw0, dw1 = _tall_display_window(crop)
         disp = crop[dw0:dw1] if (dw0, dw1) != (0, crop.shape[0]) else crop
-        # trim a burned-on aggregator watermark stack from the displayed frame
-        # only (the OCR crop `oc` below keeps it, so narration is unaffected)
-        _ch0 = disp.shape[0]
         _cy = y1 + dw0
         _tl = [(int(t[0]) - x1, int(t[1]) - _cy, int(t[2]) - x1, int(t[3]) - _cy) for t in texts]
         _tl = [(max(0, a), max(0, b), min(disp.shape[1], c), min(disp.shape[0], d))
@@ -3758,16 +4042,18 @@ def _frame_reconstructed_strip(cfg, chapter, out_dir):
             log.info("[%s] frame %d: trimmed watermark (top %d, bot %d)", chapter.tag, counter, _wt, _wb)
         elif disp.shape[0] < 24:
             disp = crop[dw0:dw1] if (dw0, dw1) != (0, crop.shape[0]) else crop
-        fp = out_dir / f"frame_{counter:05d}.jpg"
+        nm, y0 = _page_for(y1)
+        work_items.append((counter, disp, crop, nm, y0, pi, x1, y1, x1 + disp.shape[1], y1 + disp.shape[0]))
+        counter += 1
+
+    def _emit_one(item):
+        idx, disp, crop, nm, y0, pi, x1, y1, x2, y2 = item
+        fp = out_dir / f"frame_{idx:05d}.jpg"
         _compose_canvas(Image.fromarray(disp)).save(fp, quality=92)
         ocr_path = ""
         if _OCR_FRAMES_ENABLED:
-            ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
+            ocr_fp = out_dir / f"frame_{idx:05d}_ocr.jpg"
             try:
-                # OCR crop: aim the WIDTH at the target (text legibility scales
-                # with column width, not the long side) and only clamp height
-                # for a genuinely giant panel — scaling a tall grouped panel by
-                # its long side crushed the text to an unreadable sliver.
                 oc = crop
                 tgt = int(os.environ.get("RECAP_OCR_MAX_SIDE", "1100"))
                 hh, ww = oc.shape[:2]
@@ -3781,14 +4067,21 @@ def _frame_reconstructed_strip(cfg, chapter, out_dir):
                 ocr_path = str(ocr_fp.resolve())
             except Exception:
                 ocr_path = ""
-        nm, y0 = _page_for(y1)
-        entries.append(FrameEntry(
-            frame_id=f"{chapter.tag}_frame_{counter:05d}",
+        return FrameEntry(
+            frame_id=f"{chapter.tag}_frame_{idx:05d}",
             filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
             source_page=nm, source_index=pi, frame_kind="scroll_frame",
             source_box=[int(x1), int(max(0, y1 - y0)), int(x2), int(y2 - y0)],
-        ))
-        counter += 1
+            dhash=_dhash_from_array(crop),
+        )
+
+    _sw = int(os.environ.get("RECAP_SLICE_WORKERS", "4" if _is_turbo() else "1"))
+    if _sw > 1 and len(work_items) > 2:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_sw, len(work_items))) as _ex:
+            entries = list(_ex.map(_emit_one, work_items))
+    else:
+        entries = [_emit_one(it) for it in work_items]
     log.info("[%s] strip reconstruction: %d chunks -> %d panel frames", chapter.tag,
              len(chapter.panel_paths), len(entries))
     _slice_qa_check(chapter.tag, entries, [])
@@ -3893,6 +4186,11 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
         arr_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
         if _is_blank_crop(arr_gray) or crop_rgb.shape[0] < 24 or crop_rgb.shape[1] < 24:
             return
+        _page_w = pages[page_idx][2].shape[1] if (0 <= page_idx < len(pages) and pages[page_idx][2] is not None) else crop_rgb.shape[1]
+        if _is_filler_slice_crop(crop_rgb, arr_gray, orig_w=_page_w):
+            log.info("[%s] skipped skinny/VFX filler slice (%dx%d) on page %d",
+                     chapter.tag, crop_rgb.shape[1], crop_rgb.shape[0], page_idx + 1)
+            return
         if (page_idx <= 1 or page_idx >= total - 2) and _looks_like_credits_panel(crop_rgb):
             log.info("[%s] skipped credits / notes panel on page %d", chapter.tag, page_idx + 1)
             return
@@ -3932,6 +4230,7 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
             source_page=page_name, source_index=page_idx, frame_kind="panel",
             source_box=list(src_box) if src_box is not None else None,
+            dhash=_dhash_from_array(crop_rgb),
         ))
         counter += 1
 
@@ -4000,6 +4299,38 @@ def _frame_pages_reference_style(cfg: "PipelineConfig", chapter: "Chapter",
             if cx2 - cx1 < w * 0.12 or cy2 - cy1 < h * 0.02:
                 continue
             _emit(rgb[cy1:cy2, cx1:cx2], page_idx, name, src_box=(cx1, cy1, cx2, cy2))
+
+    if not entries and pages:
+        for pi in range(len(pages)):
+            page_idx, name, rgb, gray, dets = pages[pi]
+            if float((gray >= 245).mean()) >= 0.99:
+                continue
+            h, w = gray.shape
+            boxes = [b for (b, _ct, _cb) in dets] or [(0, 0, w, h)]
+            for (x1, y1, x2, y2) in boxes:
+                cx1, cy1 = max(0, int(x1)), max(0, int(y1))
+                cx2, cy2 = min(w, int(x2)), min(h, int(y2))
+                if cx2 - cx1 < 24 or cy2 - cy1 < 24:
+                    continue
+                crop_rgb = rgb[cy1:cy2, cx1:cx2]
+                fp = out_dir / f"frame_{counter:05d}.jpg"
+                _compose_canvas(Image.fromarray(crop_rgb)).save(fp, quality=92)
+                ocr_path = ""
+                if _OCR_FRAMES_ENABLED:
+                    ocr_fp = out_dir / f"frame_{counter:05d}_ocr.jpg"
+                    try:
+                        Image.fromarray(crop_rgb).save(ocr_fp, quality=94)
+                        ocr_path = str(ocr_fp.resolve())
+                    except Exception:
+                        ocr_path = ""
+                entries.append(FrameEntry(
+                    frame_id=f"{chapter.tag}_frame_{counter:05d}",
+                    filename=fp.name, path=str(fp.resolve()), ocr_path=ocr_path,
+                    source_page=name, source_index=page_idx, frame_kind="panel",
+                    source_box=[cx1, cy1, cx2, cy2],
+                    dhash=_dhash_from_array(crop_rgb),
+                ))
+                counter += 1
 
     log.info("[%s] reference-style framing: %d pages -> %d panel frames",
              chapter.tag, total, len(entries))
@@ -4397,11 +4728,24 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
 
     by_index = {int(x.get("index", i)): x for i, x in enumerate(results)}
     texts = []
+    credits_filtered_flags = []
+    sfx_noise_flags = []
     for i, e in enumerate(frame_entries):
         item = by_index.get(i, {})
         text = (item.get("text") or "").strip()
         status = item.get("status") or ("SUCCESS" if text else "NO_TEXT")
+        sel_reason = (item.get("selection_reason") or "").strip()
+        is_cf = bool(
+            "credits_filtered" in sel_reason
+            or (text and (_PROMO_CARD_RE.search(text) or (_is_credits_blob(text) and not _clean_source_text(text).strip())))
+        )
+        if is_cf:
+            text = ""
+            status = "NO_TEXT"
+        is_sfx = bool((not text) and ("noise_or_sfx_only" in sel_reason))
         texts.append([text, status])
+        credits_filtered_flags.append(is_cf)
+        sfx_noise_flags.append(is_sfx)
 
     # A cut that ran through a speech bubble makes the SAME words tail frame N
     # and head frame N+1 ("…IS THAT GUY A" / "IS THAT GUY A STRONG HUNTER") —
@@ -4443,9 +4787,10 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
     narration = []
     for i, e in enumerate(frame_entries):
         text, status = texts[i]
+        is_cf = credits_filtered_flags[i] if i < len(credits_filtered_flags) else False
         if not text and status == "SUCCESS":
             status = "NO_TEXT"
-        visual = (captions[i] if captions else "") or ""
+        visual = "" if is_cf else ((captions[i] if captions else "") or "")
         if visual:
             cap = visual.rstrip(" .") + "."
             dlg = text.strip()
@@ -4458,6 +4803,10 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
                 status = "SUCCESS"
         e.ocr_text, e.ocr_status = text, status
         entry = {"image": e.filename, "text": text, "status": status}
+        if is_cf:
+            entry["credits_filtered"] = True
+        if (i < len(sfx_noise_flags) and sfx_noise_flags[i]) and not text and not visual:
+            entry["sfx_or_noise"] = True
         if visual:
             entry["visual"] = visual
         narration.append(entry)
@@ -4478,6 +4827,130 @@ def _ocr_frames_into_narration_json(cfg: "PipelineConfig", chapter: "Chapter",
                 pass
             e.ocr_path = ""
     return True
+
+
+_BOUNDARY_HEADER_ONLY_RE = re.compile(
+    r"^\W*(?:important|notice|credits?|note|links?|join\s+us|"
+    r"(?:reaper|asura|flame|lumi|sura)\s*scans?|(?:chapter|episode)\s*\d*)\W*$",
+    re.IGNORECASE,
+)
+
+
+def _filter_sliced_credits_frames(cfg: PipelineConfig, chapter: Chapter,
+                                  frame_entries: List["FrameEntry"],
+                                  out_dir: Path) -> List["FrameEntry"]:
+    """Drop scanlation credits, recruitment, Discord/Patreon, and empty header
+    sibling panels immediately after slicing + OCR so leaked credits never enter
+    manifest.json, narration.json, panel review, or chapter rendering."""
+    if os.environ.get("RECAP_DROP_BOUNDARY_CREDITS", "1").lower() in ("0", "false", "no"):
+        return frame_entries
+    if len(frame_entries) <= 1:
+        return frame_entries
+
+    import json as _json
+    narr_path = chapter.folder / "narration.json"
+    narration_list = []
+    if narr_path.exists():
+        try:
+            loaded = _json.loads(narr_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                narration_list = loaded
+        except Exception:
+            narration_list = []
+    if not narration_list and not chapter.image_narrations:
+        return frame_entries
+
+    by_img = {n.get("image"): n for n in narration_list if isinstance(n, dict) and n.get("image")}
+    max_src_idx = max((fe.source_index for fe in frame_entries), default=0)
+
+    def _entry_ne(fe):
+        return by_img.get(fe.filename) or chapter.image_narrations.get(fe.filename) or {}
+
+    drop_idxs = set()
+    credit_pages = set()
+    for i, fe in enumerate(frame_entries):
+        ne = _entry_ne(fe)
+        raw = str(ne.get("text") or "").strip()
+        # NEVER flag short dialogue ("OH?", "HA...", "A") just because _clean_source_text < 3 letters;
+        # require an actual promo/credit pattern or credits_blob when raw text is present.
+        is_cf = bool(
+            ne.get("credits_filtered")
+            or (raw and (_PROMO_CARD_RE.search(raw) or _is_credits_blob(raw)))
+        )
+        if is_cf:
+            drop_idxs.add(i)
+            if fe.source_page:
+                credit_pages.add(fe.source_page)
+
+    # Group frame indices by source_page to know if a page is primarily a credits page
+    # (e.g. standalone end card split into "IMPORTANT" + recruitment body) vs a tall story strip.
+    from collections import defaultdict
+    page_indices = defaultdict(list)
+    for i, fe in enumerate(frame_entries):
+        if fe.source_page:
+            page_indices[fe.source_page].append(i)
+
+    for i, fe in enumerate(frame_entries):
+        if i in drop_idxs:
+            continue
+        ne = _entry_ne(fe)
+        raw = str(ne.get("text") or "").strip()
+        visual = str(ne.get("visual") or "").strip()
+        if visual:
+            continue
+        at_edge_frame = (i <= 1) or (i >= len(frame_entries) - 3) or (fe.source_index == 0) or (fe.source_index >= max_src_idx)
+        # Adjacent sibling on a flagged credits page whose other frames are all credits/headers
+        if fe.source_page and fe.source_page in credit_pages:
+            sibs = page_indices[fe.source_page]
+            non_dropped_sibs = [k for k in sibs if k not in drop_idxs]
+            if at_edge_frame or len(non_dropped_sibs) <= 2:
+                if not raw or _BOUNDARY_HEADER_ONLY_RE.match(raw) or (i + 1 in drop_idxs or i - 1 in drop_idxs):
+                    cleaned_words = _clean_source_text(raw).split()
+                    if not raw or _BOUNDARY_HEADER_ONLY_RE.match(raw) or len(cleaned_words) <= 6:
+                        drop_idxs.add(i)
+                        continue
+        if at_edge_frame and _BOUNDARY_HEADER_ONLY_RE.match(raw):
+            drop_idxs.add(i)
+            continue
+        if at_edge_frame and not raw:
+            try:
+                from PIL import Image as _PILImage
+                arr = np.array(_PILImage.open(fe.path).convert("RGB"))
+                if _looks_like_credits_panel(arr):
+                    drop_idxs.add(i)
+            except Exception:
+                pass
+
+    if not drop_idxs or len(drop_idxs) >= len(frame_entries):
+        return frame_entries
+
+    kept_entries = []
+    dropped_names = set()
+    for i, fe in enumerate(frame_entries):
+        if i in drop_idxs:
+            dropped_names.add(fe.filename)
+            try:
+                fp = Path(fe.path)
+                if fp.exists() and fp.parent.resolve() == out_dir.resolve():
+                    fp.unlink()
+            except OSError:
+                pass
+        else:
+            kept_entries.append(fe)
+
+    if narration_list:
+        filtered_narration = [n for n in narration_list if isinstance(n, dict) and n.get("image") not in dropped_names]
+        try:
+            narr_path.write_text(_json.dumps(filtered_narration, indent=2), encoding="utf-8")
+            chapter.image_narrations = {n["image"]: n for n in filtered_narration if n.get("image")}
+        except Exception:
+            pass
+    elif chapter.image_narrations:
+        for dn in dropped_names:
+            chapter.image_narrations.pop(dn, None)
+
+    log.info("[%s] post-slice credits filter dropped %d frame(s)", chapter.tag, len(dropped_names))
+    return kept_entries
 
 
 def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter, phase_cb=None) -> List[tuple]:
@@ -4525,6 +4998,7 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter, phase_cb=None) -
         frame_entries = _frame_pages_reference_style(cfg, chapter, out_dir)
         _ph("ocr", 0.40)
         _ocr_frames_into_narration_json(cfg, chapter, frame_entries, phase_cb=phase_cb)
+        frame_entries = _filter_sliced_credits_frames(cfg, chapter, frame_entries, out_dir)
         manifest = CanonicalManifest(
             manifest_version=MANIFEST_VERSION,
             job_id=cfg.job_id,
@@ -4987,6 +5461,8 @@ def _compose_canvas(crop):
     # "correct" (nothing cut) but useless result mixing both together. That
     # is a scope contract of the caller, not something this function can
     # detect on its own.
+    if crop.mode != "RGB":
+        crop = crop.convert("RGB")
     cw0, ch0 = crop.size
     if cw0 > 0 and ch0 > 0:
         import cv2
@@ -5002,26 +5478,64 @@ def _compose_canvas(crop):
     # covers the canvas (cropping the overflow, never the foreground), then
     # blurs + darkens it. Fills the whole frame — no black bars — while the
     # sharp foreground panel below still shows every pixel of the source.
-    bg_scale = max(CANVAS_W / cw, CANVAS_H / ch)
-    bw, bh = max(1, int(cw * bg_scale)), max(1, int(ch * bg_scale))
-    bg = crop.resize((bw, bh), Image.LANCZOS)
-    bx = (bw - CANVAS_W) // 2
-    by = (bh - CANVAS_H) // 2
-    bg = bg.crop((bx, by, bx + CANVAS_W, by + CANVAS_H))
-    bg = bg.filter(ImageFilter.GaussianBlur(40))
-    # Adaptive tone: a flat p*0.66 turns an already-dark panel's backdrop into
-    # a pure-black void (a very common look in the old output). Instead pull
-    # the blurred backdrop's mean toward a fixed dark tone (~46) — bright
-    # backdrops get darkened, near-black ones get lifted off zero — then a
-    # gentle radial vignette so the sharp panel still reads as the subject.
-    _b = np.asarray(bg).astype(np.float32)
-    _m = float(_b.mean())
-    _b *= float(np.clip(48.0 / max(_m, 1.0), 0.40, 4.5))
-    _b = _b * 0.9 + 16.0
-    yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W].astype(np.float32)
-    _r = (((xx - CANVAS_W / 2) / (CANVAS_W / 2)) ** 2 + ((yy - CANVAS_H / 2) / (CANVAS_H / 2)) ** 2)
-    _b *= (1.0 - 0.22 * np.clip(_r, 0, 1))[..., None]
-    canvas = Image.fromarray(np.clip(_b, 0, 255).astype(np.uint8)).convert("RGB")
+    global _VIG_FULL_CACHE, _VIG_SMALL_CACHE
+    _frame_style = os.environ.get("RECAP_FRAME_STYLE", "blur").strip().lower()
+    if _frame_style == "dark":
+        try:
+            _vig_f = _VIG_FULL_CACHE
+        except NameError:
+            yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W].astype(np.float32)
+            _r = (((xx - CANVAS_W / 2) / (CANVAS_W / 2)) ** 2 + ((yy - CANVAS_H / 2) / (CANVAS_H / 2)) ** 2)
+            _VIG_FULL_CACHE = (1.0 - 0.22 * np.clip(_r, 0, 1))[..., None].astype(np.float32)
+            _vig_f = _VIG_FULL_CACHE
+        _dark = np.empty((CANVAS_H, CANVAS_W, 3), dtype=np.float32)
+        _dark[:, :, 0] = 16.0
+        _dark[:, :, 1] = 18.0
+        _dark[:, :, 2] = 24.0
+        _dark *= _vig_f
+        canvas = Image.fromarray(np.clip(_dark, 0, 255).astype(np.uint8)).convert("RGB")
+    elif _is_turbo():
+        bg_scale = max(CANVAS_W / cw, CANVAS_H / ch)
+        sw = max(1, min(cw, int(round(CANVAS_W / bg_scale))))
+        sh = max(1, min(ch, int(round(CANVAS_H / bg_scale))))
+        sx = (cw - sw) // 2
+        sy = (ch - sh) // 2
+        bg = crop.crop((sx, sy, sx + sw, sy + sh)).resize((240, 135), Image.BILINEAR)
+        bg = bg.filter(ImageFilter.GaussianBlur(5))
+        _b = np.asarray(bg).astype(np.float32)
+        _m = float(_b.mean())
+        _b *= float(np.clip(48.0 / max(_m, 1.0), 0.40, 4.5))
+        _b = _b * 0.9 + 16.0
+        try:
+            _vig_s = _VIG_SMALL_CACHE
+        except NameError:
+            _yy, _xx = np.mgrid[0:135, 0:240].astype(np.float32)
+            _rr = (((_xx - 120.0) / 120.0) ** 2 + ((_yy - 67.5) / 67.5) ** 2)
+            _VIG_SMALL_CACHE = (1.0 - 0.22 * np.clip(_rr, 0, 1))[..., None].astype(np.float32)
+            _vig_s = _VIG_SMALL_CACHE
+        _b *= _vig_s
+        canvas = Image.fromarray(np.clip(_b, 0, 255).astype(np.uint8)).convert("RGB").resize((CANVAS_W, CANVAS_H), Image.BILINEAR)
+    else:
+        bg_scale = max(CANVAS_W / cw, CANVAS_H / ch)
+        bw, bh = max(1, int(cw * bg_scale)), max(1, int(ch * bg_scale))
+        bg = crop.resize((bw, bh), Image.LANCZOS)
+        bx = (bw - CANVAS_W) // 2
+        by = (bh - CANVAS_H) // 2
+        bg = bg.crop((bx, by, bx + CANVAS_W, by + CANVAS_H))
+        bg = bg.filter(ImageFilter.GaussianBlur(40))
+        _b = np.asarray(bg).astype(np.float32)
+        _m = float(_b.mean())
+        _b *= float(np.clip(48.0 / max(_m, 1.0), 0.40, 4.5))
+        _b = _b * 0.9 + 16.0
+        try:
+            _vig_f = _VIG_FULL_CACHE
+        except NameError:
+            yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W].astype(np.float32)
+            _r = (((xx - CANVAS_W / 2) / (CANVAS_W / 2)) ** 2 + ((yy - CANVAS_H / 2) / (CANVAS_H / 2)) ** 2)
+            _VIG_FULL_CACHE = (1.0 - 0.22 * np.clip(_r, 0, 1))[..., None].astype(np.float32)
+            _vig_f = _VIG_FULL_CACHE
+        _b *= _vig_f
+        canvas = Image.fromarray(np.clip(_b, 0, 255).astype(np.uint8)).convert("RGB")
 
     # Contain-fit by default (whole panel visible over its blurred backdrop).
     # But a MODERATELY tall panel (aspect ~1.5–2.9) contain-fits to a thin
@@ -5038,8 +5552,12 @@ def _compose_canvas(crop):
     # contain and keep the whole panel. Taller than ~1.9 is genuine scroll
     # art: contain, lose nothing. RECAP_TALL_COVER=0 disables cover entirely.
     aspect = ch / max(1, cw)
-    want_cover = (os.environ.get("RECAP_TALL_COVER", "1").lower() not in ("0", "false", "no")
-                  and 1.45 <= aspect <= 1.95)
+    if _frame_style == "cover":
+        want_cover = (os.environ.get("RECAP_TALL_COVER", "1").lower() not in ("0", "false", "no")
+                      and 1.15 <= aspect <= 2.40)
+    else:
+        want_cover = (os.environ.get("RECAP_TALL_COVER", "1").lower() not in ("0", "false", "no")
+                      and 1.45 <= aspect <= 1.95)
     fg_contain = min(CANVAS_W / cw, CANVAS_H / ch) * PANEL_FIT_MARGIN
     fg_scale = fg_contain
     crop_top = crop_bot = 0
@@ -5222,54 +5740,86 @@ _CJK_RE = re.compile(
 
 _CREDIT_PATTERNS = [
     r"\b(?:translator|translation|translated by|editor|edited by|proofreader|proof[- ]?read(?:er|ing)?|"
-    r"redraw(?:er)?|redrawer|typeset(?:ter|ting)?|cleaner|cleaning|quality check|qa\s*/?\s*qc|q\.?c\.?|"
+    r"re\s*drawer|redraw(?:er)?|typeset(?:ter|ting)?|cleaner|cleaning|quality(?:\s+check)?|qa\s*/?\s*qc|q\.?c\.?|"
     r"raw provider|scanlat(?:or|ion)|uploader|credits?)\s*[:\-—].*",
-    r"\b(?:redice studio|d\s*&\s*c\s*webtoon|d\s*&\s*c\s*media|webtoon\s+translator|original (?:novel|work|story)|"
+    r"\b(?:re\s*d\s*ice\s*studi\w*|d\s*&\s*c\s*webtoon|d\s*&\s*c\s*media|webtoon\s+translator|original (?:novel|work|story)|"
     r"art(?:ist|work)?\s*[:\-—]|story\s*[:\-—]|adapted by).*",
+    r"\b(?:asura|reap(?:er)?|flame|lumi|sura|void|realm|leva|astr[ao]|drake|reset|night|manhwa\s*freak)\s*scans?\b.*",
+    r"\b(?:patr[e]?on\s*\.\s*com|paypal\s*\.\s*me|ko-?fi\s*\.\s*com)(?:/|\b).*",
+    r"[a-z0-9._%+-]+\s*@\s*gmail\s*\.\s*com.*",
+    r"\bsupport\s+the\s+mangaka\s+by\s+buying\b.*",
+    r"\b(?:hello|dear)[,\s]+readers\b|we\s+are\s+currently\s+(?:looking\s+)?for\b.*",
+    r"\bwish\s+to\s+help\s+us\s+out\s+and\s+join\s+the\s+team\b.*",
+    r"\bjoin\s+our\s+discord\b.*",
+    r"\btra\s+pro\s+cle\s+red\s+typ\s+qua\b.*",
+    r"\bthis\s+manhwa\s+chapter\s+ends\s+on\s+novel\s+chapter\b.*",
+    r"\bcontinue\s+reading\s+(?:the\s+)?novel\s+at\b.*",
+    r"\bfor\s+the\s+fastest\s+releases?\b.*",
+    r"\bupdates\s+new\s+comics(?:\s+active\s+community)?\b.*",
+    r"\bactive\s+community\b.*",
+    r"\bmgeko(?:\.cc)?\b.*",
+    r"^\W*(?:(?:[a-z]{1,3}|d\s*&\s*c)\W+){0,2}webtoon(?:\W+.*redice.*|\W*$)",
     r"\bto be continued\b\.*",
     r"\bnext (?:chapter|episode)\b.*",
     r"\bthanks for reading\b.*",
     r"\bplease (?:support|rate|comment|subscribe)\b.*",
-    # chapter / episode title cards — "CHAPTER 3. ENTERING THE DEMONIC
-    # ACADEMY", "EPISODE 12", "PROLOGUE", "SEASON 2 CHAPTER 1". Front-matter,
-    # not story dialogue; narrating it verbatim ("Chapter 3. Entering the
-    # demonic academy.") reads as an error in a recap. Anchored to the start
-    # so a mid-sentence "…this chapter of my life…" is untouched.
     r"^\W*(?:(?:season\s*\d+\s*)?(?:chapter|episode)\s*\d+|prologue|epilogue)\b[\s.:\-—]*.*",
 ]
 
-# strong markers — a known studio / author name, or a "Role:" label — that
-# alone-plus-one signals a credits card; plain words like "studio" only count
-# as weak corroboration so a line of dialogue that happens to say "studio" and
-# "editor" isn't blanked.
 _CREDIT_BLOB_STRONG = re.compile(
     r"(?:\bredice\b|\bred\s*ice\b|\bdubu\b|\bchugong\b|\bh[-\s]?goon\b|\bd\s*&\s*c\b|"
-    r"\b(?:translat\w*|editor|edited|proofread\w*|typeset\w*|scanlat\w*|redraw\w*|"
-    r"cleaner|art|artwork|story|original\s+novel)\s*(?:[:·\-—]|\bby\b))",
+    r"\b(?:asura|reap(?:er)?|flame|lumi|sura|void|realm|manhwa\s*freak)\s*scans?\b|"
+    r"\b(?:translat\w*|editor|edited|proofread\w*|typeset\w*|scanlat\w*|re\s*draw\w*|"
+    r"cleaner|quality|art|artwork|story|original\s+novel)\s*(?:[:·\-—]|\bby\b))",
     re.IGNORECASE,
 )
 _CREDIT_BLOB_WEAK = re.compile(
     r"(?:\bwebtoon\b|\bstudio\b|\bartist\b|\badaptation\b|\bproduction\b|"
-    r"\beditor\b|\btranslat\w*|\bproofread\w*|\bto\s+be\s+continued\b|"
+    r"\beditor\b|\btranslat\w*|\bproofread\w*|\bdiscord\b|\bto\s+be\s+continued\b|"
     r"\bthanks\s+for\s+reading\b)",
+    re.IGNORECASE,
+)
+
+# Full-card scanlator / novel-promo banners that may use normal English words.
+_PROMO_CARD_RE = re.compile(
+    r"(?:\bthis\s+manhwa\s+chapter\s+ends\s+on\s+novel\s+chapter\b|"
+    r"\bcontinue\s+reading\s+(?:the\s+)?novel\s+at\b|"
+    r"\bread\s+(?:it\s+|them\s+)?at\b.{0,35}\bfor\s+the\s+fastest\s+releases?\b|"
+    r"\bfor\s+the\s+fastest\s+releases?\b|"
+    r"updates\s+new\s+comics(?:\s+active\s+community)?|\bactive\s+community\b|\bfastest\s+updates\b|\bmgeko(?:\.cc)?\b|"
+    r"redice(?:inc|studio)|^\W*(?:(?:[a-z]{1,3}|d\s*&\s*c)\W+){0,2}webtoon\W*$|"
+    r"support\s+the\s+mangaka\s+by\s+buying|buying\s+the\s+official\s+version|"
+    r"available\s+in\s+your\s+region|"
+    r"(?:hello|dear)[,\s]+readers\b|we\s+are\s+currently\s+(?:looking\s+)?for|wish\s+to\s+help\s+us\s+out\s+and\s+join\s+the\s+team|"
+    r"if\s+you\s+enjoy\s+our\s+work|contact\s+us\s+through\s+(?:either\s+)?(?:gmail|discord)|"
+    r"join\s+our\s+discord\s+to\s+get\s+updates|\btra\s+pro\s+cle\s+red\s+typ\s+qua\b|"
+    r"translator\s*:\s*\S+.*(?:proof\s*reader|cleaner|re\s*drawer|typesetter|quality)\s*:|"
+    r"\b(?:patr[e]?on\s*\.\s*com|paypal\s*\.\s*me|ko-?fi\s*\.\s*com)(?:/|\b)|"
+    r"[a-z0-9._%+-]+\s*@\s*gmail\s*\.\s*com|"
+    r"\b(?:https?://)?(?:www\.)?(?:asura|reap(?:er)?|flame|lumi|sura|void|realm|manhwa\s*freak)\s*scans?\s*\.\s*(?:com|gg|co|net)(?:/\S*)?|"
+    r"\b(?:asura|reap(?:er)?|flame|lumi|sura)\s*scans\b|"
+    r"\blans\.co\.?\b)",
     re.IGNORECASE,
 )
 
 
 def _is_credits_blob(text: str) -> bool:
     """True when a panel's text is a title / staff-credits card rather than
-    story dialogue: at least one STRONG marker (studio/author name or a
-    'Role:' label) plus one more credit marker, in a short non-prose line."""
+    story dialogue: matches promo cards, >=2 strong credit markers, or a strong+weak
+    combo in a short non-prose line."""
     if not text:
         return False
+    if _PROMO_CARD_RE.search(text):
+        return True
     strong = {m.group(0).lower() for m in _CREDIT_BLOB_STRONG.finditer(text)}
     if not strong:
         return False
+    if len(strong) >= 2:
+        return True
     weak = {m.group(0).lower() for m in _CREDIT_BLOB_WEAK.finditer(text)}
     if len(strong) + len(weak) < 2:
         return False
     words = re.findall(r"[A-Za-z']+", text)
-    # a credits card is short and mostly proper nouns / labels, not prose
     return len(words) <= 18
 
 
@@ -5313,6 +5863,8 @@ def _clean_source_text(text: str) -> str:
 
     for pat in _CREDIT_PATTERNS:
         cleaned = re.sub(pat, " ", cleaned, flags=re.IGNORECASE)
+    if _PROMO_CARD_RE.search(cleaned):
+        return ""
 
     # Common raw-site / copyright boilerplate that survives in English too.
     cleaned = re.sub(
@@ -5325,13 +5877,15 @@ def _clean_source_text(text: str) -> str:
     # mangabuddy, etc. — often mid-caption, and OCR mangles the TLD:
     # "www.baozimh.con"). Excise just the URL/domain token, NOT the rest of
     # the line — the caption text around it is real story content.
+    # Strip translator margin footnotes ("TN: ..." / "TL NOTE: ...")
+    cleaned = re.sub(r"(?:^|\s)(?:TN|T/N|TL\s*NOTE)\s*:\s*.*$", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bwww\.\S+", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bhttps?://\S+", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b[a-z][a-z0-9-]{2,}\.(?:com|net|org|con|c0m|xyz|top)\b(?=$|\s|[.,!?])",
+    cleaned = re.sub(r"\b[a-z][a-z0-9-]{2,}\.(?:com|net|org|con|c0m|xyz|top|co|gg)\b(?:/\S*)?(?=$|\s|[.,!?])",
                      " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
         r"\b(?:baozimh|baozi\s*manhua|mangabuddy|manhuaplus|manhuafast|mangapark|"
-        r"asurascans?|asuracomic|flamescans?|reaperscans?)\b",
+        r"(?:asura|sura|flame|reap(?:er)?|lumi)scans?|asuracomic|re\s*d\s*ice\s*studi\w*)\b",
         " ", cleaned, flags=re.IGNORECASE)
 
     # Collapse artefacts left by the removals.
@@ -5339,15 +5893,17 @@ def _clean_source_text(text: str) -> str:
     cleaned = re.sub(r"\(\s*$", "", cleaned)               # dangling open paren
     cleaned = re.sub(r"^\s*\)", "", cleaned)               # dangling close paren
     cleaned = re.sub(r"\s*[,;:]\s*(?=[,;:.])", "", cleaned)
-    cleaned = re.sub(r"^[\s,;:.\-—)]+", "", cleaned)
-    cleaned = re.sub(r"[\s,;:\-—(]+$", "", cleaned)
+    cleaned = re.sub(r"^[\s,;:.\-—)·|/]+", "", cleaned)
+    cleaned = re.sub(r"[\s,;:\-—(·|/]+$", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not re.search(r"[A-Za-z0-9]", cleaned):
+        return ""
 
     # Garbled-logo / credits guard: a studio logo or a stylised credits
     # graphic OCRs as a scatter of short, vowel-less, non-word tokens
     # ("GARO SSTTNO F O FEHNEEADS A S S YMY"). If most tokens don't look
     # like real words and the whole thing is short, it isn't dialogue.
-    toks = re.findall(r"[A-Za-z][A-Za-z'\-]*", cleaned)
+    toks = re.findall(r"(?<![0-9])[A-Za-z][A-Za-z'\-]*", cleaned)
     SHORT_WORDS = {"a", "i", "an", "as", "at", "be", "by", "do", "go", "he", "if",
                    "in", "is", "it", "me", "my", "no", "of", "oh", "ok", "on", "or",
                    "so", "to", "up", "us", "we", "ah", "hi", "ha", "ho", "uh", "um"}
@@ -5370,6 +5926,18 @@ def _clean_source_text(text: str) -> str:
     # (Sound effects and short interjections are NOT numbers, so they pass.)
     if re.fullmatch(r"[\W\d]*\d[\W\d]*", cleaned) and re.fullmatch(r"\d{1,4}", cleaned.strip(" .,!?-—:;\"'")):
         return ""
+    if cleaned.strip().lower() in {"to", "of", "in", "on", "at", "by", "an", "as", "or", "is", "be", "am", "the", "and", "for", "from", "with"} and not any(c in cleaned for c in ("!", "?")):
+        return ""
+    _solo_core = cleaned.strip(" .,!?-\u2014:;\"'()[]")
+    if _solo_core and " " not in _solo_core and re.fullmatch(r"(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{2,14}", _solo_core):
+        if not re.match(
+            r"^(?:\d+(?:st|nd|rd|th|km|m|cm|mm|kg|g|mg|lb|lbs|ft|in|hr|hrs|min|mins|sec|secs|hp|mp|xp|lv|lvl|fps|hz|k|mb|gb|tb|x|d)|"
+            r"(?:mp3|mp4|ak47|b12|c4|f1|s\d+|e\d+|[a-z]\d+))$",
+            _solo_core,
+            re.IGNORECASE,
+        ):
+            if re.match(r"^\d+[A-Za-z]+\d+", _solo_core) or len(re.sub(r"[^A-Za-z]", "", _solo_core)) >= 2:
+                return ""
     return cleaned
 
 
@@ -5612,6 +6180,72 @@ def _observer_fix_ocr(cfg: "PipelineConfig", text: str, cache_tag: str,
     return out
 
 
+_SFX_RE = re.compile(
+    r"\b(?:KWAA+NG|BO+M|BA+M|THU+D|SWOO+SH|CLA+SH|SLA+SH|CRACK|CRASH|RUMBLE|"
+    r"WHOOSH|WHAM|SMASH|BANG|POW|CLANG|ZAP|SNAP|ROAR|SHING|SPLASH|GASP|HUH|UGH|ACK|TCH)\b[!?.,]*",
+    re.IGNORECASE,
+)
+
+
+def _local_style_transform(text: str, style: str) -> str:
+    """Deterministic local text transform for cleanup/recap/dramatic/concise
+    when no cloud LLM key is configured (or if the LLM call fails)."""
+    cleaned = _strip_forbidden(text or "").strip()
+    if not cleaned or style == "verbatim":
+        return cleaned
+
+    # Join broken hyphenations and normalize shouty all-caps to sentence case.
+    t = re.sub(r"-\s+", "", cleaned)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = _normalize_case_for_tts(t)
+    t = re.sub(r"([!?.,]){2,}", r"\1", t)
+    # Strip standalone SFX tokens
+    t = _SFX_RE.sub("", t)
+    t = re.sub(r"\s+([,.;!?])", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,;-").lstrip("!?.,;: ")
+
+    if style == "cleanup":
+        return t or cleaned
+
+    if style == "recap":
+        # Remove isolated 1-word filler fragments and glue short pieces smoothly.
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
+        kept = []
+        for p in parts:
+            words = re.findall(r"[A-Za-z0-9']+", p)
+            if len(words) == 1 and words[0].lower() in ("huh", "what", "eh", "oh", "ah", "hm", "hmm", "wait", "no", "yes", "hey", "well"):
+                continue
+            kept.append(p)
+        res = " ".join(kept).strip()
+        return res or t or cleaned
+
+    if style == "dramatic":
+        # Add brief dramatic ellipsis pauses before punchy exclamations/questions.
+        res = re.sub(r"([!?])\s+", r"\1 ... ", t).strip()
+        return res or t or cleaned
+
+    if style == "concise":
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
+        kept = []
+        for p in parts:
+            words = re.findall(r"[A-Za-z0-9']+", p)
+            if len(words) <= 2 and p.rstrip("!?.").lower() in (
+                "what", "huh", "no way", "wait", "impossible", "really", "stop", "hey", "look"
+            ):
+                continue
+            kept.append(p)
+        res = " ".join(kept).strip()
+        if not res:
+            res = t
+        # Trim very long multi-sentence chatter down to the core first 2 sentences.
+        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", res) if s.strip()]
+        if len(sents) > 2:
+            res = " ".join(sents[:2])
+        return res or cleaned
+
+    return t or cleaned
+
+
 def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str) -> str:
     """Call an LLM to rewrite (already-English) text into narration, chained with
     prev_tail for continuity. Cached by cache_tag.
@@ -5655,12 +6289,8 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
     # exact failure on the 328-chapter run).
     chain = _llm_provider_chain(cfg)
     if not chain:
-        log.warning(
-            "[%s] [RAW/VERBATIM MODE] no LLM provider key configured — using raw text. "
-            "Set GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY (all have free tiers).",
-            cache_tag,
-        )
-        narration = _strip_forbidden(text)
+        narration = _local_style_transform(text, style)
+        log.info("[%s] [LOCAL %s] transformed text without LLM (%d -> %d chars)", cache_tag, style.upper(), len(text), len(narration))
         out_path.write_text(narration, encoding="utf-8")
         return narration
 
@@ -5668,6 +6298,18 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
         sys_prompt = CLEANUP_SYSTEM_PROMPT
         user_prompt = f"RAW OCR OF ONE PANEL:\n{text}"
         temperature = 0.1
+    elif style == "dramatic":
+        sys_prompt = SYSTEM_PROMPT + "\nTone: punchy, suspenseful dramatic narration with short pauses before reveals."
+        user_prompt = f"Rewrite the SOURCE TEXT below into dramatic recap narration. Use only what it contains.\n\nSOURCE TEXT:\n{text}"
+        if prev_tail:
+            user_prompt = f"[For tone/tense continuity only — already narrated, do NOT repeat]\n...{prev_tail}\n\n" + user_prompt
+        temperature = 0.5
+    elif style == "concise":
+        sys_prompt = SYSTEM_PROMPT + "\nLength: ultra-concise summary — 1 tight sentence covering only key plot action and dialogue."
+        user_prompt = f"Summarize the SOURCE TEXT below concisely. Use only what it contains.\n\nSOURCE TEXT:\n{text}"
+        if prev_tail:
+            user_prompt = f"[For continuity only]\n...{prev_tail}\n\n" + user_prompt
+        temperature = 0.25
     else:  # recap
         sys_prompt = SYSTEM_PROMPT
         # prev_tail is tone/tense continuity ONLY — framed as "already told,
@@ -5711,11 +6353,11 @@ def rephrase_text(cfg: PipelineConfig, text: str, cache_tag: str, prev_tail: str
         if ok:
             narration = candidate
         else:
-            narration = _strip_forbidden(text)
-            log.info("[%s] LLM %s output rejected — using raw OCR words", cache_tag, style)
+            narration = _local_style_transform(text, style)
+            log.info("[%s] LLM %s output rejected — using local %s transform", cache_tag, style, style)
     except Exception as e:
-        log.warning("[%s] narration API call failed via %s (%s) — using raw OCR words", cache_tag, provider, e)
-        narration = _strip_forbidden(text)
+        log.warning("[%s] narration API call failed via %s (%s) — using local %s transform", cache_tag, provider, e, style)
+        narration = _local_style_transform(text, style)
 
     out_path.write_text(narration, encoding="utf-8")
     log.info("[%s] narration script written via %s/%s (%d chars)", cache_tag, provider, model, len(narration))
@@ -5797,6 +6439,7 @@ def get_audio_duration(path: Path) -> float:
 
 
 def _generate_silence(path: Path, duration: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Output as WAV (not MP3) to avoid encoder delay/padding that causes
     # sync drift when concatenated. WAV is raw PCM — sample-accurate.
     #
@@ -5830,6 +6473,22 @@ def _audio_qa(path: Path, allow_silence: bool = False) -> bool:
     if not path.exists() or path.stat().st_size < 44:
         return False
     try:
+        if str(path).lower().endswith(".wav"):
+            try:
+                with wave.open(str(path), "rb") as w:
+                    fr = w.getframerate()
+                    nf = w.getnframes()
+                    sw = w.getsampwidth()
+                    if fr <= 0 or (nf / float(fr)) <= 0.05:
+                        return False
+                    if allow_silence:
+                        return True
+                    if sw == 2:
+                        pcm = np.frombuffer(w.readframes(nf), dtype="<i2")
+                        # -50 dBFS threshold for 16-bit signed PCM: 32768 * 10**(-50/20) = 103.6
+                        return bool(pcm.size > 0 and int(np.max(np.abs(pcm))) > 103)
+            except Exception:
+                pass
         duration = get_audio_duration(path)
         if duration <= 0.05:
             return False
@@ -5852,6 +6511,21 @@ def _synthesize_with_espeak(text: str, out_wav: Path) -> None:
     result = subprocess.run([espeak, "-w", str(out_wav), text], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"espeak-ng failed: {result.stderr[-200:]}")
+
+
+def _normalize_tts_wav(wav: Path) -> None:
+    """Resample a TTS engine's native WAV (Piper/eSpeak emit 22050 Hz) to the
+    pipeline's canonical mono / 16-bit / AUDIO_SAMPLE_RATE. Silence and edge-tts
+    segments are written at AUDIO_SAMPLE_RATE, and build_chapter_audio_track
+    joins segments with `-c copy`, which reinterprets every sample at the FIRST
+    file's rate -- so un-normalized Piper speech played back ~2x fast (chipmunk)
+    and the chapter audio came out far shorter than the video timeline, tripping
+    duration_out_of_tolerance on all retries (black-placeholder fallback)."""
+    fixed = wav.with_name(wav.stem + ".norm.wav")
+    fixed.unlink(missing_ok=True)
+    run_ffmpeg(["ffmpeg", "-y", "-i", str(wav), "-ar", str(AUDIO_SAMPLE_RATE),
+                "-ac", "1", "-c:a", "pcm_s16le", "-f", "wav", str(fixed)])
+    os.replace(fixed, wav)
 
 
 def _synthesize_with_piper(text: str, out_wav: Path) -> None:
@@ -5916,16 +6590,160 @@ _KOKORO_VOICE_RE = re.compile(r"^[abhijpef][fm]_[a-z][a-z_]*$")
 
 
 def _kokoro_voice_requested(cfg) -> Optional[str]:
-    """The Kokoro voice to use, or None to leave TTS on edge-tts. Kokoro is
-    selected either by RECAP_TTS_ENGINE=kokoro (voice from RECAP_KOKORO_VOICE)
-    or by cfg.voice being a Kokoro voice id (am_michael, af_bella, bm_george,
-    …) — which is how the website's voice picker turns it on."""
+    """The Kokoro voice to use, or None to leave TTS on edge-tts.
+    Explicit Kokoro voice IDs (am_michael, bm_george, ...) always use Kokoro.
+    Explicit non-default Edge-TTS voices (e.g. en-US-AndrewMultilingualNeural)
+    are always honored on Edge-TTS instead of being silently overridden."""
     v = (getattr(cfg, "voice", "") or "").strip()
     if v and _KOKORO_VOICE_RE.match(v):
         return v
-    if os.environ.get("RECAP_TTS_ENGINE", "").strip().lower() == "kokoro":
+    eng = os.environ.get("RECAP_TTS_ENGINE", "").strip().lower()
+    if eng == "edge-tts":
+        return None
+    if v and re.match(r"^[a-z]{2}-[A-Z]{2}-.+Neural$", v) and v != "en-US-ChristopherNeural":
+        return None
+    if eng == "kokoro":
         return os.environ.get("RECAP_KOKORO_VOICE", "am_michael")
     return None
+
+
+
+_kokoro_pool_singleton = None
+_kokoro_pool_singleton_lock = threading.Lock()
+
+
+class _KokoroWorkerPool:
+    """Fixed-size bounded pool of persistent kokoro_tts.py --worker processes."""
+
+    def __init__(self, py_exe: str, max_workers: int):
+        import queue
+        import atexit
+        self._py = py_exe
+        self._max_workers = max(1, max_workers)
+        self._sem = threading.Semaphore(self._max_workers)
+        self._free: "queue.LifoQueue[subprocess.Popen]" = queue.LifoQueue()
+        self._procs_lock = threading.Lock()
+        self._procs: List[subprocess.Popen] = []
+        atexit.register(self.shutdown)
+
+    def _spawn(self) -> subprocess.Popen:
+        w = subprocess.Popen(
+            [self._py, str(KOKORO_TTS_SCRIPT), "--worker", str(KOKORO_MODEL_DIR)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        ready_line = w.stdout.readline() if w.stdout else ""
+        if not ready_line or not json.loads(ready_line).get("ready"):
+            try:
+                w.kill()
+                w.wait(timeout=1)
+            except Exception:
+                pass
+            raise RuntimeError(f"Kokoro worker failed to start: {ready_line!r}")
+        with self._procs_lock:
+            self._procs.append(w)
+        return w
+
+    def _kill_worker(self, w: Optional[subprocess.Popen]) -> None:
+        if w is None:
+            return
+        with self._procs_lock:
+            if w in self._procs:
+                self._procs.remove(w)
+        try:
+            if w.poll() is None:
+                w.kill()
+            w.wait(timeout=1)
+        except Exception:
+            pass
+
+    def synthesize(self, req: dict) -> Optional[dict]:
+        for attempt in range(2):
+            self._sem.acquire()
+            w: Optional[subprocess.Popen] = None
+            healthy = False
+            try:
+                while not self._free.empty():
+                    try:
+                        cand = self._free.get_nowait()
+                    except Exception:
+                        break
+                    if cand.poll() is None:
+                        w = cand
+                        break
+                    self._kill_worker(cand)
+                if w is None:
+                    w = self._spawn()
+                assert w.stdin is not None and w.stdout is not None
+                w.stdin.write(json.dumps(req) + "\n")
+                w.stdin.flush()
+                resp_line = w.stdout.readline()
+                if not resp_line:
+                    raise EOFError("Kokoro worker closed stdout")
+                payload = json.loads(resp_line.strip())
+                healthy = True
+                return payload
+            except Exception as e:
+                self._kill_worker(w)
+                w = None
+                if attempt == 1:
+                    log.warning("Kokoro worker failed (%s) — falling back", e)
+                    return None
+            finally:
+                if healthy and w is not None and w.poll() is None:
+                    self._free.put(w)
+                elif w is not None:
+                    self._kill_worker(w)
+                self._sem.release()
+        return None
+
+    def shutdown(self) -> None:
+        while not self._free.empty():
+            try:
+                self._free.get_nowait()
+            except Exception:
+                break
+        with self._procs_lock:
+            procs = list(self._procs)
+            self._procs.clear()
+        for w in procs:
+            try:
+                if w.stdin:
+                    w.stdin.close()
+            except Exception:
+                pass
+            try:
+                if w.poll() is None:
+                    w.terminate()
+                    w.wait(timeout=2)
+            except Exception:
+                try:
+                    if w.poll() is None:
+                        w.kill()
+                        w.wait(timeout=1)
+                except Exception:
+                    pass
+
+
+def _get_kokoro_pool(py_exe: str) -> _KokoroWorkerPool:
+    global _kokoro_pool_singleton
+    if _kokoro_pool_singleton is not None:
+        return _kokoro_pool_singleton
+    with _kokoro_pool_singleton_lock:
+        if _kokoro_pool_singleton is None:
+            _kc = int(os.environ.get("RECAP_KOKORO_WORKERS", os.environ.get("RECAP_TTS_WORKERS", "4")) or 4)
+            _kc = max(1, min(_kc, max(1, os.cpu_count() or 4)))
+            _kokoro_pool_singleton = _KokoroWorkerPool(py_exe, _kc)
+    return _kokoro_pool_singleton
+
+
+def _shutdown_kokoro_pool() -> None:
+    global _kokoro_pool_singleton
+    with _kokoro_pool_singleton_lock:
+        pool = _kokoro_pool_singleton
+        _kokoro_pool_singleton = None
+    if pool is not None:
+        pool.shutdown()
 
 
 def _synthesize_with_kokoro(text: str, out_wav: Path,
@@ -5943,8 +6761,9 @@ def _synthesize_with_kokoro(text: str, out_wav: Path,
                      "(run pipeline/setup_kokoro.sh) — using edge-tts")
             _kokoro_unavailable_logged = True
         return None
-    model_ok = (KOKORO_MODEL_DIR / "kokoro-v1.0.onnx").exists() and \
-               (KOKORO_MODEL_DIR / "voices-v1.0.bin").exists()
+    _kok_model_name = os.environ.get("RECAP_KOKORO_MODEL", "kokoro-v1.0.onnx").strip() or "kokoro-v1.0.onnx"
+    _kok_model_path = Path(_kok_model_name) if os.path.isabs(_kok_model_name) else (KOKORO_MODEL_DIR / _kok_model_name)
+    model_ok = _kok_model_path.exists() and (KOKORO_MODEL_DIR / "voices-v1.0.bin").exists()
     if not model_ok:
         if not _kokoro_unavailable_logged:
             log.info("Kokoro model files missing under %s — using edge-tts", KOKORO_MODEL_DIR)
@@ -5958,36 +6777,21 @@ def _synthesize_with_kokoro(text: str, out_wav: Path,
         "lang": os.environ.get("RECAP_KOKORO_LANG", "en-us"),
         "out_wav": str(out_wav),
         "model_dir": str(KOKORO_MODEL_DIR),
-        "sample_rate": 24000,
+        "sample_rate": AUDIO_SAMPLE_RATE,
+        "fade_in": SEGMENT_FADE_IN,
+        "fade_out": SEGMENT_FADE_OUT,
         "sentence_pause": float(os.environ.get("RECAP_KOKORO_SENT_PAUSE", "0.18") or 0.18),
     }
-    # Generous ceiling: ~4x real-time on this box, plus init/spawn slack.
-    timeout = max(60.0, len(text) * 0.12 + 25.0)
-    try:
-        proc = subprocess.run(
-            [py, str(KOKORO_TTS_SCRIPT)],
-            input=json.dumps(req), text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("Kokoro synthesis timed out after %.0fs — falling back", timeout)
-        return None
-    except Exception as e:
-        log.warning("Kokoro subprocess failed to launch (%s) — falling back", e)
+    # Reuse a small bounded pool of persistent Kokoro worker subprocesses across
+    # all chapters instead of binding workers to per-chapter ThreadPoolExecutor
+    # threads via threading.local() (which leaked 4 x ~500MB processes per chapter).
+    pool = _get_kokoro_pool(py)
+    payload = pool.synthesize(req)
+    if payload is None:
         return None
 
-    out = (proc.stdout or "").strip().splitlines()
-    payload = None
-    for line in reversed(out):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                payload = json.loads(line)
-                break
-            except Exception:
-                continue
     if not payload or not payload.get("ok"):
-        err = (payload or {}).get("error") if payload else (proc.stderr or "")[-200:]
+        err = (payload or {}).get("error") if payload else "no response"
         log.info("Kokoro synthesis unavailable (%s) — using edge-tts", err)
         return None
     if not out_wav.exists() or out_wav.stat().st_size < 200:
@@ -6127,7 +6931,7 @@ def _prewarm_segment_audio(cfg: "PipelineConfig", chapter: "Chapter", segments: 
     # thrashes. Cap it near the core count when Kokoro is the engine.
     if _kokoro_voice_requested(cfg):
         _kc = max(2, min(int(os.environ.get("RECAP_KOKORO_WORKERS",
-                         str(max(2, min(3, (os.cpu_count() or 4) - 1))))), len(todo)))
+                         str(max(2, os.cpu_count() or 4)))), len(todo)))
         workers = min(workers, _kc)
 
     def _one(item):
@@ -6158,10 +6962,17 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     seg_audio_dir = cfg.temp_audio_dir / chapter.tag
     seg_audio_dir.mkdir(parents=True, exist_ok=True)
     final_path = seg_audio_dir / f"{tag}.wav"
+    wb_path = seg_audio_dir / f"{tag}.wb.json"
     text = text.strip()
     text = _normalize_case_for_tts(text)
     if final_path.exists() and _audio_qa(final_path, allow_silence=not text):
-        return final_path, False, None
+        cached_wb = None
+        if wb_path.exists():
+            try:
+                cached_wb = json.loads(wb_path.read_text(encoding="utf-8"))
+            except Exception:
+                cached_wb = None
+        return final_path, False, cached_wb
 
     final_path.unlink(missing_ok=True)
     tmp_path = seg_audio_dir / f"{tag}.tmp.wav"
@@ -6185,20 +6996,18 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     # when it is not selected or not installed.
     _kok_voice = _kokoro_voice_requested(cfg)
     if _kok_voice:
-        kok_wav = seg_audio_dir / f"{tag}_kok.wav"
-        kok_wav.unlink(missing_ok=True)
         try:
-            sentences = _synthesize_with_kokoro(text, kok_wav, voice=_kok_voice)
-            if sentences is not None and kok_wav.exists() and kok_wav.stat().st_size > 200:
-                raw_dur = get_audio_duration(kok_wav)
-                fade_out_start = max(0.0, raw_dur - SEGMENT_FADE_OUT)
-                seg_af = (f"afade=t=in:st=0:d={SEGMENT_FADE_IN},"
-                          f"afade=t=out:st={fade_out_start:.3f}:d={SEGMENT_FADE_OUT}")
-                run_ffmpeg(["ffmpeg", "-y", "-i", str(kok_wav), "-af", seg_af,
-                            "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", str(tmp_path)])
+            sentences = _synthesize_with_kokoro(text, tmp_path, voice=_kok_voice)
+            if sentences is not None and tmp_path.exists() and tmp_path.stat().st_size > 200:
+                raw_dur = get_audio_duration(tmp_path)
                 if _audio_qa(tmp_path, allow_silence=False):
                     os.replace(tmp_path, final_path)
                     wb = _kokoro_word_boundaries(text, sentences)
+                    if wb:
+                        try:
+                            wb_path.write_text(json.dumps(wb), encoding="utf-8")
+                        except Exception:
+                            pass
                     log.info("[%s] Kokoro TTS synthesised segment %s (%.1fs, %d sentence(s), timing=%s)",
                              chapter.tag, tag, raw_dur, len(sentences),
                              "real" if wb else "estimate")
@@ -6210,7 +7019,6 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
             log.info("[%s] Kokoro TTS unavailable for segment %s (%s) — using edge-tts",
                      chapter.tag, tag, e)
         finally:
-            kok_wav.unlink(missing_ok=True)
             tmp_path.unlink(missing_ok=True)
 
     import asyncio
@@ -6235,8 +7043,14 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
         # rejected/hung connection from burning edge-tts's 10s/60s defaults
         # (the difference between a ~6s failed attempt and a ~30-60s one
         # during a throttle wave).
+        tts_voice, tts_rate, tts_pitch = voice, "+5%", "+0Hz"
+        try:
+            from private_voice import resolve_voice_params
+            tts_voice, tts_rate, tts_pitch = resolve_voice_params(voice)
+        except ImportError:
+            pass
         communicate = edge_tts.Communicate(
-            text, voice, rate="+5%", connect_timeout=8, receive_timeout=15)
+            text, tts_voice, rate=tts_rate, pitch=tts_pitch, connect_timeout=8, receive_timeout=15)
         submaker = edge_tts.SubMaker()
         with open(raw_path, "wb") as f:
             async for chunk in communicate.stream():
@@ -6322,6 +7136,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     tmp_path.unlink(missing_ok=True)
     try:
         _synthesize_with_piper(text, tmp_path)
+        _normalize_tts_wav(tmp_path)
         if _audio_qa(tmp_path, allow_silence=False):
             os.replace(tmp_path, final_path)
             log.info("[%s] Piper ONNX fallback succeeded for segment %s", chapter.tag, tag)
@@ -6335,6 +7150,7 @@ def synthesize_segment_audio(cfg: PipelineConfig, chapter: Chapter, tag: str, te
     tmp_path.unlink(missing_ok=True)
     try:
         _synthesize_with_espeak(text, tmp_path)
+        _normalize_tts_wav(tmp_path)
         if _audio_qa(tmp_path, allow_silence=False):
             os.replace(tmp_path, final_path)
             log.info("[%s] eSpeak NG fallback succeeded for segment %s", chapter.tag, tag)
@@ -6371,21 +7187,83 @@ def build_chapter_audio_track(
         log.info("[%s] chapter audio track already assembled — skipping", chapter.tag)
         return out_path
 
+    tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
+    tmp_path.unlink(missing_ok=True)
+    raw_path = cfg.temp_audio_dir / f"{chapter.tag}_raw.wav"
+
+    # Turbo fast path: assemble WAVs in memory, normalize active speech RMS to
+    # TARGET_LOUDNESS_LUFS with a -1.5 dBFS soft-knee limiter, and pipe straight
+    # into libmp3lame (eliminates disk concat + slow ffmpeg loudnorm pass).
+    _fast_audio_ok = False
+    if _is_turbo() and narration_expected and segment_audio_paths and all(str(p).lower().endswith(".wav") for p in segment_audio_paths):
+        try:
+            chunks_pcm = []
+            for p in segment_audio_paths:
+                with wave.open(str(p), "rb") as w:
+                    nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                    raw_b = w.readframes(w.getnframes())
+                if sw != 2:
+                    raise RuntimeError(f"unsupported sampwidth {sw}")
+                arr = np.frombuffer(raw_b, dtype="<i2").astype(np.float32) / 32768.0
+                if nch > 1:
+                    arr = arr.reshape(-1, nch).mean(axis=1)
+                if fr != AUDIO_SAMPLE_RATE and arr.size > 1:
+                    n_out = int(round(arr.size * AUDIO_SAMPLE_RATE / float(fr)))
+                    xp = np.linspace(0.0, 1.0, num=arr.size, dtype=np.float64)
+                    x = np.linspace(0.0, 1.0, num=n_out, dtype=np.float64)
+                    arr = np.interp(x, xp, arr).astype(np.float32)
+                chunks_pcm.append(arr)
+
+            full_f = np.concatenate(chunks_pcm) if len(chunks_pcm) > 1 else chunks_pcm[0]
+            win = max(1, AUDIO_SAMPLE_RATE // 10)
+            n_win = full_f.size // win
+            if n_win > 0:
+                blocks = full_f[:n_win * win].reshape(n_win, win)
+                rms_b = np.sqrt(np.mean(blocks * blocks, axis=1))
+                active = rms_b[rms_b > (10.0 ** (-45.0 / 20.0))]
+                speech_rms = float(np.sqrt(np.mean(active * active))) if active.size else float(np.sqrt(np.mean(full_f * full_f)))
+            else:
+                speech_rms = float(np.sqrt(np.mean(full_f * full_f)))
+
+            if speech_rms > 1e-5:
+                target_rms = 10.0 ** (float(TARGET_LOUDNESS_LUFS) / 20.0)
+                gain = min(12.0, target_rms / speech_rms)
+                full_f = full_f * gain
+                thresh = 10.0 ** (-3.0 / 20.0)
+                ceil = 10.0 ** (-1.5 / 20.0)
+                over = np.abs(full_f) > thresh
+                if np.any(over):
+                    head = ceil - thresh
+                    full_f[over] = np.sign(full_f[over]) * (thresh + head * np.tanh((np.abs(full_f[over]) - thresh) / head))
+                out_pcm = np.clip(full_f * 32767.0, -32767, 32767).astype("<i2")
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-y", "-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
+                        "-i", "pipe:0", "-ac", "2", "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
+                        "-f", "mp3", str(tmp_path),
+                    ],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                _, err_b = proc.communicate(out_pcm.tobytes(), timeout=120)
+                if proc.returncode == 0 and audio_qa(tmp_path, narration_expected=narration_expected).ok:
+                    atomic_promote(tmp_path, out_path)
+                    log.info("[%s] assembled + post-processed chapter audio (in-mem gated RMS) -> %s", chapter.tag, out_path.name)
+                    return out_path
+                tmp_path.unlink(missing_ok=True)
+        except Exception as _ae:
+            log.warning("[%s] fast audio path fallback (%s) — using ffmpeg loudnorm", chapter.tag, _ae)
+            tmp_path.unlink(missing_ok=True)
+
     concat_list = cfg.temp_audio_dir / f"{chapter.tag}_audio_concat.txt"
     with concat_list.open("w", encoding="utf-8") as f:
         for p in segment_audio_paths:
             f.write(f"file '{p.resolve().as_posix()}'\n")
 
-    # First: raw concat (stream copy). WAV files have no encoder delay/padding,
-    # so concatenation with -c copy is sample-accurate — no sync drift.
-    # Output MUST be WAV (not MP3) because -c copy can't put PCM into an MP3
-    # container without re-encoding. The loudnorm step below re-encodes to MP3.
-    raw_path = cfg.temp_audio_dir / f"{chapter.tag}_raw.wav"
     run_ffmpeg(
         [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
-            "-c", "copy",
+            "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le",
             "-f", "wav",
             str(raw_path),
         ]
@@ -6420,8 +7298,6 @@ def build_chapter_audio_track(
     # to leave a truncated MP3 sitting directly at `out_path`, which a
     # resumed run would then treat as "already assembled" and feed straight
     # into render_chapter's video mux.
-    tmp_path = cfg.temp_audio_dir / f"{chapter.tag}.mp3.tmp"
-    tmp_path.unlink(missing_ok=True)
     af = f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11"
     try:
         run_ffmpeg(
@@ -6602,6 +7478,15 @@ def split_frame_timings(text: str, positions: List[int], duration: float, is_sil
 # 5. CHAPTER RENDERER (static frames, memory-efficient per-segment ffmpeg)
 # ---------------------------------------------------------------------------
 
+def _watermark_drawtext(watermark: str) -> str:
+    """Build an FFmpeg drawtext filter fragment safe for quotes, colons, backslashes, and %."""
+    wm = str(watermark).replace("\\", "").replace("'", "").replace(":", " ")
+    return (
+        f",drawtext=text='{wm}':expansion=none:fontcolor=white@0.55:fontsize=34:"
+        f"shadowcolor=black@0.6:shadowx=2:shadowy=2:x=w-tw-32:y=h-th-28"
+    )
+
+
 def render_chapter(
     cfg: PipelineConfig,
     chapter: Chapter,
@@ -6703,11 +7588,7 @@ def render_chapter(
     # video, copying the audio, so timing is untouchable.
     _tune = "stillimage"
     if getattr(cfg, "watermark", None):
-        wm = str(cfg.watermark).replace("\\", "").replace("'", "").replace(":", " ")
-        video_filters += (
-            f",drawtext=text='{wm}':fontcolor=white@0.55:fontsize=34:"
-            f"shadowcolor=black@0.6:shadowx=2:shadowy=2:x=w-tw-32:y=h-th-28"
-        )
+        video_filters += _watermark_drawtext(cfg.watermark)
 
     # NOTE on -vsync vfr (not "-r FPS"): forcing a constant output frame
     # rate makes ffmpeg duplicate frames to fill each image's declared
@@ -6730,7 +7611,7 @@ def render_chapter(
             "-i", str(audio_path),
             "-vf", video_filters,
             "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "superfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
             "-vsync", "vfr",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-shortest",
@@ -6749,7 +7630,7 @@ def render_chapter(
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-vf", video_filters,
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "superfast", "-tune", _tune, "-crf", "20", "-pix_fmt", "yuv420p",
             "-vsync", "vfr",
             "-f", "mp4",
             str(tmp_path),
@@ -7255,15 +8136,13 @@ def build_intro_video(cfg: "PipelineConfig", chapters: "List[Chapter]") -> Optio
     tmp.unlink(missing_ok=True)
     vf = f"scale={CANVAS_W}:{CANVAS_H},format=yuv420p,fps={FPS}"
     if getattr(cfg, "watermark", None):
-        wm = str(cfg.watermark).replace("\\", "").replace("'", "").replace(":", " ")
-        vf += (f",drawtext=text='{wm}':fontcolor=white@0.55:fontsize=34:"
-               f"shadowcolor=black@0.6:shadowx=2:shadowy=2:x=w-tw-32:y=h-th-28")
+        vf += _watermark_drawtext(cfg.watermark)
     run_ffmpeg([
         "ffmpeg", "-y",
         "-loop", "1", "-framerate", str(FPS), "-i", str(card),
         "-i", str(audio_wav),
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "20",
+        "-c:v", "libx264", "-preset", ("superfast" if _is_turbo() else "veryfast"), "-tune", "stillimage", "-crf", "20",
         "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2",
         "-shortest", "-t", f"{dur + 0.4:.3f}",
         "-f", "mp4", str(tmp),
@@ -7389,8 +8268,9 @@ def finalize_output(cfg: PipelineConfig, merged_path: Path) -> Path:
             # itself; amix folds the ducked BGM back under the voice.
             # Video stream is copied untouched — only audio is re-encoded.
             duck_ratio = 8  # higher = more aggressive ducking under voice
+            bgm_vol = max(0.05, min(1.0, float(os.environ.get("RECAP_BGM_VOLUME", "0.35") or 0.35)))
             filter_complex = (
-                f"[1:a]volume=0.35[bgm];"
+                f"[1:a]volume={bgm_vol:.2f}[bgm];"
                 f"[bgm][0:a]sidechaincompress=threshold=0.05:ratio={duck_ratio}:"
                 f"attack=20:release=400:makeup=1[ducked];"
                 f"[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=2:weights=1 1[aout]"
@@ -7446,6 +8326,15 @@ def cleanup_temp(cfg: PipelineConfig) -> None:
 # ---------------------------------------------------------------------------
 
 def run_pipeline(cfg: PipelineConfig) -> None:
+    _RECAP_SEEN_HASHES.clear()
+    _RECAP_SEEN_SET.clear()
+    if getattr(cfg, "motion_style", "none") == "kenburns" and FPS < 24:
+        globals()["FPS"] = 24
+    _spd = max(0.5, min(2.0, float(os.environ.get("RECAP_KOKORO_SPEED", "1.0") or 1.0)))
+    if abs(_spd - 1.0) > 0.01:
+        globals()["MIN_FRAME_DURATION"] = max(1.2, round(2.4 / _spd, 2))
+    if getattr(cfg, "narration_style", "verbatim") == "dramatic" and not os.environ.get("RECAP_KOKORO_SENT_PAUSE"):
+        os.environ["RECAP_KOKORO_SENT_PAUSE"] = "0.30"
     start = time.time()
     cfg.ensure_dirs()
     # Ensure the output directory exists.
@@ -7539,14 +8428,20 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         existing_video = cfg.temp_chapters_dir / f"{chapter.tag}.mp4"
         if existing_video.exists():
-            log.info("[%s] fully rendered already — resuming past this chapter", chapter.tag)
-            chapter_videos.append(existing_video)
-            state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag, artifact_path=existing_video)
-            # Keep narrative continuity even when resuming: pull tail from cached script.
-            script_cache = cfg.temp_scripts_dir / f"{chapter.tag}.txt"
-            if script_cache.exists():
-                prev_tail = last_sentences(script_cache.read_text(encoding="utf-8"))
-            continue
+            _ev_ok = existing_video.stat().st_size > 1024 and video_qa(existing_video, audio_expected=False).ok
+            if _ev_ok:
+                log.info("[%s] fully rendered already — resuming past this chapter", chapter.tag)
+                chapter_videos.append(existing_video)
+                state_store.record(cfg.job_id, Stage.CHAPTER, State.COMPLETE, chapter_id=chapter.tag, artifact_path=existing_video)
+                script_cache = cfg.temp_scripts_dir / f"{chapter.tag}.txt"
+                if script_cache.exists():
+                    prev_tail = last_sentences(script_cache.read_text(encoding="utf-8"))
+                continue
+            log.warning("[%s] cached %s is corrupt/incomplete — re-rendering chapter", chapter.tag, existing_video.name)
+            try:
+                existing_video.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         state_store.record(cfg.job_id, Stage.CHAPTER, State.RUNNING, chapter_id=chapter.tag)
         try:
@@ -7600,25 +8495,38 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             # this only fires on frames that are literally all-watermark.
             if (os.environ.get("RECAP_DROP_BOUNDARY_CREDITS", "1").lower() not in ("0", "false", "no")
                     and len(frame_paths) > 3 and chapter.image_narrations):
-                def _boundary_credits(i: int) -> bool:
+                def _get_ne(i: int):
                     fp = frame_paths[i]
                     fe = manifest.frames[i] if (manifest and i < len(manifest.frames)) else None
                     if fe:
-                        ne = (chapter.image_narrations.get(fe.frame_id)
-                              or chapter.image_narrations.get(fe.filename)
-                              or chapter.image_narrations.get(fp.name))
-                    else:
-                        ne = chapter.image_narrations.get(fp.name)
+                        return (chapter.image_narrations.get(fe.frame_id)
+                                or chapter.image_narrations.get(fe.filename)
+                                or chapter.image_narrations.get(fp.name))
+                    return chapter.image_narrations.get(fp.name)
+
+                def _definite_promo_or_credit(i: int) -> bool:
+                    ne = _get_ne(i)
+                    if isinstance(ne, dict) and ne.get("credits_filtered"):
+                        return True
+                    raw = parse_narration_item(ne)["text"].strip()
+                    if not raw:
+                        return False
+                    if _PROMO_CARD_RE.search(raw):
+                        return True
+                    if _is_credits_blob(raw) and not _clean_source_text(raw).strip():
+                        return True
+                    return False
+
+                def _boundary_credits(i: int) -> bool:
+                    if _definite_promo_or_credit(i):
+                        return True
+                    fp = frame_paths[i]
+                    ne = _get_ne(i)
                     raw = parse_narration_item(ne)["text"].strip()
                     if not raw or len(re.sub(r"[^A-Za-z]", "", raw)) < 4:
-                        return False  # no real OCR text → could be a silent panel, keep
+                        return False
                     if _clean_source_text(raw).strip():
-                        return False  # real narratable text survives cleaning → keep
-                    # OCR read a card's worth of text and it ALL cleaned away as
-                    # credits / studio / "CHAPTER N …" front-matter. In the tight
-                    # first/last-few window that's card enough to drop; the
-                    # visual check is a tie-breaker for the borderline case of a
-                    # story panel whose only text is a stamped watermark.
+                        return False
                     if _is_credits_blob(raw) or re.match(
                             r"^\W*(?:(?:season\s*\d+\s*)?(?:chapter|episode)\s*\d+|prologue|epilogue)\b",
                             raw, re.IGNORECASE):
@@ -7630,11 +8538,21 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                     except Exception:
                         return True
 
-                # scan the first few and last few frames — the studio/title
-                # card usually sits behind a cold-open panel or two, and the
-                # end-of-chapter credits card behind the final story beat.
                 _drop = set()
                 _n = len(frame_paths)
+                for i in range(_n):
+                    if _definite_promo_or_credit(i):
+                        _drop.add(i)
+                _sfx_floor = max(4, int(0.65 * _n))
+                _sfx_dropped = 0
+                for i in range(_n):
+                    if i in _drop:
+                        continue
+                    if (_n - len(_drop) - 1) >= _sfx_floor:
+                        _fe_i = manifest.frames[i] if (manifest and i < len(manifest.frames)) else None
+                        if _is_empty_sfx_filler(frame_paths[i], _fe_i, _get_ne(i)):
+                            _drop.add(i)
+                            _sfx_dropped += 1
                 _window = min(4, _n // 3)
                 for i in list(range(_window)) + list(range(_n - _window, _n)):
                     if 0 <= i < _n and i not in _drop and _boundary_credits(i):
@@ -7645,28 +8563,38 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                     frame_sources = [frame_sources[i] for i in _keep]
                     if manifest and manifest.frames:
                         manifest.frames = [manifest.frames[i] for i in _keep if i < len(manifest.frames)]
-                    log.info("[%s] dropped %d boundary credits/title frame(s)", chapter.tag, len(_drop))
+                    log.info("[%s] dropped %d boundary credits / SFX-filler frame(s) (%d sfx/filler)",
+                             chapter.tag, len(_drop), _sfx_dropped)
 
             # Near-duplicate drop: webtoons repeat panels ("previously on…"
             # strips, flashbacks). Keep the FIRST occurrence, drop repeats.
-            # In-chapter always; cross-chapter (flashbacks) only when
-            # RECAP_DEDUP_CROSS=1 and with a tighter threshold. Never drops
-            # below a 55%%-of-frames floor.
+            # Cross-chapter flashback dedup enabled by default (RECAP_DEDUP_CROSS=1)
+            # with a bounded sliding window + exact-set fast path.
             if (os.environ.get("RECAP_DEDUP_FRAMES", "1").lower() not in ("0", "false", "no")
                     and len(frame_paths) > 6):
                 _in_dist = int(os.environ.get("RECAP_DEDUP_DIST", "26"))   # of 512 bits (~95%)
                 _x_dist = int(os.environ.get("RECAP_DEDUP_CROSS_DIST", "16"))
-                _cross = os.environ.get("RECAP_DEDUP_CROSS", "0").lower() in ("1", "true", "yes")
-                _hashes = [_frame_dhash(p) for p in frame_paths]
+                _cross = os.environ.get("RECAP_DEDUP_CROSS", "1").lower() not in ("0", "false", "no")
+                _hashes = []
+                for idx_h, p in enumerate(frame_paths):
+                    fe_h = manifest.frames[idx_h] if (manifest and idx_h < len(manifest.frames)) else None
+                    if fe_h and getattr(fe_h, "dhash", None):
+                        try:
+                            _hashes.append(int(fe_h.dhash, 16))
+                            continue
+                        except ValueError:
+                            pass
+                    _hashes.append(_frame_dhash(p))
                 _kept_h: List[int] = []
                 _keep, _ddrop = [], 0
                 _floor = max(6, int(0.55 * len(frame_paths)))
                 for i, h in enumerate(_hashes):
-                    if h is None:
+                    _fe_d = manifest.frames[i] if (manifest and i < len(manifest.frames)) else None
+                    if h is None or (_fe_d and getattr(_fe_d, "scroll_group", None)):
                         _keep.append(i); continue
                     dup = any(_ham64(h, kh) <= _in_dist for kh in _kept_h)
                     if not dup and _cross:
-                        dup = any(_ham64(h, sh) <= _x_dist for sh in _RECAP_SEEN_HASHES)
+                        dup = (h in _RECAP_SEEN_SET) or any(_ham64(h, sh) <= _x_dist for sh in _RECAP_SEEN_HASHES)
                     if dup and (len(_keep) + (len(_hashes) - i - 1)) > _floor:
                         _ddrop += 1
                         continue
@@ -7679,7 +8607,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                         manifest.frames = [manifest.frames[i] for i in _keep if i < len(manifest.frames)]
                     log.info("[%s] dropped %d near-duplicate frame(s) (%d -> %d)",
                              chapter.tag, _ddrop, len(_keep) + _ddrop, len(_keep))
-                _RECAP_SEEN_HASHES.extend(h for h in _kept_h if h is not None)
+                _record_seen_hashes(_kept_h)
 
             log.info("[%s] %d canonical frames from %d source pages", chapter.tag, len(frame_paths), len(chapter.panel_paths))
             cfg.write_progress("render", chapter.index - 1, total,
@@ -8046,6 +8974,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             len(placeholder_chapters), total, ", ".join(placeholder_chapters),
         )
 
+    _shutdown_kokoro_pool()
+
     if cfg.intro:
         try:
             cfg.write_progress("merge", total, total, "Building intro")
@@ -8109,6 +9039,11 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             "not a silent success.",
             dropped_chapters, total, len(placeholder_chapters), total,
         )
+        if dropped_chapters + len(placeholder_chapters) >= total:
+            cfg.write_progress("render", total, total, "All chapters failed to render (placeholder only)", status="error")
+            raise RuntimeError(
+                f"All {total} chapter(s) failed to render and fell back to black placeholders"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -8161,10 +9096,12 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         help="Override the narration model name (default: openai_model or groq_model depending on provider).",
     )
     parser.add_argument(
-        "--narration-style", default="verbatim", choices=["verbatim", "cleanup", "recap"],
-        help="verbatim (default): the OCR's own words in order, no LLM, no translation. "
-             "cleanup: same words, LLM fixes reading order + OCR splits only. "
-             "recap: first-person retell (LLM).",
+        "--narration-style", default="verbatim", choices=["verbatim", "cleanup", "recap", "dramatic", "concise"],
+        help="verbatim (default): the OCR's own words in order. "
+             "cleanup: fix OCR order/typos/SFX. "
+             "recap: smooth story narration. "
+             "dramatic: suspenseful pacing with pauses. "
+             "concise: fast plot-only lines.",
     )
     parser.add_argument(
         "--observer", action="store_true",
@@ -8338,27 +9275,115 @@ def run_slice_only(cfg: PipelineConfig) -> None:
     total_frames = 0
     _SUB_LABEL = {"frame": "Slicing panels", "ocr": "Reading panel text",
                   "visual": "Describing panels"}
-    for _idx, chapter in enumerate(chapters):
-        t0 = time.time()
-        log.info("--- Chapter %d/%d (%s) ---", chapter.index, total, chapter.name)
+    if total > 1 and os.environ.get("RECAP_FRAME_MODE", "page").lower() != "panel":
+        from concurrent.futures import ThreadPoolExecutor
+        _inflight = threading.Semaphore(max(1, int(os.environ.get("RECAP_SLICE_AHEAD", "3"))))
+        _prog_lock = threading.Lock()
+        _done_ocr = [0]
+        _max_frac_written = [0.0]
+        _slicing_done = [False]
 
-        def _cb(sub, frac, _ci=_idx, _cn=chapter.index):
-            cfg.write_progress(
-                "slice", _ci, total,
-                f"Chapter {_cn}/{total}: {_SUB_LABEL.get(sub, sub)}…",
-                frac=frac, substage=sub,
-            )
+        def _emit_slice_prog(msg: str, sub: str, done_units: float):
+            with _prog_lock:
+                cur = max(_max_frac_written[0], min(float(total), done_units))
+                _max_frac_written[0] = cur
+                c_idx = min(total, int(cur))
+                c_frac = max(0.0, min(1.0, cur - c_idx))
+                eff_sub = "frame" if not _slicing_done[0] else sub
+                cfg.write_progress("slice", c_idx, total, msg, frac=c_frac, substage=eff_sub)
 
-        _cb("frame", 0.0)
-        frame_data = slice_chapter_panels(cfg, chapter, phase_cb=_cb)
-        n = len(frame_data)
-        total_frames += n
-        dt = time.time() - t0
-        log.info("[%s] %d frames from %d source panels (%.1fs)",
-                 chapter.tag, n, len(chapter.panel_paths), dt)
-        cfg.write_progress("slice", _idx, total,
-                           f"Chapter {chapter.index}/{total}: {n} panels ready",
-                           frac=1.0, substage="ocr")
+        ocr_futures = []
+        with ThreadPoolExecutor(max_workers=1) as ocr_ex:
+            for _idx, chapter in enumerate(chapters):
+                t0 = time.time()
+                log.info("--- Chapter %d/%d (%s) ---", chapter.index, total, chapter.name)
+
+                out_dir = cfg.temp_slices_dir / chapter.tag
+                manifest_path = out_dir / "manifest.json"
+                is_valid, manifest, reason = validate_canonical_manifest(manifest_path, chapter, job_id=cfg.job_id)
+                if is_valid and manifest:
+                    log.info("[%s] canonical manifest verified (%d frames, %s) — skipping slicing",
+                             chapter.tag, len(manifest.frames), reason)
+                    total_frames += len(manifest.frames)
+                    with _prog_lock:
+                        _done_ocr[0] += 1
+                        cur_done = _done_ocr[0]
+                    _emit_slice_prog(f"Chapter {chapter.index}/{total}: verified ({cur_done}/{total} ready)", "ocr", float(cur_done))
+                    continue
+
+                _inflight.acquire()
+                try:
+                    _emit_slice_prog(
+                        f"Chapter {chapter.index}/{total}: Slicing panels…",
+                        "frame",
+                        _done_ocr[0] + 0.15,
+                    )
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    frame_entries = _frame_pages_reference_style(cfg, chapter, out_dir)
+                    n = len(frame_entries)
+                    total_frames += n
+                    log.info("[%s] framed %d panels from %d source pages in %.1fs — queuing OCR",
+                             chapter.tag, n, len(chapter.panel_paths), time.time() - t0)
+                except Exception:
+                    _inflight.release()
+                    raise
+
+                def _finish_ocr(_ch=chapter, _fe=frame_entries, _mp=manifest_path, _n=n, _t0=t0):
+                    try:
+                        def _cb_inner(sub, frac):
+                            _emit_slice_prog(
+                                f"Chapter {_ch.index}/{total}: {_SUB_LABEL.get(sub, sub)}…",
+                                sub,
+                                _done_ocr[0] + max(0.0, min(0.95, frac)),
+                            )
+                        _cb_inner("ocr", 0.40)
+                        _ocr_frames_into_narration_json(cfg, _ch, _fe, phase_cb=_cb_inner)
+                        mf = CanonicalManifest(
+                            manifest_version=MANIFEST_VERSION,
+                            job_id=cfg.job_id,
+                            chapter_tag=_ch.tag,
+                            source_pages=[p.name for p in _ch.panel_paths],
+                            frames=_fe,
+                        )
+                        mf.save(_mp)
+                        log.info("[%s] %d frames + OCR complete (%.1fs total)", _ch.tag, _n, time.time() - _t0)
+                        with _prog_lock:
+                            _done_ocr[0] += 1
+                            cur_done = _done_ocr[0]
+                        _emit_slice_prog(
+                            f"Chapter {_ch.index}/{total}: {_n} panels ready ({cur_done}/{total})",
+                            "ocr",
+                            float(cur_done),
+                        )
+                    finally:
+                        _inflight.release()
+
+                ocr_futures.append(ocr_ex.submit(_finish_ocr))
+            _slicing_done[0] = True
+            for fut in ocr_futures:
+                fut.result()
+    else:
+        for _idx, chapter in enumerate(chapters):
+            t0 = time.time()
+            log.info("--- Chapter %d/%d (%s) ---", chapter.index, total, chapter.name)
+
+            def _cb(sub, frac, _ci=_idx, _cn=chapter.index):
+                cfg.write_progress(
+                    "slice", _ci, total,
+                    f"Chapter {_cn}/{total}: {_SUB_LABEL.get(sub, sub)}…",
+                    frac=frac, substage=sub,
+                )
+
+            _cb("frame", 0.0)
+            frame_data = slice_chapter_panels(cfg, chapter, phase_cb=_cb)
+            n = len(frame_data)
+            total_frames += n
+            dt = time.time() - t0
+            log.info("[%s] %d frames from %d source panels (%.1fs)",
+                     chapter.tag, n, len(chapter.panel_paths), dt)
+            cfg.write_progress("slice", _idx, total,
+                               f"Chapter {chapter.index}/{total}: {n} panels ready",
+                               frac=1.0, substage="ocr")
     log.info("=== SLICE-ONLY DONE: %d chapters, %d total frames in %.1fs ===",
              total, total_frames, time.time() - start)
     cfg.write_progress("done", total, total,

@@ -22,6 +22,10 @@ import {
   Sparkles,
   Film,
   Eye,
+  Music,
+  Gauge,
+  Layout,
+  Type,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -59,6 +63,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [language, setLanguage] = useState("en");
   const [chapterLimit, setChapterLimit] = useState(5);
   const [voice, setVoice] = useState("am_michael");
+  const [extraVoices, setExtraVoices] = useState<Array<{ value: string; label: string; gender: "male" | "female" }>>([]);
   const [groqKey, setGroqKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
   const [openRouterKey, setOpenRouterKey] = useState("");
@@ -68,7 +73,15 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   const [megaPassword, setMegaPassword] = useState("");
   const [autoArchive, setAutoArchive] = useState(false);
   const [translate, setTranslate] = useState(false);
-  const [narrationStyle, setNarrationStyle] = useState<"verbatim" | "cleanup" | "recap">("verbatim");
+  const [narrationStyle, setNarrationStyle] = useState<"verbatim" | "cleanup" | "recap" | "dramatic" | "concise">("verbatim");
+  const [narrationSpeed, setNarrationSpeed] = useState<"slow" | "normal" | "fast" | "brisk">("normal");
+  const [frameStyle, setFrameStyle] = useState<"blur" | "cover" | "dark">("blur");
+  const [useBgm, setUseBgm] = useState(true);
+  const [bgmPath, setBgmPath] = useState("default_cinematic.mp3");
+  const [bgmTracks, setBgmTracks] = useState<Array<{ name: string; size: number; isDefault: boolean }>>([]);
+  const [bgmVolume, setBgmVolume] = useState<"subtle" | "balanced" | "bold">("balanced");
+  const [includeIntro, setIncludeIntro] = useState(true);
+  const [watermark, setWatermark] = useState("Denji Recaps");
   const [describeVisuals, setDescribeVisuals] = useState(false);
   const [visualProvider, setVisualProvider] = useState<"auto" | "ollama" | "groq" | "gemini" | "openrouter">("auto");
   const [motionStyle, setMotionStyle] = useState<"none" | "kenburns">("none");
@@ -93,10 +106,16 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
   useEffect(() => {
     (async () => {
       try {
-        const [settingsRes, chaptersRes] = await Promise.all([
+        const [settingsRes, chaptersRes, bgmRes] = await Promise.all([
           fetch("/api/settings").then((r) => r.json()),
-          fetch(`/api/manga/${manga.id}`).then((r) => r.json()),
+          fetch(`/api/manga/${manga.id}?title=${encodeURIComponent(manga.title)}${manga.contentRating === "erotica" ? "&adult=1" : ""}`).then((r) => r.json()),
+          fetch("/api/bgm").then((r) => (r.ok ? r.json() : { tracks: [] })).catch(() => ({ tracks: [] })),
         ]);
+        const tracks = (bgmRes?.tracks ?? []) as Array<{ name: string; size: number; isDefault: boolean }>;
+        setBgmTracks(tracks);
+        if (tracks.length > 0 && !tracks.some((t) => t.name === "default_cinematic.mp3")) {
+          setBgmPath(tracks[0].name);
+        }
         const s = settingsRes.settings ?? settingsRes;
         setSettings(s);
         setGroqKey(s.groqKey ?? "");
@@ -110,6 +129,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
         setVoice(s.defaultVoice ?? "am_michael");
         setChapterLimit(s.defaultChapterLimit ?? 5);
 
+        if (Array.isArray(chaptersRes.extraVoices)) setExtraVoices(chaptersRes.extraVoices);
         const allChapters: ChapterFeedItem[] = chaptersRes.chapters ?? [];
         setChapters(allChapters);
 
@@ -145,9 +165,9 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
 
   const effectiveLimit = effectiveSelectedChapters.length;
   const selectedTotalImages = effectiveSelectedChapters.reduce((s, c) => s + (c.pages ?? 0), 0);
-  // Estimate: ~3 min per chapter (scrape + VLM + TTS + render)
-  const estimatedMinutes = Math.max(1, Math.round(effectiveLimit * 3));
-  const estimatedVideoDuration = Math.max(2, Math.round(effectiveLimit * 4));
+  // Estimate: ~1.9 min per chapter in Turbo mode (scrape + RapidOCR + Kokoro INT8 + 4fps render)
+  const estimatedMinutes = Math.max(1, Math.round(effectiveLimit * 1.9));
+  const estimatedVideoDuration = Math.max(2, Math.round(effectiveLimit * 7));
 
   // Chapter selection helpers (for specific mode)
   const toggleChapter = useCallback((id: string) => {
@@ -235,6 +255,11 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           translate,
           narrate: narrationStyle !== "verbatim",
           narrationStyle,
+          narrationSpeed,
+          frameStyle,
+          bgmVolume,
+          includeIntro,
+          watermark,
           describeVisuals,
           visualProvider,
           motionStyle,
@@ -247,7 +272,8 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
           megaEmail: megaEmail || undefined,
           megaPassword: megaPassword || undefined,
           autoArchive,
-          useBgm: false,
+          bgmPath: useBgm ? bgmPath : null,
+          useBgm,
         }),
       });
       if (!res.ok) {
@@ -261,7 +287,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
     } finally {
       setStarting(false);
     }
-  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrationStyle, describeVisuals, visualProvider, motionStyle, reviewPanels, manga, onJobCreated]);
+  }, [groqKey, geminiKey, openRouterKey, zhipuKey, siliconFlowKey, megaEmail, megaPassword, autoArchive, voice, language, chapterLimit, chapterSelectionMode, selectedChapterIds, translate, narrationStyle, narrationSpeed, frameStyle, useBgm, bgmPath, bgmVolume, includeIntro, watermark, describeVisuals, visualProvider, motionStyle, reviewPanels, manga, onJobCreated]);
 
   // --- Voice preview ---
   // Fetches a short edge-tts sample for the selected voice and plays it.
@@ -370,7 +396,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
       <div className="flex flex-col sm:flex-row gap-6 p-6 rounded-xl border border-border bg-card">
         <div className="w-32 sm:w-40 aspect-[3/4] rounded-lg overflow-hidden bg-muted flex-shrink-0 border border-border">
           {manga.coverUrl ? (
-            <img src={manga.coverUrl} alt={manga.title} className="w-full h-full object-cover" />
+            <img src={`/api/cover?url=${encodeURIComponent(manga.coverUrl)}`} alt={manga.title} referrerPolicy="no-referrer" className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-muted-foreground text-xs">
               No cover
@@ -614,6 +640,7 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
             Narration voice
           </Label>
           <VoiceSelector
+            extraVoices={extraVoices}
             value={voice}
             onChange={setVoice}
             previewLoading={previewLoading}
@@ -650,18 +677,138 @@ export function MangaConfig({ manga, onBack, onJobCreated }: MangaConfigProps) {
             <div className="space-y-0.5 min-w-0">
               <Label className="text-sm font-medium">Narration style</Label>
               <p className="text-xs text-muted-foreground">
-                Verbatim: transcribed words as-is (no AI). Cleanup: fix OCR
-                order/typos only. Recap: rewrite into a flowing script.
+                Verbatim: OCR words as-is. Cleanup: fix case/OCR/SFX. Story Recap: smooth lines. Dramatic: suspense pauses. Concise: tight plot beats (works offline too).
               </p>
             </div>
             <Select value={narrationStyle} onValueChange={(v) => setNarrationStyle(v as typeof narrationStyle)}>
-              <SelectTrigger className="w-32 shrink-0"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="w-36 shrink-0"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="verbatim">Verbatim</SelectItem>
-                <SelectItem value="cleanup">Cleanup</SelectItem>
-                <SelectItem value="recap">Recap</SelectItem>
+                <SelectItem value="cleanup">Cleanup (Fix OCR)</SelectItem>
+                <SelectItem value="recap">Story Recap</SelectItem>
+                <SelectItem value="dramatic">Dramatic</SelectItem>
+                <SelectItem value="concise">Concise</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+
+          {/* Narration speed & pacing */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <Gauge className="h-3.5 w-3.5 text-muted-foreground" />
+                Narration speed &amp; pacing
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Controls Kokoro speech rate and minimum panel hold duration.
+              </p>
+            </div>
+            <Select value={narrationSpeed} onValueChange={(v) => setNarrationSpeed(v as typeof narrationSpeed)}>
+              <SelectTrigger className="w-36 shrink-0"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="slow">Slow (0.9x)</SelectItem>
+                <SelectItem value="normal">Normal (1.0x)</SelectItem>
+                <SelectItem value="fast">Fast (1.15x)</SelectItem>
+                <SelectItem value="brisk">Brisk (1.25x)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Panel framing style */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium">
+                <Layout className="h-3.5 w-3.5 text-muted-foreground" />
+                Panel framing style
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Cinema Blur fills sides with a blurred backdrop; Full-Width Cover zooms clean tall panels; Dark Matte uses a clean studio backdrop.
+              </p>
+            </div>
+            <Select value={frameStyle} onValueChange={(v) => setFrameStyle(v as typeof frameStyle)}>
+              <SelectTrigger className="w-40 shrink-0"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="blur">Cinema Blur (16:9)</SelectItem>
+                <SelectItem value="cover">Full-Width Cover</SelectItem>
+                <SelectItem value="dark">Dark Studio Matte</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Background music */}
+          <div className="p-3 space-y-2.5">
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-0.5 min-w-0">
+                <Label className="flex items-center gap-2 text-sm font-medium">
+                  <Music className="h-3.5 w-3.5 text-muted-foreground" />
+                  Background music (BGM)
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  Sidechain-ducked ambient music mixed smoothly beneath narration.
+                </p>
+              </div>
+              <Switch checked={useBgm} onCheckedChange={setUseBgm} />
+            </div>
+            {useBgm && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <Select value={bgmPath} onValueChange={setBgmPath}>
+                  <SelectTrigger className="w-full h-8 text-xs"><SelectValue placeholder="Select track" /></SelectTrigger>
+                  <SelectContent>
+                    {(bgmTracks.length > 0
+                      ? bgmTracks
+                      : [
+                          { name: "default_cinematic.mp3", size: 0, isDefault: true },
+                          { name: "dark_tension.mp3", size: 0, isDefault: false },
+                          { name: "epic_action.mp3", size: 0, isDefault: false },
+                        ]
+                    ).map((t) => (
+                      <SelectItem key={t.name} value={t.name}>
+                        {t.name.replace(/\.[^.]+$/, "").replace(/_/g, " ")}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={bgmVolume} onValueChange={(v) => setBgmVolume(v as typeof bgmVolume)}>
+                  <SelectTrigger className="w-full h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="subtle">Volume: Subtle (20%)</SelectItem>
+                    <SelectItem value="balanced">Volume: Balanced (35%)</SelectItem>
+                    <SelectItem value="bold">Volume: Bold (50%)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
+
+          {/* Spoken intro card */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="text-sm font-medium">Spoken intro title card</Label>
+              <p className="text-xs text-muted-foreground">
+                Include a spoken series/chapter title card at the start of the video.
+              </p>
+            </div>
+            <Switch checked={includeIntro} onCheckedChange={setIncludeIntro} />
+          </div>
+
+          {/* Channel watermark */}
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div className="space-y-0.5 min-w-0">
+              <Label className="flex items-center gap-2 text-sm font-medium" htmlFor="watermarkInput">
+                <Type className="h-3.5 w-3.5 text-muted-foreground" />
+                Channel watermark
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Overlay text shown in the bottom-right corner (leave blank for none).
+              </p>
+            </div>
+            <Input
+              id="watermarkInput"
+              value={watermark}
+              onChange={(e) => setWatermark(e.target.value)}
+              placeholder="None"
+              className="w-40 shrink-0 h-8 text-xs"
+            />
           </div>
 
           {/* Visual action captioning */}

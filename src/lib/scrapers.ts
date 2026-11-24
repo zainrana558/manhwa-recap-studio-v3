@@ -1,3 +1,4 @@
+import { getPrivateExt } from "@/lib/private-loader";
 /**
  * Multi-source manga scraper — 3 scraping APIs + 2 metadata APIs.
  *
@@ -605,11 +606,54 @@ export async function getAsuraScansImages(
 // SEARCH: MangaDex, MangaPill, Toonily
 // ---------------------------------------------------------------------------
 
+let _mdTagCache: Record<string, string> | null = null;
+async function getMangaDexTagMap(): Promise<Record<string, string>> {
+  if (_mdTagCache) return _mdTagCache;
+  try {
+    const res = await fetchWithTimeout("https://api.mangadex.org/manga/tag", {}, 10000);
+    if (!res.ok) return {};
+    const j = await res.json() as { data?: Array<{ id: string; attributes?: { name?: Record<string, string> } }> };
+    const map: Record<string, string> = {};
+    for (const t of j.data || []) {
+      const nm = (t.attributes?.name?.en || "").toLowerCase().trim();
+      if (nm) map[nm] = t.id;
+    }
+    _mdTagCache = map;
+    return map;
+  } catch {
+    return {};
+  }
+}
+
 export async function searchMangaDex(
   query: string,
-  limit = 10
+  limit = 10,
+  adult = false,
+  genre = ""
 ): Promise<MangadexManga[]> {
-  const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=${limit}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive&order[relevance]=desc`;
+  const ratings = adult
+    ? "contentRating[]=erotica&contentRating[]=pornographic&contentRating[]=suggestive"
+    : "contentRating[]=safe&contentRating[]=suggestive";
+  let tagParam = "";
+  let effectiveTitle = query.trim();
+  const gNorm = genre.trim().toLowerCase();
+  if (gNorm) {
+    const tagMap = await getMangaDexTagMap();
+    const aliases: Record<string, string[]> = {
+      milf: ["milf", "office workers"],
+      smut: ["smut", "sexual violence"],
+    };
+    const candidates = [gNorm, ...(aliases[gNorm] || [])];
+    const matchedIds = candidates.map((c) => tagMap[c]).filter(Boolean);
+    if (matchedIds.length > 0) {
+      tagParam = `&includedTags[]=${encodeURIComponent(matchedIds[0])}`;
+    } else if (!effectiveTitle) {
+      effectiveTitle = genre.trim();
+    }
+  }
+  const titleParam = effectiveTitle ? `title=${encodeURIComponent(effectiveTitle)}&` : "";
+  const orderParam = effectiveTitle ? "order[relevance]=desc" : "order[followedCount]=desc";
+  const url = `https://api.mangadex.org/manga?${titleParam}limit=${limit}&includes[]=cover_art&${ratings}${tagParam}&${orderParam}`;
   const res = await fetchWithTimeout(url, {}, 15000);
   if (!res.ok) throw new Error(`MangaDex search ${res.status}`);
   const data = await res.json() as {
@@ -702,78 +746,47 @@ export async function searchMangaPill(
   return results;
 }
 
-export async function searchToonily(
-  query: string,
-  limit = 10
-): Promise<MangadexManga[]> {
-  const url = `https://toonily.com/?s=${encodeURIComponent(query)}&post_type=wp-manga`;
-  const res = await fetchWithTimeout(url, {
-    headers: { "User-Agent": "Mozilla/5.0", Referer: "https://toonily.com/" },
-  }, 15000);
-  if (!res.ok) throw new Error(`Toonily search ${res.status}`);
-  const html = await res.text();
-
-  const results: MangadexManga[] = [];
-  // Madara theme: results are <div class="row c-tabs-item__content"> with
-  // <a href="https://toonily.com/serie/{slug}/"> and <img src="{cover}">
-  const regex = /href="https:\/\/toonily\.com\/serie\/([^/]+)\/?"[^>]*>[\s\S]*?(?:src="([^"]+)")?[\s\S]*?<h3[^>]*>\s*<a[^>]*>([^<]+)<\/a>/g;
-  let match;
-  while ((match = regex.exec(html)) !== null && results.length < limit) {
-    const slug = match[1];
-    const cover = match[2] || null;
-    const title = match[3].trim();
-    results.push({
-      id: `tl-${slug}`,
-      title,
-      description: "",
-      coverUrl: cover,
-      status: null,
-      year: null,
-      originalLanguage: "ko", // Toonily is manhwa-focused
-      availableTranslatedLanguages: ["en"],
-      tags: [],
-      contentRating: "safe",
-      lastChapter: null,
-      source: "toonily" as const,
-      externalUrl: `https://toonily.com/serie/${slug}/`,
-    });
-  }
-
-  return results;
-}
-
 // ---------------------------------------------------------------------------
 // Unified dispatcher: given a manga ID, determine the source and delegate.
 // ---------------------------------------------------------------------------
 
 export type ScraperSource =
+  | "asurascans"
+  | "thunderscans"
+  | "vortexscans"
+  | "rizzfables"
+  | "webtoons"
+  | "mgeko"
+  | "mangadex"
   | "mangahere"
   | "fanfox"
-  | "webtoons"
-  | "asurascans"
-  | "mangadex"
   | "mangapill"
-  | "toonily"
   | "comick"
   | "weebcentral"
-  | "mgeko";
+  | (string & {});
 
 export function getSourceFromId(id: string): ScraperSource | null {
   if (id.startsWith("mh-")) return "mangahere";
   if (id.startsWith("ff-")) return "fanfox";
   if (id.startsWith("wt-")) return "webtoons";
   if (id.startsWith("as-")) return "asurascans";
+  if (id.startsWith("ts-")) return "thunderscans";
+  if (id.startsWith("vs-")) return "vortexscans";
+  if (id.startsWith("rf-")) return "rizzfables";
   if (id.startsWith("md-")) return "mangadex";
   if (id.startsWith("mp-")) return "mangapill";
-  if (id.startsWith("tl-")) return "toonily";
   if (id.startsWith("cm-")) return "comick";
   if (id.startsWith("wc-")) return "weebcentral";
   if (id.startsWith("mg-")) return "mgeko";
+  const ext = getPrivateExt();
+  if (ext?.isPrivateId(id)) return ext.getSourceFromId(id);
   return null;
 }
 
 export function getSlugFromId(id: string): string {
-  return id.replace(/^(mh-|ff-|wt-|as-|md-|mp-|tl-|cm-|wc-|mg-)/, "");
+  const ext = getPrivateExt();
+  if (ext?.isPrivateId(id)) return ext.getSlugFromId(id) ?? id;
+  return id.replace(/^(mh-|ff-|wt-|as-|ts-|vs-|rf-|md-|mp-|cm-|wc-|mg-)/, "");
 }
 
 export async function getChaptersForSource(
@@ -789,18 +802,28 @@ export async function getChaptersForSource(
       return getWebtoonsChapters(parseInt(slug, 10));
     case "asurascans":
       return getAsuraScansChapters(slug);
+    case "thunderscans":
+      return getThunderScansChapters(slug);
+    case "vortexscans":
+      return getVortexScansChapters(slug);
+    case "rizzfables":
+      return getRizzFablesChapters(slug);
     case "mangadex":
       return getMangaDexChapters(slug);
     case "mangapill":
       return getMangaPillChapters(slug);
-    case "toonily":
-      return getToonilyChapters(slug);
     case "comick":
       return getComickChapters(slug);
     case "weebcentral":
       return getWeebCentralChapters(slug);
     case "mgeko":
       return getMgekoChapters(slug);
+    default: {
+      const ext = getPrivateExt();
+      const ch = await ext?.getChapters(source, slug);
+      if (ch) return ch;
+      throw new Error(`Unsupported source: ${source}`);
+    }
   }
 }
 
@@ -818,18 +841,28 @@ export async function getImagesForSource(
       return getWebtoonsImages(parseInt(slug, 10), parseInt(chapterId.replace(/^ep-/, ""), 10));
     case "asurascans":
       return getAsuraScansImages(slug, chapterId);
+    case "thunderscans":
+      return getThunderScansImages(slug, chapterId);
+    case "vortexscans":
+      return getVortexScansImages(slug, chapterId);
+    case "rizzfables":
+      return getRizzFablesImages(slug, chapterId);
     case "mangadex":
       return getMangaDexImages(slug, chapterId);
     case "mangapill":
       return getMangaPillImages(slug, chapterId);
-    case "toonily":
-      return getToonilyImages(slug, chapterId);
     case "comick":
       return getComickImages(slug, chapterId);
     case "weebcentral":
       return getWeebCentralImages(slug, chapterId);
     case "mgeko":
       return getMgekoImages(slug, chapterId);
+    default: {
+      const ext = getPrivateExt();
+      const imgs = await ext?.getImages(source, slug, chapterId);
+      if (imgs) return imgs;
+      throw new Error(`Unsupported source: ${source}`);
+    }
   }
 }
 
@@ -921,7 +954,7 @@ export async function getMgekoImages(_slug: string, chapterId: string): Promise<
   const re = /<img[^>]+(?:src|data-src)="(https?:\/\/[^"]+?\.(?:jpg|jpeg|png|webp))"/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    if (/logo|banner|avatar|icon/i.test(m[1]) || seen.has(m[1])) continue;
+    if (/logo|banner|avatar|icon|credits-mgeko|radioads|radioonlinehd|\/ads\/|vline\.png/i.test(m[1]) || seen.has(m[1])) continue;
     seen.add(m[1]);
     urls.push(m[1]);
   }
@@ -1462,4 +1495,329 @@ export async function getWeebCentralImages(
   }
   if (images.length === 0) throw new Error(`WeebCentral returned no images for chapter ${chapterId}`);
   return images;
+}
+
+
+// ---------------------------------------------------------------------------
+// ThunderScans (en-thunderscans.com) — WordPress MangaStream scanlator with
+// ultra-clean uniform 800x13000+ vertical webtoon strips, no Cloudflare.
+// `ts-{slug}` id form.
+// ---------------------------------------------------------------------------
+const THUNDER_WEB = "https://en-thunderscans.com";
+const SCAN_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+export async function searchThunderScans(query: string, limit = 12): Promise<MangadexManga[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const res = await fetchWithTimeout(`${THUNDER_WEB}/?s=${encodeURIComponent(q)}`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`ThunderScans search HTTP ${res.status}`);
+  const html = await res.text();
+  const cards = html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
+  const seen = new Set<string>();
+  const out: MangadexManga[] = [];
+  for (const card of cards) {
+    const hrefM = card.match(/href="https:\/\/en-thunderscans\.com\/comics\/([^"\/?]+)\/?"/i);
+    if (!hrefM) continue;
+    const slug = hrefM[1];
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const titleM =
+      card.match(/<div class="tt">\s*([^<]+?)\s*<\/div>/i) ||
+      card.match(/title="([^"]+)"/i);
+    const title = (titleM ? titleM[1] : slug.replace(/-/g, " "))
+      .replace(/&#8217;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .trim();
+    const imgM = card.match(/<img[^>]+src="([^"]+)"/i);
+    const coverUrl = imgM ? imgM[1] : null;
+    out.push({
+      id: `ts-${slug}`,
+      title,
+      description: "",
+      coverUrl,
+      status: null,
+      year: null,
+      originalLanguage: "ko",
+      availableTranslatedLanguages: ["en"],
+      tags: [],
+      contentRating: "safe",
+      lastChapter: null,
+      source: "thunderscans" as const,
+      externalUrl: `${THUNDER_WEB}/comics/${slug}/`,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+export async function getThunderScansChapters(slug: string): Promise<ScrapedChapter[]> {
+  const res = await fetchWithTimeout(`${THUNDER_WEB}/comics/${encodeURIComponent(slug)}/`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`ThunderScans series HTTP ${res.status}`);
+  const html = await res.text();
+  const re = /<li[^>]*data-num="([^"]+)"[^>]*>[\s\S]*?href="https:\/\/en-thunderscans\.com\/([^"\/]+)\/?"/gi;
+  const seen = new Set<string>();
+  const out: ScrapedChapter[] = [];
+  for (const m of html.matchAll(re)) {
+    const rawNum = m[1].trim();
+    const chSlug = m[2].trim();
+    if (!rawNum || rawNum.includes("{{") || seen.has(chSlug)) continue;
+    seen.add(chSlug);
+    out.push({
+      id: chSlug,
+      chapterNum: rawNum,
+      title: null,
+      language: "en",
+      pageCount: 0,
+      external: false,
+    });
+  }
+  out.sort((a, b) => (parseFloat(a.chapterNum || "0") || 0) - (parseFloat(b.chapterNum || "0") || 0));
+  return out;
+}
+
+export async function getThunderScansImages(_slug: string, chapterSlug: string): Promise<ScrapedImage[]> {
+  const res = await fetchWithTimeout(`${THUNDER_WEB}/${encodeURIComponent(chapterSlug)}/`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`ThunderScans chapter HTTP ${res.status}`);
+  const html = await res.text();
+  const m = html.match(/"images"\s*:\s*\[([^\]]+)\]/);
+  const seen = new Set<string>();
+  const out: ScrapedImage[] = [];
+  if (m) {
+    for (const im of m[1].matchAll(/"(https?:[^"]+)"/g)) {
+      const u = im[1].replace(/\\\//g, "/");
+      if (!seen.has(u) && !/logo|icon|banner|discord/i.test(u)) {
+        seen.add(u);
+        out.push({ url: u, referer: `${THUNDER_WEB}/` });
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// VortexScans (vortexscans.org) â€” Iken JSON REST API + 800x5000 WebP strips
+// (same uniform vertical strip format as AsuraScans). `vs-{postId}--{slug}`.
+// ---------------------------------------------------------------------------
+const VORTEX_API = "https://api.vortexscans.org";
+const VORTEX_WEB = "https://vortexscans.org";
+
+function parseVortexSlug(raw: string): { postId: string; slug: string } {
+  const idx = raw.indexOf("--");
+  if (idx > 0) {
+    return { postId: raw.slice(0, idx), slug: raw.slice(idx + 2) };
+  }
+  return { postId: "", slug: raw };
+}
+
+export async function searchVortexScans(query: string, limit = 12): Promise<MangadexManga[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const url = `${VORTEX_API}/api/query?searchTerm=${encodeURIComponent(q)}&perPage=${Math.min(Math.max(limit, 1), 25)}&page=1`;
+  const res = await fetchWithTimeout(url, {
+    headers: { "User-Agent": SCAN_UA, Accept: "application/json" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`VortexScans search HTTP ${res.status}`);
+  const body = (await res.json()) as {
+    posts?: Array<{
+      id: number;
+      slug: string;
+      postTitle: string;
+      postContent?: string | null;
+      featuredImage?: string | null;
+      seriesStatus?: string | null;
+      genres?: Array<{ name?: string }>;
+    }>;
+  };
+  return (body.posts ?? [])
+    .filter((p) => p?.id && p?.slug && p?.postTitle && !/\[novel\]/i.test(p.postTitle))
+    .slice(0, limit)
+    .map((p) => ({
+      id: `vs-${p.id}--${p.slug}`,
+      title: p.postTitle,
+      description: (p.postContent ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+      coverUrl: p.featuredImage || null,
+      status: p.seriesStatus ? p.seriesStatus.charAt(0) + p.seriesStatus.slice(1).toLowerCase() : null,
+      year: null,
+      originalLanguage: "ko",
+      availableTranslatedLanguages: ["en"],
+      tags: (p.genres ?? []).map((g) => g.name).filter((n): n is string => Boolean(n)),
+      contentRating: "safe",
+      lastChapter: null,
+      source: "vortexscans" as const,
+      externalUrl: `${VORTEX_WEB}/series/${p.slug}`,
+    }));
+}
+
+export async function getVortexScansChapters(compoundSlug: string): Promise<ScrapedChapter[]> {
+  const { postId } = parseVortexSlug(compoundSlug);
+  if (!postId) return [];
+  const url = `${VORTEX_API}/api/chapters?postId=${encodeURIComponent(postId)}&take=500&order=asc`;
+  const res = await fetchWithTimeout(url, {
+    headers: { "User-Agent": SCAN_UA, Accept: "application/json" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`VortexScans chapters HTTP ${res.status}`);
+  const body = (await res.json()) as {
+    post?: {
+      chapters?: Array<{
+        slug: string;
+        number?: number | string | null;
+        title?: string | null;
+        isLocked?: boolean;
+      }>;
+    };
+  };
+  const raw = (body.post?.chapters ?? []).filter((c) => c?.slug && !c.isLocked);
+  const out: ScrapedChapter[] = raw.map((c) => ({
+    id: c.slug,
+    chapterNum: c.number != null ? String(c.number) : null,
+    title: c.title || null,
+    language: "en",
+    pageCount: 0,
+    external: false,
+  }));
+  out.sort((a, b) => (parseFloat(a.chapterNum || "0") || 0) - (parseFloat(b.chapterNum || "0") || 0));
+  return out;
+}
+
+export async function getVortexScansImages(compoundSlug: string, chapterSlug: string): Promise<ScrapedImage[]> {
+  const { slug } = parseVortexSlug(compoundSlug);
+  const res = await fetchWithTimeout(
+    `${VORTEX_WEB}/series/${encodeURIComponent(slug)}/${encodeURIComponent(chapterSlug)}`,
+    {
+      headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+      cache: "no-store",
+    }
+  );
+  if (!res.ok) throw new Error(`VortexScans chapter HTTP ${res.status}`);
+  const html = await res.text();
+  const re = /https:\/\/storage\.vortexscans\.org\/upload\/series\/[^"'\\<>\s]+\.(?:webp|jpg|jpeg|png)/gi;
+  const seen = new Set<string>();
+  const out: ScrapedImage[] = [];
+  for (const m of html.matchAll(re)) {
+    const u = m[0];
+    if (u.includes("/featured/") || seen.has(u)) continue;
+    seen.add(u);
+    out.push({ url: u, referer: `${VORTEX_WEB}/` });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// RizzFables (rizzfables.com) â€” WordPress MangaStream scanlator with uniform
+// 900px-wide tall vertical WebP strips, no Cloudflare challenge. `rf-{slug}`.
+// ---------------------------------------------------------------------------
+const RIZZ_WEB = "https://rizzfables.com";
+
+export async function searchRizzFables(query: string, limit = 12): Promise<MangadexManga[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const res = await fetchWithTimeout(`${RIZZ_WEB}/?s=${encodeURIComponent(q)}`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`RizzFables search HTTP ${res.status}`);
+  const html = await res.text();
+  const cards = html.match(/<div class="bsx">[\s\S]*?<\/div>\s*<\/div>/g) ?? [];
+  const seen = new Set<string>();
+  const out: MangadexManga[] = [];
+  for (const card of cards) {
+    const hrefM = card.match(/href="https:\/\/rizzfables\.com\/series\/([^"\/]+)\/?"/i);
+    if (!hrefM) continue;
+    const slug = hrefM[1];
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const titleM =
+      card.match(/<div class="tt">\s*([^<]+?)\s*<\/div>/i) ||
+      card.match(/title="([^"]+)"/i);
+    const title = (titleM ? titleM[1] : slug.replace(/-/g, " "))
+      .replace(/&#8217;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .trim();
+    const imgM = card.match(/<img[^>]+src="([^"]+)"/i);
+    let coverUrl = imgM ? imgM[1] : null;
+    if (coverUrl && coverUrl.startsWith("/")) {
+      coverUrl = `${RIZZ_WEB}${coverUrl}`;
+    }
+    out.push({
+      id: `rf-${slug}`,
+      title,
+      description: "",
+      coverUrl,
+      status: null,
+      year: null,
+      originalLanguage: "ko",
+      availableTranslatedLanguages: ["en"],
+      tags: [],
+      contentRating: "safe",
+      lastChapter: null,
+      source: "rizzfables" as const,
+      externalUrl: `${RIZZ_WEB}/series/${slug}`,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+export async function getRizzFablesChapters(slug: string): Promise<ScrapedChapter[]> {
+  const res = await fetchWithTimeout(`${RIZZ_WEB}/series/${encodeURIComponent(slug)}`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`RizzFables series HTTP ${res.status}`);
+  const html = await res.text();
+  const re = /<li[^>]*data-num="([^"]+)"[^>]*>[\s\S]*?href="https:\/\/rizzfables\.com\/chapter\/([^"\/]+)\/?"/gi;
+  const seen = new Set<string>();
+  const out: ScrapedChapter[] = [];
+  for (const m of html.matchAll(re)) {
+    const rawNum = m[1].trim();
+    const chSlug = m[2].trim();
+    if (!rawNum || rawNum.includes("{{") || seen.has(chSlug)) continue;
+    seen.add(chSlug);
+    out.push({
+      id: chSlug,
+      chapterNum: rawNum,
+      title: null,
+      language: "en",
+      pageCount: 0,
+      external: false,
+    });
+  }
+  // Chapter list is newest-first on the page â€” sort ascending by chapter number.
+  out.sort((a, b) => (parseFloat(a.chapterNum || "0") || 0) - (parseFloat(b.chapterNum || "0") || 0));
+  return out;
+}
+
+export async function getRizzFablesImages(_slug: string, chapterSlug: string): Promise<ScrapedImage[]> {
+  const res = await fetchWithTimeout(`${RIZZ_WEB}/chapter/${encodeURIComponent(chapterSlug)}`, {
+    headers: { "User-Agent": SCAN_UA, Accept: "text/html,*/*" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`RizzFables chapter HTTP ${res.status}`);
+  const html = await res.text();
+  const areaM = html.match(/<div[^>]+id="readerarea"[^>]*>([\s\S]*?)<\/div>/i);
+  const scope = areaM ? areaM[1] : html;
+  const re = /src="(https?:\/\/[^"]+\.(?:webp|jpg|jpeg|png)(?:\?[^"]*)?)"/gi;
+  const seen = new Set<string>();
+  const out: ScrapedImage[] = [];
+  for (const m of scope.matchAll(re)) {
+    const u = m[1];
+    if (seen.has(u) || /logo|icon|avatar|banner|discord/i.test(u)) continue;
+    seen.add(u);
+    out.push({ url: u, referer: `${RIZZ_WEB}/` });
+  }
+  return out;
 }

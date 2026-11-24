@@ -5,21 +5,41 @@ import { workDir, datasetDir } from "@/lib/paths";
 
 export const dynamic = "force-dynamic";
 
+type NarrationEntry = { text: string; status: string; visual?: string };
+
+async function readChapterNarration(
+  id: string,
+  chapter: number,
+): Promise<Record<string, NarrationEntry> | null> {
+  try {
+    const raw = await fs.readFile(
+      path.join(datasetDir(id), `chapter_${String(chapter).padStart(3, "0")}`, "narration.json"),
+      "utf8",
+    );
+    const list = JSON.parse(raw) as Array<{ image: string; text: string; status: string; visual?: string }>;
+    const map: Record<string, NarrationEntry> = {};
+    for (const n of list) map[n.image] = { text: n.text || "", status: n.status || "", visual: n.visual };
+    return map;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * GET /api/frames/{id}?limit=16
  *
  * Live view of the panels the pipeline is currently slicing / captioning /
- * rendering. Reads the sliced frames under work/temp_slices/chap_XXX/ and pairs
- * each with its transcription + visual caption from that chapter's
- * dataset/chapter_XXX/narration.json.
+ * rendering. Reads sliced frames under work/temp_slices/chap_XXX/ and pairs
+ * each with its transcription + visual caption from narration.json.
  *
- * Returns the most recently written frames (by mtime) so the UI shows a live
- * "what's being processed right now" filmstrip. Empty once a finished job's
- * work/ dir is cleaned up — that's expected; the final video is the artifact.
+ * For live strip polls (without ?all=1), stats ONLY the directory metadata
+ * across chapters (~N stats) rather than every individual frame file (~27k+
+ * stats on 300+ chapter jobs), then stats individual frames only inside the
+ * newest active chapters.
  */
 export async function GET(
   req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
   if (!id || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
@@ -40,52 +60,82 @@ export async function GET(
     return NextResponse.json({ frames: [], ready: false });
   }
 
-  type Row = { chapter: number; name: string; mtime: number };
-  const rows: Row[] = [];
-  const narrationCache = new Map<number, Record<string, { text: string; status: string; visual?: string }>>();
-
-  for (const cd of chapDirs) {
-    const chapter = parseInt(cd.replace(/\D/g, ""), 10);
-    if (!Number.isFinite(chapter)) continue;
-    let entries: string[] = [];
-    try {
-      entries = (await fs.readdir(path.join(slicesRoot, cd))).filter((f) =>
-        /^frame_\d+\.jpe?g$/i.test(f)
-      );
-    } catch {
-      continue;
-    }
-    for (const f of entries) {
+  type ChapMeta = { cd: string; chapter: number; entries: string[]; dirMtime: number };
+  const metasRaw = await Promise.all(
+    chapDirs.map(async (cd): Promise<ChapMeta | null> => {
+      const chapter = parseInt(cd.replace(/\D/g, ""), 10);
+      if (!Number.isFinite(chapter)) return null;
+      const dirPath = path.join(slicesRoot, cd);
       try {
-        const st = await fs.stat(path.join(slicesRoot, cd, f));
-        rows.push({ chapter, name: f, mtime: st.mtimeMs });
+        const [files, st] = await Promise.all([fs.readdir(dirPath), fs.stat(dirPath)]);
+        const entries = files.filter((f) => /^frame_\d+\.jpe?g$/i.test(f));
+        if (entries.length === 0) return null;
+        return { cd, chapter, entries, dirMtime: st.mtimeMs };
       } catch {
-        /* ignore */
+        return null;
       }
-    }
-    // load narration.json once per chapter
-    try {
-      const raw = await fs.readFile(
-        path.join(datasetDir(id), `chapter_${String(chapter).padStart(3, "0")}`, "narration.json"),
-        "utf8"
-      );
-      const list = JSON.parse(raw) as Array<{ image: string; text: string; status: string; visual?: string }>;
-      const map: Record<string, { text: string; status: string; visual?: string }> = {};
-      for (const n of list) map[n.image] = { text: n.text || "", status: n.status || "", visual: n.visual };
-      narrationCache.set(chapter, map);
-    } catch {
-      /* narration.json not written yet */
-    }
-  }
+    }),
+  );
+  const metas = metasRaw.filter((m): m is ChapMeta => m !== null);
+  const totalFrames = metas.reduce((acc, m) => acc + m.entries.length, 0);
+
+  type Row = { chapter: number; name: string; mtime: number };
+  let selectedRows: Row[] = [];
+  const narrationCache = new Map<number, Record<string, NarrationEntry>>();
 
   if (all) {
-    // natural reading order: chapter then frame number
     const num = (s: string) => parseInt(s.replace(/\D/g, ""), 10) || 0;
-    rows.sort((a, b) => a.chapter - b.chapter || num(a.name) - num(b.name));
+    metas.sort((a, b) => a.chapter - b.chapter);
+    for (const m of metas) {
+      m.entries.sort((a, b) => num(a) - num(b));
+      for (const f of m.entries) {
+        selectedRows.push({ chapter: m.chapter, name: f, mtime: m.dirMtime });
+        if (selectedRows.length >= limit) break;
+      }
+      if (selectedRows.length >= limit) break;
+    }
+    const neededChaps = [...new Set(selectedRows.map((r) => r.chapter))];
+    await Promise.all(
+      neededChaps.map(async (ch) => {
+        const map = await readChapterNarration(id, ch);
+        if (map) narrationCache.set(ch, map);
+      }),
+    );
   } else {
-    rows.sort((a, b) => b.mtime - a.mtime);
+    // Newest-touched chapters first; stat only individual frames inside those
+    // recent chapters (typically 1-3 dirs) instead of scanning all 300+ dirs.
+    metas.sort((a, b) => b.dirMtime - a.dirMtime || b.chapter - a.chapter);
+    const recentRows: Row[] = [];
+    for (const m of metas) {
+      const dirPath = path.join(slicesRoot, m.cd);
+      const fileRows = await Promise.all(
+        m.entries.map(async (f): Promise<Row | null> => {
+          try {
+            const st = await fs.stat(path.join(dirPath, f));
+            return { chapter: m.chapter, name: f, mtime: st.mtimeMs };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      for (const r of fileRows) {
+        if (r) recentRows.push(r);
+      }
+      if (recentRows.length >= limit * 2) break;
+    }
+    recentRows.sort((a, b) => b.mtime - a.mtime);
+    selectedRows = recentRows.slice(0, limit);
+
+    const neededChaps = [...new Set(selectedRows.map((r) => r.chapter))];
+    await Promise.all(
+      neededChaps.map(async (ch) => {
+        const map = await readChapterNarration(id, ch);
+        if (map) narrationCache.set(ch, map);
+      }),
+    );
   }
-  const frames = rows.slice(0, limit).map((r) => {
+
+  const frames = selectedRows.map((r) => {
     const n = narrationCache.get(r.chapter)?.[r.name];
     return {
       url: `/api/frames/${id}/${r.chapter}/${r.name}`,
@@ -97,12 +147,12 @@ export async function GET(
       status: n?.status ?? "",
     };
   });
-  // live strip: newest-last so it reads left→right in processing order
+  // live strip: newest-last so it reads left->right in processing order
   if (!all) frames.reverse();
 
   return NextResponse.json({
     frames,
     ready: true,
-    total: rows.length,
+    total: totalFrames,
   });
 }

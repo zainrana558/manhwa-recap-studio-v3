@@ -91,3 +91,59 @@ def test_ocr_cascade_skips_expensive_passes_when_zero_regions_detected(monkeypat
     assert regions == 0
     assert text == ""
     assert "skipped_cascade_zero_regions_detected" in reason
+
+
+def test_alnum_garble_and_webtoon_prefix_filtering():
+    # "9NIO9" must trigger _looks_like_ocr_garble so PARSeq crop recovery runs,
+    # and if unrescued as a solo token, _merge_regions must drop it.
+    assert paddleocr_main._looks_like_ocr_garble("9NIO9") is True
+    assert paddleocr_main._looks_like_ocr_garble("1ST") is False
+    assert paddleocr_main._looks_like_ocr_garble("100KG") is False
+
+    reg_garble = [_TextRegion("9NIO9", 0.91, 10, 10, 40, 120)]
+    merged_g, _, cnt_g = _merge_regions(reg_garble)
+    assert merged_g == "" and cnt_g == 0
+
+    # Legitimate ordinals / ratios / units remain intact
+    reg_ok = [_TextRegion("1ST PLACE! 100KG", 0.91, 10, 10, 40, 160)]
+    merged_ok, _, cnt_ok = _merge_regions(reg_ok)
+    assert "1ST" in merged_ok and cnt_ok == 1
+
+    # Short-prefix WEBTOON end-cards like "to WEBTOON" match banner/credit filters
+    assert paddleocr_main._PROMO_BANNER_RE.search("to WEBTOON") is not None
+    assert paddleocr_main._CREDIT_LINE_RE.search("to WEBTOON") is not None
+    assert paddleocr_main._PROMO_BANNER_RE.search("I love webtoon comics") is None
+
+
+def test_free_local_ocr_glue_and_digit_o_repairs():
+    assert paddleocr_main._desegment_runon("OFTHE TEMPLE") == "OF THE TEMPLE"
+    assert paddleocr_main._desegment_runon("I'LLTHINK ABOUT IT") == "I'LL THINK ABOUT IT"
+    assert paddleocr_main._desegment_runon("DIDN'TBRING A HEALER") == "DIDN'T BRING A HEALER"
+    assert paddleocr_main._desegment_runon("20 MINUTES'LEEWAY") == "20 MINUTES' LEEWAY"
+    assert paddleocr_main._repair_and_denoise("ABOUT 4O MINUTES") == "ABOUT 40 MINUTES"
+
+
+def test_curated_ocr_corrections_and_solo_leveling_dict():
+    out_sl = paddleocr_main._apply_known_corrections(
+        "SUNG AN WOO NEALTHE 10 AGUITY 10 SDOLS AD-RANK HEADBACK", "solo-leveling"
+    )
+    assert "SUNG JINWOO" in out_sl
+    assert "HEALTH" in out_sl
+    assert "AGILITY" in out_sl
+    assert "STOP" in out_sl
+    assert "A D-RANK" in out_sl
+    assert "HEAD BACK" in out_sl
+
+    out_gl = paddleocr_main._apply_known_corrections("THEYDDN'TBRING A HEALER", "any-other-series")
+    assert "THEY DIDN'T BRING" in out_gl
+
+
+def test_nano_machine_curated_tokens():
+    out = paddleocr_main._apply_known_corrections(
+        "CHNOHS WIHI DEWON HSLITTL SUPERVISOK", "nano-machine"
+    )
+    assert "SHOULD" in out
+    assert "WITH" in out
+    assert "DEMON" in out
+    assert "HESITATE" in out
+    assert "SUPERVISOR" in out

@@ -27,18 +27,20 @@ export type Stage =
   | "done";
 
 export type MangaSource =
+  | "asurascans"
+  | "thunderscans"
+  | "vortexscans"
+  | "rizzfables"
+  | "webtoons"
+  | "mgeko"
+  | "mangadex"
   | "mangahere"
   | "fanfox"
-  | "webtoons"
-  | "mal"
-  | "anilist"
-  | "asurascans"
-  | "mangadex"
   | "mangapill"
-  | "toonily"
   | "comick"
   | "weebcentral"
-  | "mgeko";
+  | "mal"
+  | "anilist";
 
 export interface MangadexManga {
   id: string;
@@ -151,7 +153,12 @@ export interface CreateJobInput {
   voice: string;
   translate: boolean;
   narrate?: boolean;
-  narrationStyle?: "verbatim" | "cleanup" | "recap"; // default "verbatim"
+  narrationStyle?: "verbatim" | "cleanup" | "recap" | "dramatic" | "concise"; // default "verbatim"
+  narrationSpeed?: "slow" | "normal" | "fast" | "brisk";
+  frameStyle?: "blur" | "cover" | "dark";
+  bgmVolume?: "subtle" | "balanced" | "bold";
+  includeIntro?: boolean;
+  watermark?: string;
   describeVisuals?: boolean; // caption each panel's visual action, folded into narration
   visualProvider?: "auto" | "ollama" | "groq" | "gemini" | "openrouter" | "none";
   motionStyle?: "none" | "kenburns"; // subtle camera drift

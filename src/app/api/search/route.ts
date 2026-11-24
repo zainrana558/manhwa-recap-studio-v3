@@ -1,3 +1,4 @@
+import { getPrivateExt } from "@/lib/private-loader";
 import { NextRequest, NextResponse } from "next/server";
 import { searchAllManga, searchSingleSource } from "@/lib/manga-search";
 
@@ -6,7 +7,7 @@ export const dynamic = "force-dynamic";
 // Increase the max duration for this API route since it calls multiple external sources.
 export const maxDuration = 30;
 
-const VALID_SOURCES = ["mangahere", "fanfox", "webtoons", "asurascans", "mangadex", "mangapill", "toonily", "comick", "weebcentral", "mgeko", "mal", "anilist"] as const;
+const VALID_SOURCES = ["asurascans", "thunderscans", "vortexscans", "rizzfables", "webtoons", "mgeko", "mangadex", "mangahere", "fanfox", "mangapill", "comick", "weebcentral", "mal", "anilist"] as const;
 type ValidSource = (typeof VALID_SOURCES)[number];
 
 function isSource(s: string): s is ValidSource {
@@ -38,8 +39,17 @@ export async function GET(req: NextRequest) {
     const limitParam = searchParams.get("limit");
     const limit = limitParam ? Math.max(1, parseInt(limitParam, 10) || 12) : 12;
     const sourceParam = (searchParams.get("source") ?? "").trim().toLowerCase();
+    const adult = searchParams.get("adult") === "1";
+    const genre = (searchParams.get("genre") ?? "").trim();
 
-    if (!q) {
+
+
+    const ext = getPrivateExt();
+    if (!adult && q && ext?.isUnlockCode(q)) {
+      return NextResponse.json({ unlockPrivate: true, ...ext.getPrivateConfig() });
+    }
+
+    if (!q && !(adult && genre)) {
       return NextResponse.json(
         { error: "Query parameter 'q' is required." },
         { status: 400 }
@@ -68,7 +78,7 @@ export async function GET(req: NextRequest) {
 
     // All-source mode — NEVER return 502, always return 200 with whatever results we got.
     try {
-      const { manga, sources } = await searchAllManga(q, limit);
+      const { manga, sources } = await searchAllManga(q, limit, { adult, genre });
       return NextResponse.json({
         manga,
         total: manga.length,

@@ -72,7 +72,9 @@ export default function Home() {
   const { job, logs, connected } = useJobProgress(currentJobId);
 
   const handleSelectManga = useCallback((manga: MangadexManga) => {
-    addViewed({ id: manga.id, title: manga.title, coverUrl: manga.coverUrl || "" });
+    if (manga.contentRating !== "erotica") {
+      addViewed({ id: manga.id, title: manga.title, coverUrl: manga.coverUrl || "" });
+    }
     setSelectedManga(manga);
     setView("config");
   }, [addViewed]);
@@ -122,23 +124,85 @@ export default function Home() {
     } catch {
       savedId = null;
     }
-    if (!savedId) return;
 
-    fetch(`/api/jobs/${savedId}`)
+    const ACTIVE = new Set([
+      "pending",
+      "awaiting_review",
+      "scraping",
+      "transcribing",
+      "translating",
+      "rendering",
+      "merging",
+    ]);
+
+    fetch("/api/jobs")
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (cancelled) return;
-        if (data?.job) {
-          setCurrentJobId(savedId);
-          setView("job");
-        } else {
-          // Job no longer exists (deleted/DB reset) — clear the stale pointer.
+        const jobs = (data?.jobs ?? []) as Array<{ id: string; status: string; createdAt: string }>;
+        if (!jobs.length) {
+          if (savedId) {
+            try {
+              localStorage.removeItem("activeJobId");
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
+
+        const activeJob = jobs.find((j) => ACTIVE.has(j.status));
+        if (activeJob) {
           try {
-            localStorage.removeItem("activeJobId");
+            localStorage.setItem("activeJobId", activeJob.id);
           } catch {
             // ignore
           }
+          setCurrentJobId(activeJob.id);
+          setView("job");
+          return;
         }
+
+        if (!savedId) return;
+
+        const savedJob = jobs.find((j) => j.id === savedId);
+        const latest = jobs[0];
+        if (!savedJob) {
+          if (latest) {
+            try {
+              localStorage.setItem("activeJobId", latest.id);
+            } catch {
+              // ignore
+            }
+            setCurrentJobId(latest.id);
+            setView("job");
+          } else {
+            try {
+              localStorage.removeItem("activeJobId");
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
+
+        // If the saved job is already finished and a newer job exists on the server,
+        // promote the latest job so refreshes reflect recent backend runs.
+        const target =
+          !ACTIVE.has(savedJob.status) &&
+          latest &&
+          latest.id !== savedJob.id &&
+          new Date(latest.createdAt).getTime() > new Date(savedJob.createdAt).getTime()
+            ? latest
+            : savedJob;
+
+        try {
+          localStorage.setItem("activeJobId", target.id);
+        } catch {
+          // ignore
+        }
+        setCurrentJobId(target.id);
+        setView("job");
       })
       .catch(() => {
         // Pipeline/web service unreachable at load time — leave the search
@@ -506,7 +570,7 @@ export default function Home() {
                   <span className="text-gradient">first recap video?</span>
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md leading-relaxed mx-auto lg:mx-0">
-                  Search for any manhwa, configure your preferences, and let the AI pipeline handle the rest. It takes about 6 minutes per chapter.
+                  Search for any manhwa, configure your preferences, and let the AI pipeline handle the rest. It takes about 2 minutes per chapter.
                 </p>
               </div>
               <div className="flex flex-col sm:flex-row items-center gap-3">
@@ -627,7 +691,7 @@ export default function Home() {
                 Groq
               </a>
               <span className="text-muted-foreground/40">·</span>
-              <span className="text-foreground/80">VLM · edge-tts · ffmpeg · YOLO</span>
+              <span className="text-foreground/80">RapidOCR · Kokoro-82M INT8 · ffmpeg · YOLO</span>
             </div>
             <div className="flex items-center gap-3">
               <span>For personal use only</span>

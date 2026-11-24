@@ -160,7 +160,18 @@ async function httpHandler(req: IncomingMessage, res: ServerResponse) {
     const voice = fullUrl.searchParams.get('voice') || ''
     // edge-tts ids ("en-US-AndrewNeural") OR Kokoro ids ("am_michael", "af_bella")
     const VOICE_ID_RE = /^([a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+Neural|[abhijpef][fm]_[a-z][a-z_]*)$/
-    if (!VOICE_ID_RE.test(voice)) {
+async function isAllowedPrivateVoice(v: string): Promise<boolean> {
+  try {
+    const _path = await import('path')
+    const _fs = await import('fs')
+    const p = _path.join(import.meta.dir, 'private', 'sources.ts')
+    if (!_fs.existsSync(p)) return false
+    return Boolean(require(p).isValidPrivateVoice(v))
+  } catch {
+    return false
+  }
+}
+    if (!VOICE_ID_RE.test(voice) && !(await isAllowedPrivateVoice(voice))) {
       sendJson(res, 400, { error: 'Invalid or missing voice parameter.' })
       return
     }
@@ -681,8 +692,40 @@ async function countSlicedFrames(jobId: string): Promise<number> {
   return n
 }
 
+interface RecapOptionsFile {
+  narrationStyle?: string
+  narrationSpeed?: string
+  frameStyle?: string
+  bgmVolume?: string
+  includeIntro?: boolean
+  watermark?: string
+}
+
+async function readRecapOptions(jobId: string): Promise<RecapOptionsFile> {
+  try {
+    const raw = await fs.readFile(path.join(jobDir(jobId), 'recap_options.json'), 'utf8')
+    return JSON.parse(raw) as RecapOptionsFile
+  } catch {
+    return {}
+  }
+}
+
+const SPEED_MAP: Record<string, string> = {
+  slow: '0.9',
+  normal: '1.0',
+  fast: '1.15',
+  brisk: '1.25',
+}
+
+const BGM_VOL_MAP: Record<string, string> = {
+  subtle: '0.20',
+  balanced: '0.35',
+  bold: '0.50',
+}
+
 async function sliceJobChapters(jobId: string): Promise<boolean> {
   const job = await db.job.findUnique({ where: { id: jobId } })
+  const recapOpts = await readRecapOptions(jobId)
   const args = [
     PIPELINE_SCRIPT,
     '--input-dir', datasetDir(jobId),
@@ -746,9 +789,11 @@ async function sliceJobChapters(jobId: string): Promise<boolean> {
   // cancelled (spawnSync offered no way to kill it mid-run).
   let stdoutBuf = ''
   let stderrBuf = ''
+  const sliceEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: '1' }
+  if (recapOpts.frameStyle) sliceEnv.RECAP_FRAME_STYLE = recapOpts.frameStyle
   const child = spawn(PYTHON_BIN, args, {
     cwd: spawnCwd,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: sliceEnv,
   })
   childProcesses.set(jobId, child)
 
@@ -951,8 +996,8 @@ async function processJob(jobId: string): Promise<void> {
       await emitLog(jobId, 'warn', 'scrape', 'Cancelled during scrape')
       return
     }
-    // Skip chapters already scraped (resume support).
-    if (ch.status === 'scraped') {
+    // Skip chapters already scraped, transcribed, or rendered (resume support).
+    if (ch.status === 'scraped' || ch.status === 'transcribed' || ch.status === 'rendered') {
       const cDir = chapterDir(jobId, ch.index)
       try {
         const existing = (await fs.readdir(cDir)).filter(f => /\.(jpe?g|png|webp|gif)$/i.test(f)).length
@@ -1101,6 +1146,12 @@ async function processJob(jobId: string): Promise<void> {
   // Slices chapter source pages into canonical panel and scroll frames,
   // creating work/temp_slices/chap_XXX/frame_NNNNN.jpg + manifest.json.
   // The VLM or PaddleOCR then transcribes text mapped to individual canonical frames.
+  await db.job.update({
+    where: { id: jobId },
+    data: { status: 'transcribing', stage: 'slice', message: 'Slicing panels & reading text' },
+  })
+  await emitStatus(jobId)
+
   const sliced = await sliceJobChapters(jobId)
   if (sliced) {
     await emitLog(jobId, 'success', 'slice', 'Canonical frames created and manifest validated.')
@@ -1504,9 +1555,12 @@ async function processJob(jobId: string): Promise<void> {
     })
   }
 
+  const totalTranscribed = await db.chapter.count({
+    where: { jobId, transcribed: true },
+  })
   await db.job.update({
     where: { id: jobId },
-    data: { doneChapters: transcribedCount },
+    data: { doneChapters: Math.max(transcribedCount, totalTranscribed) },
   })
   await emitLog(
     jobId,
@@ -1527,6 +1581,7 @@ async function processJob(jobId: string): Promise<void> {
   await emitStatus(jobId)
   await emitLog(jobId, 'info', 'render', 'Spawning Python master_pipeline.py')
 
+  const recapOpts = await readRecapOptions(jobId)
   const outFile = outputVideoPath(jobId)
   const progressFile = progressFilePath(jobId)
   // Reset the progress file so we don't read stale data.
@@ -1563,8 +1618,12 @@ async function processJob(jobId: string): Promise<void> {
     // channel watermark on every frame. RECAP_WATERMARK overrides the
     // channel name; RECAP_WATERMARK=0/none disables it.
     '--recap-title', job.mangaTitle || 'Recap',
+    ...(recapOpts.includeIntro === false ? ['--no-intro'] : []),
     ...(() => {
-      const wm = process.env.RECAP_WATERMARK ?? 'Denji Recaps'
+      const wm =
+        typeof recapOpts.watermark === 'string'
+          ? recapOpts.watermark.trim()
+          : (process.env.RECAP_WATERMARK ?? 'Denji Recaps')
       return wm && !['0', 'none', 'false'].includes(wm.toLowerCase()) ? ['--watermark', wm] : []
     })(),
     ...(process.env.PRODUCTION_PIPELINE === '0' ? [] : ['--production-mode']),
@@ -1604,11 +1663,12 @@ async function processJob(jobId: string): Promise<void> {
   // pass --bgm if the file actually exists, so a stale/deleted track name
   // can't crash the whole render (master_pipeline.py also validates
   // --bgm's existence, but failing here logs a clearer, job-specific reason).
-  if (job.useBgm !== false && job.bgmPath) {
-    const bgmFile = path.join(DATA_DIR, 'bgm', job.bgmPath)
+  if (job.useBgm !== false) {
+    const trackName = job.bgmPath || 'default_cinematic.mp3'
+    const bgmFile = path.join(DATA_DIR, 'bgm', trackName)
     if (await fileExists(bgmFile)) {
       args.push('--bgm', bgmFile)
-    } else {
+    } else if (job.bgmPath) {
       await emitLog(jobId, 'warn', 'render', `BGM track "${job.bgmPath}" not found — rendering without background music`)
     }
   }
@@ -1629,11 +1689,28 @@ async function processJob(jobId: string): Promise<void> {
     // fall back to the repo root if the job dir can't be created
   }
 
+  const renderEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: '1' }
+  if (job.voice && /-.*Neural$/i.test(job.voice.trim())) {
+    renderEnv.RECAP_TTS_ENGINE = 'edge-tts'
+  }
+  if (recapOpts.frameStyle) renderEnv.RECAP_FRAME_STYLE = recapOpts.frameStyle
+  if (recapOpts.narrationSpeed && SPEED_MAP[recapOpts.narrationSpeed]) {
+    renderEnv.RECAP_KOKORO_SPEED = SPEED_MAP[recapOpts.narrationSpeed]
+  }
+  if (recapOpts.bgmVolume && BGM_VOL_MAP[recapOpts.bgmVolume]) {
+    renderEnv.RECAP_BGM_VOLUME = BGM_VOL_MAP[recapOpts.bgmVolume]
+  }
+  if (typeof recapOpts.watermark === 'string' && recapOpts.watermark.trim() === '') {
+    renderEnv.RECAP_WATERMARK = 'none'
+  }
   const child = spawn(PYTHON_BIN, args, {
     cwd: spawnCwd,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: renderEnv,
   })
   childProcesses.set(jobId, child)
+
+  let lastMarkedRendered = 0
+  let lastMarkedRendering = -1
 
   // Poll the progress file every 1s while the process runs.
   const pollTimer = setInterval(async () => {
@@ -1675,9 +1752,50 @@ async function processJob(jobId: string): Promise<void> {
           : /rendering|render/i.test(prog.message || '') ? 'encode'
           : /Ken Burns|motion/i.test(prog.message || '') ? 'motion'
           : undefined)
+      const renderChapterDone = stage === 'render'
+        ? Math.min(scrapedChapters.length, Math.max(0, Math.floor(prog.chapter_index ?? 0)))
+        : (stage === 'merge' || stage === 'bgm' || stage === 'done')
+          ? scrapedChapters.length
+          : 0
+
+      if (stage === 'render' || stage === 'merge' || stage === 'bgm' || stage === 'done') {
+        while (lastMarkedRendered < renderChapterDone && lastMarkedRendered < scrapedChapters.length) {
+          const chDone = scrapedChapters[lastMarkedRendered]
+          lastMarkedRendered++
+          try {
+            const u = await db.chapter.update({
+              where: { id: chDone.id },
+              data: { status: 'rendered' },
+            })
+            await emitChapter(jobId, u)
+          } catch {
+            // ignore DB contention
+          }
+        }
+        if (stage === 'render' && renderChapterDone < scrapedChapters.length && lastMarkedRendering !== renderChapterDone) {
+          lastMarkedRendering = renderChapterDone
+          const chCur = scrapedChapters[renderChapterDone]
+          try {
+            const u = await db.chapter.update({
+              where: { id: chCur.id },
+              data: { status: 'rendering' },
+            })
+            await emitChapter(jobId, u)
+          } catch {
+            // ignore DB contention
+          }
+        }
+      }
+
+      const effectiveDoneChapters = stage === 'slice'
+        ? Math.max(transcribedCount, Math.min(chapters.length, Math.floor(prog.chapter_index ?? 0)))
+        : (stage === 'render' || stage === 'merge' || stage === 'bgm' || stage === 'done')
+          ? Math.max(renderChapterDone, Math.max(transcribedCount, totalTranscribed))
+          : Math.max(transcribedCount, totalTranscribed)
+
       await emitProgress(jobId, {
         progress: pct,
-        doneChapters: transcribedCount,
+        doneChapters: Math.min(chapters.length, effectiveDoneChapters),
         totalChapters: chapters.length,
         doneImages,
         totalImages,
@@ -1720,7 +1838,7 @@ async function processJob(jobId: string): Promise<void> {
     const level: 'info' | 'warn' | 'error' =
       /\b(error|traceback|exception|critical|abort|fail(ed|ure)?)\b/i.test(line) && !NOISE.test(line)
         ? 'error'
-        : src === 'stderr' && hard
+        : (/\b(warn(ing)?|retry|fallback|degraded|timeout|timed out)\b/i.test(line) || /\bWARNING\b/.test(line)) && !NOISE.test(line)
           ? 'warn'
           : 'info'
     void emitLog(jobId, level, 'render', line)
@@ -1936,11 +2054,17 @@ async function processJob(jobId: string): Promise<void> {
       }
     }
 
+    await db.chapter.updateMany({
+      where: { jobId, status: { not: 'rendered' } },
+      data: { status: 'rendered' },
+    })
+
     await db.job.update({
       where: { id: jobId },
       data: {
         status: 'done',
         progress: 100,
+        doneChapters: chapters.length,
         stage: 'done',
         message: 'Pipeline complete',
         error: null, // F4: clear any stale transient error now that we finished OK

@@ -33,10 +33,10 @@ const FAQ_ITEMS: FAQItem[] = [
   {
     question: "How does the manhwa recap pipeline work?",
     answer:
-      "The pipeline has 5 stages: (1) Search across 6 sources (MangaHere, FanFox, Webtoons, AsuraScans, MAL, AniList). " +
-      "(2) Download every chapter image. (3) Transcribe speech bubble text using VLM (vision language model). " +
-      "(4) Generate narration with edge-tts text-to-speech. (5) Render the final MP4 video with ffmpeg — " +
-      "panels synced to narration audio. The whole process takes ~6 minutes per chapter.",
+      "The pipeline has 5 stages: (1) Search across 12 sources (AsuraScans, MangaDex, Webtoons, MangaGeko, Comick, MangaPill, MangaHere, FanFox, MAL, AniList & more). " +
+      "(2) Download every chapter image. (3) Transcribe speech bubble text using RapidOCR PP-OCRv5 (local ONNX, with optional VLM fallback). " +
+      "(4) Generate narration with local Kokoro-82M INT8 neural text-to-speech. (5) Render the final MP4 video with ffmpeg — " +
+      "panels synced to narration audio. The whole process takes ~2 minutes per chapter.",
     icon: Workflow,
     iconClass: "text-sky-400",
     borderStyle: "border-l-sky-400",

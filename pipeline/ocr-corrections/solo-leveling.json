@@ -1,0 +1,127 @@
+{
+  "_note": "Solo Leveling curated OCR corrections and proper nouns.",
+  "phrases": [
+    [
+      "SUNG AN WOO",
+      "SUNG JINWOO"
+    ],
+    [
+      "SUN AMIOO",
+      "SUNG JINWOO"
+    ],
+    [
+      "SUNG JIN WOO",
+      "SUNG JINWOO"
+    ],
+    [
+      "TITLE:MONE",
+      "TITLE: NONE"
+    ],
+    [
+      "TITLE:NONE",
+      "TITLE: NONE"
+    ],
+    [
+      "AVAKABLEABUITY POINTS",
+      "AVAILABLE ABILITY POINTS"
+    ],
+    [
+      "AWALABLEABLITYPONTS",
+      "AVAILABLE ABILITY POINTS"
+    ]
+  ],
+  "tokens": {
+    "SDOLS": "STOP",
+    "SIHI": "THIS",
+    "IHGH": "HEY",
+    "NEALTHE": "HEALTH",
+    "AGUITY": "AGILITY"
+  },
+  "sfx": [
+    "SHOOM",
+    "HNGHHH"
+  ],
+  "names": [
+    "ahjin",
+    "antares",
+    "ashborn",
+    "asura",
+    "baek",
+    "baran",
+    "bellion",
+    "berserker",
+    "beru",
+    "bloodlust",
+    "cartenon",
+    "chae",
+    "cheol",
+    "choi",
+    "chul",
+    "dominator",
+    "dongsoo",
+    "esil",
+    "eskill",
+    "geon",
+    "geurimja",
+    "gotou",
+    "greed",
+    "gunhee",
+    "gunju",
+    "heejin",
+    "hwan",
+    "hwang",
+    "igris",
+    "imphal",
+    "inukai",
+    "iron",
+    "isao",
+    "jinchu",
+    "jinchul",
+    "jinwoo",
+    "jong",
+    "joohee",
+    "junichirou",
+    "kaisel",
+    "kaisellin",
+    "kamish",
+    "kargalgan",
+    "kasaka",
+    "kenta",
+    "kiba",
+    "kiyoomi",
+    "knightkiller",
+    "kousaka",
+    "mabuchi",
+    "mana",
+    "mangjadeurui",
+    "mizushino",
+    "mogami",
+    "monarch",
+    "morobishi",
+    "mutilate",
+    "predation",
+    "quicksilver",
+    "radiru",
+    "rasaka",
+    "shaman",
+    "shirakawa",
+    "shizuku",
+    "soohyun",
+    "suho",
+    "sung",
+    "taiga",
+    "tank",
+    "teleportation",
+    "tenacity",
+    "tusk",
+    "unwithering",
+    "wang",
+    "woojin",
+    "yeol",
+    "ygritte",
+    "yongjun",
+    "yoojin",
+    "yoon",
+    "yoonho"
+  ]
+}

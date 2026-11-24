@@ -223,6 +223,7 @@ interface VoiceSelectorProps {
   previewPlaying?: boolean;
   onPreview?: () => void;
   previewError?: string | null;
+  extraVoices?: VoiceEntry[];
 }
 
 type GenderFilter = "all" | "male" | "female";
@@ -234,6 +235,7 @@ export function VoiceSelector({
   previewPlaying,
   onPreview,
   previewError,
+  extraVoices = [],
 }: VoiceSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -287,10 +289,15 @@ export function VoiceSelector({
     return () => document.removeEventListener("keydown", handler);
   }, [open]);
 
+  const allGroups = useMemo(() => {
+    if (!extraVoices || extraVoices.length === 0) return VOICE_GROUPS;
+    return [{ code: "EXT", label: "Extended", flag: "EXT", voices: extraVoices }, ...VOICE_GROUPS];
+  }, [extraVoices]);
+
   // Filtered voice groups
   const filteredGroups = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return VOICE_GROUPS.map((group) => {
+    return allGroups.map((group) => {
       let voices = group.voices;
 
       // Gender filter
@@ -316,10 +323,11 @@ export function VoiceSelector({
 
       return { ...group, voices };
     }).filter((g) => g.voices.length > 0);
-  }, [search, genderFilter, activeGroup]);
+  }, [search, genderFilter, activeGroup, allGroups]);
 
   const totalFiltered = filteredGroups.reduce((s, g) => s + g.voices.length, 0);
-  const selectedVoice = findVoice(value);
+  const extraMatch = extraVoices.find((v) => v.value === value);
+  const selectedVoice = extraMatch ? { ...extraMatch, groupFlag: "EXT" } : findVoice(value);
 
   const handleSelect = useCallback(
     (voiceValue: string) => {

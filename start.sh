@@ -353,7 +353,7 @@ cd "$PROJECT_DIR/mini-services/paddleocr-service"
 # access should go through Caddy). Calling main.py directly binds 0.0.0.0
 # (see its own `if __name__ == "__main__"` block), exposing OCR publicly
 # with no auth.
-setsid bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null &
+setsid bash start.sh > "$LOG_DIR/paddleocr.log" 2>&1 < /dev/null 200>&- &
 PADDLEOCR_PID=$!
 cd "$PROJECT_DIR"
 # Poll for real readiness instead of a fixed sleep + a substring grep that
@@ -382,7 +382,7 @@ kill_service "bun index.ts"
 kill_port 3001
 echo "[2/3] Starting Pipeline on port 3001..."
 cd "$PROJECT_DIR/mini-services/pipeline-service"
-setsid bun run start > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null &
+setsid bun run start > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null 200>&- &
 PIPELINE_PID=$!
 cd "$PROJECT_DIR"
 ready=0
@@ -453,7 +453,7 @@ fi
 # run standalone failed with exactly "Failed to start server. Is port
 # 3001 in use?", and the watchdog log showed it restart-looping
 # indefinitely every cycle for over 10 hours as a result.
-HOSTNAME=127.0.0.1 PORT=3000 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null &
+HOSTNAME=127.0.0.1 PORT=3000 setsid bun .next/standalone/server.js > "$LOG_DIR/nextjs.log" 2>&1 < /dev/null 200>&- &
 NEXT_PID=$!
 # Real HTTP status check with a poll loop (a cold Turbopack/Next start can
 # take a few seconds) instead of a fixed sleep + an always-false substring
@@ -494,7 +494,7 @@ fi
 # automatically within seconds instead.
 # ─────────────────────────────────────────────────────────────────────────
 pkill -f "watchdog.sh" 2>/dev/null || true
-WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null &
+WATCHDOG_LOG_DIR="$LOG_DIR" setsid bash "$PROJECT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 < /dev/null 200>&- &
 echo "  ✅ Watchdog started — auto-restarts any of the 3 services if it dies (see $LOG_DIR/watchdog.log)"
 
 # Get public IP

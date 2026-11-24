@@ -103,7 +103,7 @@ export function LiveFrames({
                 src={f.url}
                 alt={f.name}
                 loading="lazy"
-                className="w-40 h-40 object-cover rounded-lg border border-border bg-muted"
+                className="w-40 h-40 object-contain rounded-lg border border-border bg-muted"
               />
               <figcaption className="text-[10px] leading-tight text-muted-foreground line-clamp-3">
                 <span className="text-foreground/70">ch {f.chapter}</span>

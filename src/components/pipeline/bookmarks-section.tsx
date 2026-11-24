@@ -15,6 +15,9 @@ const SOURCE_LABEL: Record<string, string> = {
   fanfox: "FanFox",
   webtoons: "Webtoons",
   asurascans: "Asura",
+  thunderscans: "Thunder",
+  vortexscans: "Vortex",
+  rizzfables: "Rizz",
   mal: "MAL",
   anilist: "AniList",
 };
@@ -24,6 +27,9 @@ const SOURCE_COLORS: Record<string, string> = {
   fanfox: "text-orange-400",
   webtoons: "text-green-400",
   asurascans: "text-rose-400",
+  thunderscans: "text-amber-400",
+  vortexscans: "text-purple-400",
+  rizzfables: "text-pink-400",
   mal: "text-sky-400",
   anilist: "text-fuchsia-400",
 };
@@ -133,7 +139,7 @@ export function BookmarksSection({ onSelectManga }: BookmarksSectionProps) {
               >
                 <div className="w-8 h-11 rounded-lg overflow-hidden bg-muted flex-shrink-0 border border-border">
                   {b.coverUrl ? (
-                    <img src={b.coverUrl} alt="" className="w-full h-full object-cover" loading="lazy" />
+                    <img src={b.coverUrl} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" loading="lazy" />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center">
                       <Bookmark className="h-3 w-3 text-muted-foreground/30" />

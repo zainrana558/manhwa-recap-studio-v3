@@ -32,14 +32,16 @@ type QuickSort = "relevance" | "updated" | "followed" | "title-az";
 
 const SOURCE_FILTERS: { value: SourceFilter; label: string; color: string }[] = [
   { value: "all", label: "All Sources", color: "" },
-  { value: "mangadex", label: "MangaDex", color: "text-orange-400" },
-  { value: "mgeko", label: "MangaGeko", color: "text-teal-400" },
-  { value: "webtoons", label: "Webtoons", color: "text-green-400" },
   { value: "asurascans", label: "AsuraScans", color: "text-rose-400" },
+  { value: "thunderscans", label: "ThunderScans", color: "text-amber-400" },
+  { value: "vortexscans", label: "VortexScans", color: "text-purple-400" },
+  { value: "rizzfables", label: "RizzFables", color: "text-pink-400" },
+  { value: "webtoons", label: "Webtoons", color: "text-green-400" },
+  { value: "mgeko", label: "MangaGeko", color: "text-teal-400" },
+  { value: "mangadex", label: "MangaDex", color: "text-orange-400" },
   { value: "mangahere", label: "MangaHere", color: "text-emerald-400" },
   { value: "fanfox", label: "FanFox", color: "text-orange-400" },
   { value: "mangapill", label: "MangaPill", color: "text-cyan-400" },
-  { value: "toonily", label: "Toonily", color: "text-pink-400" },
   { value: "comick", label: "Comick", color: "text-violet-400" },
   { value: "weebcentral", label: "WeebCentral", color: "text-indigo-400" },
   { value: "mal", label: "MAL", color: "text-sky-400" },
@@ -65,11 +67,13 @@ const SOURCE_BADGE_CLASSES: Record<MangaSource, string> = {
   fanfox: "bg-orange-500/15 text-orange-300 border-orange-500/30",
   webtoons: "bg-green-500/15 text-green-300 border-green-500/30",
   asurascans: "bg-rose-500/15 text-rose-300 border-rose-500/30",
+  thunderscans: "bg-amber-500/15 text-amber-300 border-amber-500/30",
+  vortexscans: "bg-purple-500/15 text-purple-300 border-purple-500/30",
+  rizzfables: "bg-pink-500/15 text-pink-300 border-pink-500/30",
   mal: "bg-sky-500/15 text-sky-300 border-sky-500/30",
   anilist: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30",
   mangadex: "bg-orange-500/15 text-orange-300 border-orange-500/30",
   mangapill: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
-  toonily: "bg-pink-500/15 text-pink-300 border-pink-500/30",
   comick: "bg-violet-500/15 text-violet-300 border-violet-500/30",
   weebcentral: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30",
   mgeko: "bg-teal-500/15 text-teal-300 border-teal-500/30",
@@ -80,11 +84,13 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   fanfox: "FanFox",
   webtoons: "Webtoons",
   asurascans: "Asura",
+  thunderscans: "Thunder",
+  vortexscans: "Vortex",
+  rizzfables: "Rizz",
   mal: "MAL",
   anilist: "AniList",
   mangadex: "MangaDex",
   mangapill: "MangaPill",
-  toonily: "Toonily",
   comick: "Comick",
   weebcentral: "WeebCentral",
   mgeko: "MangaGeko",
@@ -130,9 +136,11 @@ interface SourceCounts {
   fanfox: number;
   webtoons: number;
   asurascans: number;
+  thunderscans?: number;
+  vortexscans?: number;
+  rizzfables?: number;
   mangadex: number;
   mangapill: number;
-  toonily: number;
   comick: number;
   weebcentral: number;
   mgeko: number;
@@ -169,6 +177,10 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     const { ref: sectionRef, isVisible } = useSectionObserver(0.05);
     const { history: searchHistory, addHistory, removeHistory, clearHistory } = useSearchHistory();
     const [query, setQuery] = useState("");
+    const [privateMode, setPrivateMode] = useState<{ genres: string[]; prefixes: string[]; sourceLabels: Record<string, { label: string; badge: string; color: string }> } | null>(null);
+    const [extQuery, setExtQuery] = useState("");
+    const [extGenre, setExtGenre] = useState("");
+    const [lastSearchPrivate, setLastSearchPrivate] = useState(false);
     const [loading, setLoading] = useState(false);
     const [resolvingId, setResolvingId] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -261,19 +273,26 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
       onClearResults?.();
     }, [onClearResults]);
 
-    const handleSearch = useCallback(async () => {
-      const q = query.trim();
-      if (!q) return;
+    const runSearch = useCallback(async (rawQ: string, isExt = false, rawGenre = "") => {
+      const q = rawQ.trim();
+      const g = rawGenre.trim();
+      if (!q && !(isExt && g)) return;
       setLoading(true);
       setError(null);
+      if (isExt) setLastSearchPrivate(true);
+      else setLastSearchPrivate(false);
       setHasSearched(true);
       setExpandedManga(null);
       searchStartTime.current = performance.now();
 
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
-        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=24`, {
+        const timeout = setTimeout(() => controller.abort(), 25000);
+        const params = new URLSearchParams({ limit: "24" });
+        if (q) params.set("q", q);
+        if (isExt) params.set("adult", "1");
+        if (isExt && g) params.set("genre", g);
+        const res = await fetch(`/api/search?${params.toString()}`, {
           signal: controller.signal,
         });
         clearTimeout(timeout);
@@ -284,11 +303,19 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
           throw new Error(data.error || `Search failed (${res.status})`);
         }
         const data = await res.json();
+        if (data.unlockPrivate) {
+          setPrivateMode({ genres: data.genres ?? [], prefixes: data.prefixes ?? [], sourceLabels: data.sourceLabels ?? {} });
+          setQuery("");
+          setHasSearched(false);
+          setError(null);
+          return;
+        }
         const manga: MangadexManga[] = data.manga ?? [];
         setResults(manga);
         setSourceCounts(data.sources ?? null);
-        onResults(manga, q);
-        if (manga.length > 0) addHistory(q, manga.length);
+        const label = [q, g ? `[${g}]` : ""].filter(Boolean).join(" ");
+        onResults(manga, label);
+        if (!isExt && manga.length > 0) addHistory(label, manga.length);
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Search failed";
         if (e instanceof DOMException && e.name === "AbortError") {
@@ -302,7 +329,42 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
       } finally {
         setLoading(false);
       }
-    }, [query, onResults, addHistory]);
+    }, [onResults, addHistory]);
+
+    const handleSearch = useCallback(async () => {
+      await runSearch(query, false);
+    }, [query, runSearch]);
+
+    const handleExtSearch = useCallback(async (overrideGenre?: string) => {
+      const g = overrideGenre !== undefined ? overrideGenre : extGenre;
+      await runSearch(extQuery, true, g);
+    }, [extQuery, extGenre, runSearch]);
+
+    const handleHidePrivate = useCallback(() => {
+      const prefixes = privateMode?.prefixes ?? [];
+      setPrivateMode(null);
+      setExtQuery("");
+      setExtGenre("");
+      if (lastSearchPrivate) {
+        setResults([]);
+        setSourceCounts(null);
+        setHasSearched(false);
+        setExpandedManga(null);
+        setLastSearchPrivate(false);
+        onClearResults?.();
+      }
+      try {
+        const raw = localStorage.getItem("manhwa-recently-viewed");
+        if (raw && prefixes.length > 0) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            const cleaned = parsed.filter((item: any) => !prefixes.some((p) => String(item?.id || "").startsWith(p)));
+            localStorage.setItem("manhwa-recently-viewed", JSON.stringify(cleaned));
+          }
+        }
+      } catch {}
+      fetch("/api/jobs?scope=private", { method: "DELETE" }).catch(() => {});
+    }, [privateMode, lastSearchPrivate, onClearResults]);
 
     const visibleResults = useMemo(() => {
       let filtered = filter === "all" ? [...results] : results.filter((m) => (m.source ?? "mangahere") === filter);
@@ -369,7 +431,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
         try {
           // Try the sources that actually work from this host, in order.
           let mdMatch: MangadexManga | undefined;
-          for (const s of ["mangadex", "mgeko", "mangahere", "fanfox"] as const) {
+          for (const s of ["asurascans", "thunderscans", "vortexscans", "rizzfables", "mgeko", "mangadex", "mangahere", "fanfox"] as const) {
             const r = await fetch(`/api/search?q=${encodeURIComponent(m.title)}&limit=1&source=${s}`);
             const d = await r.json().catch(() => ({}));
             const hit: MangadexManga | undefined = (d.manga ?? [])[0];
@@ -576,6 +638,80 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
           </Button>
         </form>
 
+        {privateMode && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleExtSearch();
+            }}
+            className="max-w-2xl mx-auto mt-3 p-3 rounded-xl border border-rose-500/40 bg-rose-950/20 backdrop-blur-sm space-y-2.5 animate-fade-in-up"
+          >
+            <div className="flex flex-col sm:flex-row gap-2.5">
+              <div className="relative flex-1 flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 shrink-0">
+                  Private
+                </span>
+                <Input
+                  id="ext-search-input"
+                  value={extQuery}
+                  onChange={(e) => setExtQuery(e.target.value)}
+                  placeholder="Title (optional if category set)..."
+                  className="h-11 text-sm bg-card/80 border-rose-500/30 rounded-lg"
+                  autoFocus
+                />
+              </div>
+              <Input
+                id="ext-genre-input"
+                value={extGenre}
+                onChange={(e) => setExtGenre(e.target.value)}
+                placeholder="Category / Genre..."
+                className="sm:w-56 h-11 text-sm bg-card/80 border-rose-500/30 rounded-lg"
+              />
+              <div className="flex gap-2">
+                <Button
+                  type="submit"
+                  size="default"
+                  className="h-11 px-5 font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white"
+                  disabled={loading || (!extQuery.trim() && !extGenre.trim())}
+                >
+                  Search
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="default"
+                  className="h-11 px-3 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={handleHidePrivate}
+                >
+                  Hide
+                </Button>
+              </div>
+            </div>
+            {privateMode.genres.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-rose-300/70 mr-1">Categories:</span>
+                {privateMode.genres.map((tag) => (
+                  <button
+                    key={tag}
+                    type="button"
+                    onClick={() => {
+                      setExtGenre(tag);
+                      handleExtSearch(tag);
+                    }}
+                    className={`px-2 py-0.5 rounded-md text-[11px] border transition-colors ${
+                      extGenre.toLowerCase() === tag
+                        ? "bg-rose-500/30 text-rose-200 border-rose-400"
+                        : "bg-card/60 text-muted-foreground border-border/60 hover:text-rose-200 hover:border-rose-500/40"
+                    }`}
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            )}
+          </form>
+        )}
+
         {/* Search history dropdown panel */}
         {showHistory && (
           <div
@@ -738,7 +874,14 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
 
             {/* Source filter pills row */}
             <div className="flex flex-wrap items-center justify-center gap-1.5">
-              {SOURCE_FILTERS.map((f) => {
+              {[
+                ...SOURCE_FILTERS,
+                ...Object.entries(privateMode?.sourceLabels ?? {}).map(([value, meta]) => ({
+                  value: value as SourceFilter,
+                  label: meta.label,
+                  color: meta.color,
+                })),
+              ].map((f) => {
                 const isActive = filter === f.value;
                 const count =
                   f.value === "all"
@@ -872,8 +1015,9 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
                     {m.coverUrl ? (
                       <>
                         <img
-                          src={m.coverUrl}
+                          src={`/api/cover?url=${encodeURIComponent(m.coverUrl)}`}
                           alt={m.title}
+                          referrerPolicy="no-referrer"
                           className="w-full h-full object-cover group-hover:scale-105 group-hover:brightness-110 transition-all duration-500"
                           loading="lazy"
                         />
@@ -886,9 +1030,9 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
                       </div>
                     )}
                     <span
-                      className={`absolute top-1.5 left-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-md border backdrop-blur-sm ${SOURCE_BADGE_CLASSES[source]}`}
+                      className={`absolute top-1.5 left-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-md border backdrop-blur-sm ${SOURCE_BADGE_CLASSES[source] ?? privateMode?.sourceLabels?.[source]?.badge ?? "bg-zinc-500/20 text-zinc-200 border-zinc-500/40"}`}
                     >
-                      {isResolving ? "…" : SOURCE_LABEL[source]}
+                      {isResolving ? "…" : (SOURCE_LABEL[source] ?? privateMode?.sourceLabels?.[source]?.label ?? source)}
                     </span>
                     <span
                       className={`absolute top-1.5 right-1.5 h-2 w-2 rounded-full ${CONTENT_RATING_CLASSES[contentRating] ?? "bg-emerald-500"}`}
@@ -919,7 +1063,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
                         rel="noopener noreferrer"
                         onClick={(e) => e.stopPropagation()}
                         className="absolute top-1.5 right-1.5 p-1 rounded bg-black/50 text-white/80 hover:text-white hover:bg-black/70 transition z-10"
-                        aria-label={`View ${SOURCE_LABEL[source]} page`}
+                        aria-label={`View ${(SOURCE_LABEL[source] ?? privateMode?.sourceLabels?.[source]?.label ?? source)} page`}
                       >
                         <ExternalLink className="h-3 w-3" />
                       </a>
@@ -981,7 +1125,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
         {hasSearched && !loading && results.length > 0 && (
           <p className="text-center text-xs text-muted-foreground/60">
             {sourceCounts
-              ? `MangaDex: ${sourceCounts.mangadex} · MangaGeko: ${sourceCounts.mgeko} · Webtoons: ${sourceCounts.webtoons} · MangaPill: ${sourceCounts.mangapill} · Comick: ${sourceCounts.comick} · MangaHere: ${sourceCounts.mangahere} · FanFox: ${sourceCounts.fanfox} · AsuraScans: ${sourceCounts.asurascans} · MAL: ${sourceCounts.mal} · AniList: ${sourceCounts.anilist}`
+              ? `AsuraScans: ${sourceCounts.asurascans} · ThunderScans: ${sourceCounts.thunderscans ?? 0} · VortexScans: ${sourceCounts.vortexscans ?? 0} · RizzFables: ${sourceCounts.rizzfables ?? 0} · Webtoons: ${sourceCounts.webtoons} · MangaGeko: ${sourceCounts.mgeko} · MangaDex: ${sourceCounts.mangadex} · MangaHere: ${sourceCounts.mangahere} · FanFox: ${sourceCounts.fanfox} · MAL: ${sourceCounts.mal} · AniList: ${sourceCounts.anilist}`
               : ""}{" "}
             — metadata-only results (MAL/AniList) are auto-matched to a scrapeable source on selection.
           </p>

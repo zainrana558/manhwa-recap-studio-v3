@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "bun --hot index.ts",
-    "start": "bun index.ts"
+    "start": "bun --env-file=../../.env index.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1095.0",

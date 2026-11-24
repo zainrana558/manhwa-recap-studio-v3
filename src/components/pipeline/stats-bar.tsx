@@ -7,6 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 interface Stats {
   totalJobs: number;
   completedJobs: number;
+  activeJobs?: number;
   totalChapters: number;
   totalImages: number;
   archivedJobs?: number;
@@ -21,7 +22,7 @@ interface PlatformStat {
 }
 
 const PLATFORM_STATS: PlatformStat[] = [
-  { icon: Search, label: "Sources", value: "6", color: "text-amber-400", barColor: "bg-amber-400" },
+  { icon: Search, label: "Sources", value: "12", color: "text-amber-400", barColor: "bg-amber-400" },
   { icon: Zap, label: "TTS Voices", value: "55+", color: "text-emerald-400", barColor: "bg-emerald-400" },
   { icon: Users, label: "Languages", value: "9+", color: "text-sky-400", barColor: "bg-sky-400" },
   { icon: Database, label: "API Providers", value: "3", color: "text-fuchsia-400", barColor: "bg-fuchsia-400" },
@@ -72,13 +73,24 @@ export function StatsBar() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/stats")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data && !data.error) setStats(data);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    const loadStats = () => {
+      fetch("/api/stats")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!cancelled && data && !data.error) setStats(data);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    };
+    loadStats();
+    const timer = setInterval(loadStats, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, []);
 
   if (loading) {
@@ -120,7 +132,7 @@ export function StatsBar() {
     { icon: Film, label: "Videos", value: String(stats.completedJobs), color: "text-emerald-400", barColor: "bg-emerald-400" },
     { icon: Play, label: "Jobs", value: String(stats.totalJobs), color: "text-sky-400", barColor: "bg-sky-400" },
     { icon: ImageIcon, label: "Images", value: stats.totalImages.toLocaleString(), color: "text-amber-400", barColor: "bg-amber-400" },
-    { icon: Clock, label: "In Progress", value: String(stats.totalJobs - stats.completedJobs), color: "text-fuchsia-400", barColor: "bg-fuchsia-400" },
+    { icon: Clock, label: "In Progress", value: String(stats.activeJobs ?? 0), color: "text-fuchsia-400", barColor: "bg-fuchsia-400" },
   ];
 
   if (stats.archivedJobs && stats.archivedJobs > 0) {

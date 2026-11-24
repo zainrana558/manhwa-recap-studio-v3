@@ -210,7 +210,7 @@ export function JobHistory({ onSelectJob, refreshKey }: JobHistoryProps) {
           <div className="text-center space-y-1.5">
             <p className="text-sm font-semibold text-muted-foreground">No jobs yet</p>
             <p className="text-xs text-muted-foreground/60 max-w-xs leading-relaxed">
-              Search for a manhwa above to create your first recap video. It takes about 6 minutes per chapter.
+              Search for a manhwa above to create your first recap video. It takes about 2 minutes per chapter.
             </p>
           </div>
           <div className="flex items-center gap-2 text-[10px] text-muted-foreground/40">
@@ -245,7 +245,7 @@ export function JobHistory({ onSelectJob, refreshKey }: JobHistoryProps) {
                 {/* Cover image */}
                 <div className="w-10 h-14 rounded-lg overflow-hidden bg-muted flex-shrink-0 border border-border relative">
                   {job.coverUrl ? (
-                    <img src={job.coverUrl} alt="" className="w-full h-full object-cover" />
+                    <img src={job.coverUrl} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center">
                       <Film className="h-4 w-4 text-muted-foreground/30" />

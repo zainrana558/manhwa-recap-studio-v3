@@ -40,7 +40,13 @@ _KOKORO_MODELS = os.path.join(_HERE, "models", "kokoro")
 
 async def _generate_edge(voice: str, text: str, output: str) -> None:
     import edge_tts
-    await edge_tts.Communicate(text, voice).save(output)
+    tts_rate, tts_pitch = "+0%", "+0Hz"
+    try:
+        from private_voice import resolve_voice_params
+        voice, tts_rate, tts_pitch = resolve_voice_params(voice)
+    except ImportError:
+        pass
+    await edge_tts.Communicate(text, voice, rate=tts_rate, pitch=tts_pitch).save(output)
 
 
 def _generate_kokoro(voice: str, text: str, output: str) -> None:

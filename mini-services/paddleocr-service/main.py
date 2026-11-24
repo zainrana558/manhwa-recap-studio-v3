@@ -9,6 +9,8 @@ captions.
 Port: 3002
 """
 
+import contextvars
+import difflib
 import json
 import os
 import signal
@@ -774,13 +776,14 @@ def _load_clean_dict():
     # type: () -> set
     """The system spellcheck word list — clean, unlike wordninja's frequency
     list which is polluted with glued tokens ('atleast', 'bethe') and rare
-    surnames. Used to gate word-splitting so a real merged pair is split but
-    a romanised name is not."""
+    surnames. Filters out capitalized proper nouns ('Kim', 'Han', 'Martel')
+    so romanised names cannot pollute common-word checks."""
     for p in ("/usr/share/dict/american-english", "/usr/share/dict/words"):
         try:
             with open(p, encoding="utf-8", errors="ignore") as f:
-                d = {ln.strip().lower() for ln in f
-                     if ln.strip().isalpha() and len(ln.strip()) >= 2}
+                lines = [ln.strip() for ln in f if ln.strip().isalpha() and len(ln.strip()) >= 2]
+            lower_only = {s for s in lines if s.islower()}
+            d = lower_only if len(lower_only) > 20000 else {s.lower() for s in lines}
             if len(d) > 20000:
                 return d
         except OSError:
@@ -825,8 +828,32 @@ def _is_common_word(w):
     if wl in _SPLIT_FUNCTION_WORDS:
         return True
     if _CLEAN_DICT:
-        return wl in _CLEAN_DICT
-    return len(wl) >= 2 and _WORDCOST.get(wl, 99.0) <= 11.0
+        return wl in _CLEAN_DICT or (len(wl) >= 5 and wl in _EXTRA_WORDS and wl not in _SFX_WORDS)
+    if len(wl) >= 5 and wl in _EXTRA_WORDS and wl not in _SFX_WORDS:
+        return True
+    return len(wl) >= 2 and _WORDCOST.get(wl, 99.0) <= 13.0
+
+
+_CONTRACTION_STEMS = {
+    "i", "don", "doesn", "didn", "can", "couldn", "wouldn", "shouldn",
+    "isn", "wasn", "aren", "weren", "hasn", "haven", "hadn", "won", "shan",
+    "let", "there", "that", "here", "what", "who", "where", "how",
+}
+
+
+def _is_common_target(w):
+    # type: (str) -> bool
+    """True for common English words AND standard contractions ("I'M", "ISN'T",
+    "WOULDN'T") so learned corrections targeting contractions aren't dropped."""
+    wl = re.sub(r"[^a-z']", "", (w or "").lower()).strip("'")
+    if not wl:
+        return False
+    if "'" in wl:
+        parts = wl.split("'")
+        if len(parts) != 2 or not parts[0] or parts[1] not in ("s", "t", "m", "re", "ve", "ll", "d"):
+            return False
+        return parts[0] in _CONTRACTION_STEMS or _is_common_word(parts[0])
+    return _is_common_word(wl) or wl in _SPLIT_FUNCTION_WORDS
 
 
 # Words the OCR (and its training corpus) frequently glues together, where
@@ -838,6 +865,12 @@ _GLUED_WORDS = {
     "eachother": "each other", "nomatter": "no matter", "thankyou": "thank you",
     "everytime": "every time", "infact": "in fact", "aslong": "as long",
     "atall": "at all", "bethe": "be the", "asif": "as if",
+    "ofthe": "of the", "tothe": "to the", "inthe": "in the",
+    "onthe": "on the", "atthe": "at the", "isthe": "is the",
+    "asthe": "as the", "bythe": "by the", "forthe": "for the",
+    "andthe": "and the", "heis": "he is", "itis": "it is",
+    "weare": "we are", "youare": "you are", "theyare": "they are",
+    "thatis": "that is", "whatis": "what is", "thereis": "there is",
 }
 
 
@@ -876,28 +909,49 @@ _SFX_WORDS = {
     "aah", "ahh", "ooh", "ohh", "eek", "whew", "phew", "uwah", "waah", "wah",
     "gwah", "kya", "kyaa", "nng", "nngh", "hnng", "urgh", "blegh", "ack", "gack",
     "humph", "hmph", "hmp", "harrumph", "pff", "pfft", "meh", "bah", "psh", "feh",
+    # romanized manga/manhwa SFX
+    "dokin", "doon", "gagi", "gogogo", "kacha", "baki", "zubaa", "zashu",
+    "badump", "shoom", "kwaaang", "kwaang", "fwooom", "shiiing", "zwoosh",
+    "vwoom", "crak", "krak", "thwomp", "skree",
 }
 _SFX_TAIL_RE = re.compile(r"^[A-Z]*(?:SH|OSH|OOSH|OM|OOM|NG|ANG|ONG|CK|MP|ZZ|RR)$")
 _SFX_SYLLABLE_RE = re.compile(r"(?:ha|he|hi|ho|hu|ja|ka|ke|na|la|da|ba|wa|nya|mwa|bwa)+$", re.I)
 
 
-def _is_probable_sfx(tok):
-    # type: (str) -> bool
+def _has_close_common_word(core, cutoff=0.82):
+    # type: (str, float) -> bool
+    """True when an uppercase non-word like UIGHTNING / FIIGHTING / ATTACCK /
+    LSING sits very close to a common English word, meaning it is a dialogue
+    typo rather than an impact/scream SFX that just happens to end in -NG/-CK."""
+    if _rf_process is None or len(core) < 4:
+        return False
+    key = core.lower()
+    cands = _spell_candidates(len(key))
+    if not cands:
+        return False
+    hits = _rf_process.extract(key, cands, scorer=_rf_Indel.normalized_similarity,
+                               score_cutoff=cutoff, limit=2)
+    return any(_is_common_word(w) and len(w) >= 4 and not w.endswith(("oo", "ah"))
+               for w, _score, _ in hits)
+
+
+def _is_probable_sfx(tok, explicit_only=False):
+    # type: (str, bool) -> bool
     core = re.sub(r"[^A-Za-z]", "", tok)
     if len(core) < 2:
         return False
     if core.lower() in _SFX_WORDS:
         return True
-    # a stretched letter is the signature of a shout / crash ("BOOOM",
-    # "AAARGH", "GRRR", "NOOO", "HMMM")
     if re.search(r"(.)\1{2,}", core):
         return True
-    # repeated CV syllable = laughter / chant ("HAHA", "NANANA", "KEKEKE")
     if len(core) >= 4 and _SFX_SYLLABLE_RE.fullmatch(core.lower()):
         return True
-    # short all-caps blob ending like an impact sound, not a real word
+    if explicit_only:
+        return False
     if core.isupper() and 3 <= len(core) <= 9 and _SFX_TAIL_RE.match(core) \
-            and not _is_dict_word(core):
+            and not _is_dict_word(core) and not (_CLEAN_DICT and core.lower() in _CLEAN_DICT):
+        if _has_close_common_word(core):
+            return False
         return True
     return False
 
@@ -923,12 +977,17 @@ def _spell_candidates(n):
     # type: (int) -> list
     b = _DICT_BUCKETS.get(n)
     if b is None:
-        # OCR mis-recognitions add stray characters far more often than they
-        # drop them ("dunngoeoon" is 3 longer than "dungeon"), so the window
-        # reaches further BELOW the observed length than above.
-        lo, hi = n - 4, n + 2
+        lo, hi = max(2, n - 4), n + 2
+        # Intersect frequency-ranked _WORDCOST (c <= 13.8) with _is_common_word
+        # so neither surnames ("martel") nor ultra-rare wamerican words ("beeves")
+        # hijack common English fixes. Also include long _EXTRA_WORDS (>= 5 chars).
         b = [w for w, c in _WORDCOST.items()
-             if lo <= len(w) <= hi and c <= 13.6 and w.isalpha()]
+             if lo <= len(w) <= hi and c <= 13.8 and w.isalpha() and _is_common_word(w)]
+        if _EXTRA_WORDS:
+            seen = set(b)
+            for w in _EXTRA_WORDS:
+                if lo <= len(w) <= hi and w.isalpha() and len(w) >= 5 and w not in _SFX_WORDS and w not in seen:
+                    b.append(w)
         _DICT_BUCKETS[n] = b
     return b
 
@@ -968,138 +1027,221 @@ def _get_mlm():
     return _mlm_tokenizer, _mlm_model
 
 
-def _disambiguate_tie(context_tokens, idx, candidates):
-    # type: (List[str], int, List[str]) -> Optional[str]
-    """Pick between 2 tied spell-correction candidates using the sentence
-    they actually appear in, via a masked-LM cloze prediction, instead of
-    an arbitrary (effectively random) tie-break. Returns the chosen
-    candidate's exact string (lowercase), or None if the model isn't
-    available or gives no usable signal -- callers should fall back to the
-    existing deterministic behavior in that case, never guess further."""
+def _disambiguate_tie(context_tokens, idx, candidates, min_prob=0.0, min_ratio=1.0):
+    # type: (List[str], int, List[str], float, float) -> Optional[str]
+    """Pick between tied or ambiguous candidates using the sentence via a
+    masked-LM cloze prediction (supporting both single-token and multi-subword
+    candidates via joint pseudo-log-likelihood). When `min_prob`/`min_ratio`
+    are set, only returns a winner when its probability clears both floors."""
     tok, model = _get_mlm()
-    if tok is None:
+    if tok is None or not context_tokens or idx is None or not (0 <= idx < len(context_tokens)):
         return None
     try:
+        import math
         import torch
-        masked = list(context_tokens)
-        masked[idx] = tok.mask_token
-        sentence = " ".join(masked)
-        inputs = tok(sentence, return_tensors="pt", truncation=True, max_length=64)
-        mask_positions = (inputs.input_ids[0] == tok.mask_token_id).nonzero(as_tuple=True)[0]
-        if len(mask_positions) == 0:
-            return None
-        with torch.no_grad():
-            logits = model(**inputs).logits
-        probs = torch.softmax(logits[0, mask_positions[0]], dim=-1)
-        scored = []
+        dedup = []
+        seen = set()
         for c in candidates:
-            cid = tok.convert_tokens_to_ids(c.lower())
-            if cid is None or cid == tok.unk_token_id:
-                continue
-            scored.append((c.lower(), probs[cid].item()))
+            cl = c.lower()
+            if cl and cl not in seen:
+                seen.add(cl)
+                sub_ids = tok.encode(cl, add_special_tokens=False)
+                if sub_ids:
+                    dedup.append((cl, sub_ids))
+        if not dedup:
+            return None
+        scored = []
+        single_only = [(cl, ids[0]) for cl, ids in dedup if len(ids) == 1]
+        multi = [(cl, ids) for cl, ids in dedup if len(ids) > 1]
+        if single_only:
+            masked = list(context_tokens)
+            masked[idx] = tok.mask_token
+            inputs = tok(" ".join(masked), return_tensors="pt", truncation=True, max_length=64)
+            mask_positions = (inputs.input_ids[0] == tok.mask_token_id).nonzero(as_tuple=True)[0]
+            if len(mask_positions) > 0:
+                with torch.no_grad():
+                    logits = model(**inputs).logits
+                probs = torch.softmax(logits[0, mask_positions[0]], dim=-1)
+                for cl, tid in single_only:
+                    scored.append((cl, probs[tid].item()))
+        if multi:
+            prefix = " ".join(context_tokens[:idx])
+            suffix = " ".join(context_tokens[idx + 1:])
+            p_ids = tok.encode(prefix, add_special_tokens=False) if prefix else []
+            s_ids = tok.encode(suffix, add_special_tokens=False) if suffix else []
+            rows, mask_cols, target_ids, owner = [], [], [], []
+            for cl, sub_ids in multi:
+                if 2 + len(p_ids) + len(sub_ids) > 64:
+                    continue
+                for k, tid in enumerate(sub_ids):
+                    seq = ([tok.cls_token_id] + p_ids + list(sub_ids) + s_ids + [tok.sep_token_id])[:64]
+                    pos = 1 + len(p_ids) + k
+                    if pos >= len(seq):
+                        break
+                    seq[pos] = tok.mask_token_id
+                    rows.append(seq)
+                    mask_cols.append(pos)
+                    target_ids.append(tid)
+                    owner.append(cl)
+            if rows:
+                max_len = max(len(r) for r in rows)
+                pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+                padded = [r + [pad_id] * (max_len - len(r)) for r in rows]
+                attn = [[1] * len(r) + [0] * (max_len - len(r)) for r in rows]
+                with torch.no_grad():
+                    logits = model(
+                        input_ids=torch.tensor(padded, dtype=torch.long),
+                        attention_mask=torch.tensor(attn, dtype=torch.long),
+                    ).logits
+                by_cand = {}
+                for r_i, pos, tid, cl in zip(range(len(rows)), mask_cols, target_ids, owner):
+                    lp = torch.log_softmax(logits[r_i, pos], dim=-1)[tid].item()
+                    by_cand[cl] = by_cand.get(cl, 0.0) + lp
+                for cl, sum_lp in by_cand.items():
+                    scored.append((cl, math.exp(sum_lp)))
         if not scored:
             return None
-        return max(scored, key=lambda x: x[1])[0]
+        scored.sort(key=lambda x: -x[1])
+        best_w, best_p = scored[0]
+        second_p = scored[1][1] if len(scored) > 1 else 0.0
+        if best_p < min_prob:
+            return None
+        if min_ratio > 1.0 and second_p > 0 and (best_p / second_p) < min_ratio:
+            return None
+        return best_w
     except Exception as e:
         logger.debug("MLM disambiguation failed (%s) -- falling back", e)
         return None
 
 
+_VISUAL_MULTI_SWAPS = (
+    ("u", "li"), ("li", "u"), ("lu", "iv"), ("cl", "d"),
+    ("rn", "m"), ("m", "rn"), ("vv", "w"), ("ii", "u"),
+)
+_VISUAL_CHAR_SWAPS = (
+    ("u", "l"), ("h", "l"), ("u", "c"), ("m", "v"), ("b", "e"),
+    ("l", "i"), ("c", "b"), ("c", "g"), ("u", "ll"),
+)
+
+
+def _visual_glyph_candidates(key):
+    # type: (str) -> List[str]
+    """Common-word candidates reachable by 1 known webtoon-font glyph confusion
+    ("beueve"->"believe", "dluine"->"divine", "pahace"->"palace", "dimine"->"divine")."""
+    if len(key) < 5:
+        return []
+    hits = []
+    seen = set()
+
+    def _try_add(cw, max_cost=12.5):
+        if cw != key and len(cw) >= 4 and cw not in seen and _is_common_word(cw):
+            if _WORDCOST.get(cw, 99.0) <= max_cost or (_CLEAN_DICT and cw in _CLEAN_DICT):
+                seen.add(cw)
+                hits.append(cw)
+
+    for pat, repl in _VISUAL_MULTI_SWAPS:
+        start = 0
+        while True:
+            pos = key.find(pat, start)
+            if pos < 0:
+                break
+            _try_add(key[:pos] + repl + key[pos + len(pat):], max_cost=13.5)
+            start = pos + 1
+    for a, b in _VISUAL_CHAR_SWAPS:
+        for pos, ch in enumerate(key):
+            if ch == a:
+                _try_add(key[:pos] + b + key[pos + 1:], max_cost=11.5)
+    return hits
+
+
 def _correct_token(tok, context_tokens=None, idx=None):
     # type: (str, Optional[List[str]], Optional[int]) -> str
     """Return a corrected spelling for a single OCR token, or the token
-    unchanged. Only fires on a clearly non-word of length >= 5 that has a
-    very close real-word neighbour — so character names and sound effects
-    (no close dictionary neighbour) pass straight through. Hyphenated /
-    apostrophe'd tokens (stutters "M-MOVE", compounds "LOW-TIER",
-    contractions) are left alone.
-
-    context_tokens/idx (the full token list this token came from, and its
-    position in it) are used ONLY to break a genuine tie between two
-    similarly-scored candidates via a small masked-LM (see
-    _disambiguate_tie) — e.g. "lkes" is equidistant from both "likes" and
-    "lakes" by edit distance alone (proven: identical indel/JW scores), and
-    picking one is a coin flip without the surrounding sentence. Callers
-    that don't have context (or during tests) can omit these and get the
-    exact pre-existing single-best-candidate behavior."""
-    if _rf_process is None or not _WORDCOST:
+    unchanged. Character names and explicit SFX pass through."""
+    if _rf_process is None or not (_WORDCOST or _CLEAN_DICT):
         return tok
     if "-" in tok or "'" in tok or "’" in tok:
         return tok
     core = re.sub(r"[^A-Za-z]", "", tok)
-    # Floor was 5 -- verified (real 4-letter substitution pairs: than/then,
-    # chat/that, ever/even, were/here, wave/gave, warm/worm, best/rest,
-    # fast/last all score indel=0.75, safely below the 0.80 gate below) that
-    # dropping to 4 doesn't let same-length substitutions merge distinct
-    # real words. It's specifically needed for a DELETION dropping a
-    # 5-letter word to 4 chars ("likes" -> "lkes", indel=0.89/jw=0.94 --
-    # comfortably clears both gates and is nothing like the substitution
-    # pairs above). Below 4, single-letter words get too ambiguous either
-    # way to risk it.
     if len(core) < 4 or any(ch.isdigit() for ch in tok):
         return tok
-    if _is_dict_word(core) or _is_probable_sfx(tok):
+    if _is_dict_word(core) or (_CLEAN_DICT and core.lower() in _CLEAN_DICT) or _is_known_wordform(core):
+        return tok
+    if _is_probable_sfx(tok):
         return tok
     key = core.lower()
+    _slug = _get_series_slug()
+    try:
+        _sc = _load_corrections(_slug)
+    except Exception:
+        _sc = {}
+    if key in (_sc.get("names") or ()):
+        return tok
+    if key.upper() in (_sc.get("tokens") or {}) or key.upper() in (_sc.get("conflicts") or {}):
+        return tok
     if key in _SPELL_CACHE:
-        cand = _SPELL_CACHE[key]
-    else:
-        cand = None
-        tie_candidate = None
-        # top-2, not top-1: need the runner-up to detect a genuine tie.
-        results = _rf_process.extract(
-            key, _spell_candidates(len(key)),
-            scorer=_rf_Indel.normalized_similarity, score_cutoff=0.80, limit=2)
-        if results:
-            w, indel, _score_idx = results[0]
-            if abs(len(w) - len(key)) <= max(3, len(key) // 2):
-                jw = _rf_JW.normalized_similarity(key, w)
+        cached = _SPELL_CACHE[key]
+        if isinstance(cached, tuple):
+            if context_tokens is not None and idx is not None:
+                resolved = _disambiguate_tie(context_tokens, idx, list(cached))
+                if resolved:
+                    return _apply_case(tok, core, resolved)
+            return _apply_case(tok, core, cached[0])
+        if not cached:
+            return tok
+        return _apply_case(tok, core, cached)
 
-                def _gate(cw, ind):
-                    # Only ever correct TO a clean-dictionary word (never to
-                    # wordninja-list junk like "muri"), and:
-                    #  - near-identical  -> typo, fix it
-                    #  - close + strong prefix match  -> OCR letter swap
-                    #  - a pure adjacent transposition ("escpae"->"escape")
-                    #  - looser, but only if the OCR token itself looks
-                    #    mangled ("dunngoeoon" - 4 vowels in a row)
-                    # A romanised name ('SUNBAE','GONGJA','JAIHUAN') sits one
-                    # substitution (indel ~0.83) from a real word but has
-                    # clean phonotactics and a non-word target -> never fires.
-                    if not _is_common_word(cw):
-                        return False
-                    jwx = _rf_JW.normalized_similarity(key, cw)
-                    transposed = (len(key) == len(cw) and sorted(key) == sorted(cw)
-                                  and 0 < sum(a != b for a, b in zip(key, cw)) <= 2)
-                    return (ind >= 0.90
-                            or (ind >= 0.86 and jwx >= 0.90)
-                            or transposed
-                            or (ind >= 0.80 and jwx >= 0.88 and _looks_corrupted(key)))
+    cand = None
+    tie_candidates = None  # type: Optional[List[str]]
+    results = _rf_process.extract(
+        key, _spell_candidates(len(key)),
+        scorer=_rf_Indel.normalized_similarity, score_cutoff=0.80, limit=5)
 
-                if _gate(w, indel):
-                    cand = w
-                    if len(results) > 1:
-                        w2, indel2, _ = results[1]
-                        jw2 = _rf_JW.normalized_similarity(key, w2)
-                        gate2 = _gate(w2, indel2)
-                        # "tie" = both candidates clear the safety gate AND
-                        # score within 0.02 of each other (indel is 0-1) --
-                        # e.g. likes/lakes score IDENTICALLY here.
-                        if gate2 and w2.lower() != w.lower() and abs(indel - indel2) < 0.02:
-                            tie_candidate = w2
-        # A tied result is context-dependent (the same corrupted token can
-        # resolve differently in different sentences), so it must NOT go
-        # into _SPELL_CACHE the way a clean single-winner does -- caching it
-        # would freeze whichever sentence asked first as the answer for
-        # every future occurrence of this token regardless of its own
-        # context. Only cache the non-tied path.
-        if tie_candidate is not None and context_tokens is not None and idx is not None:
-            resolved = _disambiguate_tie(context_tokens, idx, [cand, tie_candidate])
+    def _gate(cw, ind):
+        if not _is_common_word(cw):
+            return False
+        jwx = _rf_JW.normalized_similarity(key, cw)
+        transposed = (len(key) == len(cw) and sorted(key) == sorted(cw)
+                      and 0 < sum(a != b for a, b in zip(key, cw)) <= 2)
+        return (ind >= 0.89
+                or (ind >= 0.87 and jwx >= 0.90)
+                or ((len(key) == len(cw) or len(key) >= 8) and ind >= 0.85 and jwx >= 0.92)
+                or transposed
+                or (ind >= 0.80 and jwx >= 0.88 and _looks_corrupted(key)))
+
+    gated = []
+    for w, indel, _score_idx in results:
+        if abs(len(w) - len(key)) <= max(3, len(key) // 2) and _gate(w, indel):
+            gated.append((w, indel))
+
+    vis_hits = _visual_glyph_candidates(key)
+
+    if gated:
+        w0, indel0 = gated[0]
+        cand = w0
+        tied = [w0]
+        for w2, indel2 in gated[1:]:
+            if w2.lower() != w0.lower() and abs(indel0 - indel2) < 0.025:
+                tied.append(w2)
+        for vh in vis_hits:
+            if vh not in tied:
+                tied.append(vh)
+        if len(tied) > 1:
+            tie_candidates = tied
+    elif vis_hits:
+        cand = vis_hits[0]
+        if len(vis_hits) > 1:
+            tie_candidates = vis_hits
+
+    if tie_candidates is not None:
+        _SPELL_CACHE[key] = tuple(tie_candidates)
+        if context_tokens is not None and idx is not None:
+            resolved = _disambiguate_tie(context_tokens, idx, tie_candidates)
             if resolved:
                 return _apply_case(tok, core, resolved)
-            # model unavailable/inconclusive -- fall through to the
-            # deterministic top-1 below, same as if there'd been no tie
-        _SPELL_CACHE[key] = cand
+        return _apply_case(tok, core, cand)
+
+    _SPELL_CACHE[key] = cand
     if not cand:
         return tok
     return _apply_case(tok, core, cand)
@@ -1123,9 +1265,25 @@ _SINGLE_LETTER_RUN_RE = re.compile(
 _SYMBOL_RUN_RE = re.compile(r"(?<![.!?])([^\w\s.!?'\"()\-’–—])\1{1,}")
 _VOWEL_RE = re.compile(r"[aeiouyAEIOUY]")
 
-# current series slug for the in-flight OCR batch (set by ocr_batch); read by
-# the garble detector and the correction layer.
+# current series slug for the in-flight OCR batch (isolated per async task/thread
+# via ContextVar, with dict fallback for single-process scripts and unit tests).
 _ocr_series_ctx = {"slug": "_none"}
+_ocr_series_var = contextvars.ContextVar("_ocr_series_slug", default="_none")
+
+
+def _get_series_slug():
+    # type: () -> str
+    v = _ocr_series_var.get()
+    if v and v != "_none":
+        return v
+    return _ocr_series_ctx.get("slug", "_none")
+
+
+def _set_series_slug(slug):
+    # type: (str) -> None
+    s = slug or "_none"
+    _ocr_series_var.set(s)
+    _ocr_series_ctx["slug"] = s
 
 
 def _looks_corrupted(s):
@@ -1142,6 +1300,8 @@ def _looks_corrupted(s):
     if re.search(r"(.)\1\1", sl):                       # 3+ same char in a row
         return True
     if re.search(r"[aeiouy]{3,}", sl):                  # 3+ vowels in a row
+        return True
+    if "ii" in sl:                                      # OCR split H/N/U/T into ii
         return True
     v = sum(c in "aeiouy" for c in sl)
     if v / len(sl) < 0.30:                              # very consonant-heavy
@@ -1233,27 +1393,50 @@ def _ocr_text_quality(text):
     return cost - 0.25 * dict_hits
 
 
-def _looks_like_ocr_garble(text):
-    # type: (str) -> bool
-    """Does a *confident* classical OCR result contain a mangled token — the
-    failure a low-confidence gate misses? Real Nano Machine cases at conf
-    0.84-0.99: "A HE'S BEHIND iiisn" (US!!!), "WHAT I CTNOHS DO" (SHOULD),
-    "IILLHS GUESS THERE IS NO CHOICE" (I).
+_ALNUM_UNIT_RE = re.compile(
+    r"^(?:\d+(?:st|nd|rd|th|km|m|cm|mm|kg|g|mg|lb|lbs|ft|in|hr|hrs|min|mins|sec|secs|hp|mp|xp|lv|lvl|fps|hz|k|mb|gb|tb|x|d)|"
+    r"(?:mp3|mp4|ak47|b12|c4|f1|s\d+|e\d+|[a-z]\d+))$",
+    re.IGNORECASE,
+)
 
-    Only second-guesses a result that is *mostly* real words — so a lone SFX
-    token ("THRRRK", "KAJIK") or a genuine name line isn't sent to the slow
-    VLM tier. A flagged panel is re-read by PaddleOCR variants + the VLM
-    tier(s); if none does better the original text is still returned.
-    """
+
+def _is_alnum_garble_token(tok):
+    # type: (str) -> bool
+    """True for mixed digit+letter non-word OCR garble like '9NIO9' or '0K4Y',
+    while preserving ordinals ('1st'), units ('100kg'), and RPG/short codes."""
+    if not tok or not re.fullmatch(r"(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{2,14}", tok):
+        return False
+    if _ALNUM_UNIT_RE.match(tok):
+        return False
+    # Digit-letter-digit bracketed tokens ('9NIO9', '0A1') are almost always OCR garble.
+    if re.match(r"^\d+[A-Za-z]+\d+", tok):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", tok)
+    if len(letters) >= 2 and not _is_known_wordform(letters):
+        return True
+    return False
+
+
+def _looks_like_ocr_garble(text, extra_names=None):
+    # type: (str, Optional[Any]) -> bool
+    """Does a *confident* classical OCR result contain a mangled token — the
+    failure a low-confidence gate misses?"""
     if not text:
         return False
-    try:
-        _nm = _load_corrections(_ocr_series_ctx.get("slug", "_none")).get("names") or frozenset()
-    except Exception:
-        _nm = frozenset()
+    if extra_names is not None:
+        _nm = frozenset(extra_names)
+    else:
+        try:
+            _nm = _load_corrections(_get_series_slug()).get("names") or frozenset()
+        except Exception:
+            _nm = frozenset()
 
     def _known(t):
         return _is_known_wordform(t) or re.sub(r"[^a-z]", "", t.lower()) in _nm
+
+    for _atok in re.findall(r"[A-Za-z0-9]+", text):
+        if _is_alnum_garble_token(_atok):
+            return True
 
     toks = re.findall(r"[A-Za-z][A-Za-z'’]*", text)
     real = [t for t in toks if len(t) >= 2]
@@ -1313,8 +1496,9 @@ def _repair_and_denoise(text):
     allcaps_panel = _upper >= 6 and _upper >= _lower * 4
     # raw-aggregator site watermark stamped into the panel ("www.baozimh.con",
     # often with the TLD mis-read). Strip just the URL token.
+    t = re.sub(r"\bhttps?://\S+", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b(?:https?://)?www\.\S+", " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\b[a-z][a-z0-9-]{2,}\.(?:com|net|org|con|c0m|xyz|top|io)\b(?=$|\s|[.,!?])",
+    t = re.sub(r"\b[a-z][a-z0-9-]{2,}\.(?:com|net|org|con|c0m|xyz|top|io)\b(?:/\S*)?(?=$|\s|[.,!?])",
                " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b(?:baozimh|mangabuddy|manhuaplus|manhuafast|asuracomic|flamescans?)\b",
                " ", t, flags=re.IGNORECASE)
@@ -1335,6 +1519,10 @@ def _repair_and_denoise(text):
         if not core:
             if re.fullmatch(r"(?:\.{2,}|!+|\?+|[!?]{2,}|[-–—]+|,)", tok):
                 out.append("..." if tok.startswith("..") else tok)
+            continue
+        # Fix digit+O confusion in numbers ("4O" -> "40", "1O" -> "10")
+        if re.fullmatch(r"\d+[Oo]+", core):
+            out.append(re.sub(r"(?<=\d)[Oo]+", lambda m: "0" * len(m.group(0)), tok))
             continue
         # ordinal ("3RD", "2ND", "1ST", "4TH") — keep intact; the "RD"/"ND"/
         # "TH" tail would otherwise be dropped by the vowel-less-shard rule
@@ -1360,8 +1548,12 @@ def _repair_and_denoise(text):
         if len(letters) >= 4 and nset == 2 and not _VOWEL_RE.search(letters):  # "WNWN"
             continue
         if 0 < len(letters) <= 4 and not _VOWEL_RE.search(letters) \
+                and not core[0].isdigit() \
                 and letters.upper() not in ("MR", "MRS", "DR", "ST", "TV", "HP", "MP"):
             continue                                              # "WN", "TTR"
+        if len(letters) >= 5 and not re.search(r"[aeiouyAEIOUY]", letters) \
+                and not core[0].isdigit() and not _is_probable_sfx(tok):
+            continue                                              # "QVRXHHSD", "DPBGZPGZ"
         if len(core) == 1 and core not in ("I", "A", "a") and not core.isdigit():
             continue
         # lowercase shard in an otherwise all-caps panel = mis-read texture
@@ -1426,9 +1618,13 @@ def _repair_and_denoise(text):
     # a panel whose ENTIRE transcription is one short lower-case non-word
     # ("winz", "inen", "ina") is the detector reading hatching/texture in an
     # art panel — no dialogue, drop it
+    if t and not re.search(r"[A-Za-z]", t):
+        return ""
     lone = re.sub(r"[^A-Za-z]", "", t)
     if t and lone == t.strip(".,!?:;'\"") and len(lone) <= 6 and lone.islower() \
             and not _is_dict_word(lone) and lone not in _REAL_SHORT_WORDS:
+        return ""
+    if t and _looks_like_ocr_noise(t):
         return ""
     return t
 
@@ -1455,20 +1651,46 @@ def _desegment_runon(text):
     text = re.sub(r"\b[A-Za-z]{4,}\b", _glued, text)
 
     def _splittable_part(p, short_token):
-        # every part must be a clean-dictionary word; for a short source token
-        # (< 8 chars) also require each part to be >= 3 chars OR a function
-        # word, so a romanised name ("GARAM" -> "GAR AM", "SEOLAH" -> "SEOL
-        # AH") is never split even though its syllables are dictionary words.
         if not _is_common_word(p):
             return False
-        if short_token and len(p) < 3 and p.lower() not in _SPLIT_FUNCTION_WORDS:
-            return False
+        pl = p.lower()
+        if short_token:
+            if len(pl) < 3 and pl not in _SPLIT_FUNCTION_WORDS:
+                return False
+            # Avoid splitting 6-7 char OCR typos into obscure 3+4 words ("MARTEAL"->"MAR TEAL")
+            if pl not in _SPLIT_FUNCTION_WORDS and _WORDCOST.get(pl, 99.0) > 11.2:
+                return False
         return True
+
+    _domain_vocab = _EXTRA_WORDS | _series_name_set(_get_series_slug())
+    try:
+        _known_corr_toks = _load_corrections(_get_series_slug()).get("tokens") or {}
+    except Exception:
+        _known_corr_toks = {}
+
+    def _split_domain_glue(tok):
+        low = tok.lower()
+        for dw in _domain_vocab:
+            if len(dw) < 4 or len(tok) <= len(dw) + 2:
+                continue
+            if low.startswith(dw) and _is_common_word(low[len(dw):]):
+                return tok[:len(dw)] + " " + tok[len(dw):]
+            if low.endswith(dw) and _is_common_word(low[:-len(dw)]):
+                split_at = len(tok) - len(dw)
+                return tok[:split_at] + " " + tok[split_at:]
+        return None
 
     def _fix(m):
         tok = m.group(0)
-        if len(tok) < 5 or _is_common_word(tok) or _is_probable_sfx(tok):
+        if len(tok) < 6 or _is_common_word(tok) or tok.lower() in _domain_vocab or tok.upper() in _known_corr_toks:
             return tok
+        if tok.lower() in _SFX_WORDS or _SFX_SYLLABLE_RE.fullmatch(tok.lower()):
+            return tok
+        if _SFX_TAIL_RE.match(tok.upper()) and len(tok) <= 9 and _is_probable_sfx(tok):
+            return tok
+        dom = _split_domain_glue(tok)
+        if dom:
+            return dom
         parts = _wordninja.split(tok)
         if len(parts) < 2 or sum(len(p) for p in parts) != len(tok):
             return tok
@@ -1481,6 +1703,8 @@ def _desegment_runon(text):
             i += len(p)
         return " ".join(out)
 
+    text = re.sub(r"\b([A-Za-z]+'(?:[sStTdDmM]|[rR][eE]|[vV][eE]|[lL][lL]))([A-Za-z]{2,})\b", r"\1 \2", text)
+    text = re.sub(r"\b([A-Za-z]{3,}')([A-Za-z]{3,})\b", r"\1 \2", text)
     return re.sub(r"[A-Za-z]{5,}", _fix, text)
 
 
@@ -1512,6 +1736,44 @@ def _clean_and_normalize_ocr_text(text: str) -> str:
     # OCR frequently drops the space after mid-sentence punctuation when two
     # bubbles are read in one pass ("SPELL,WANG" -> "SPELL, WANG"). Safe: an
     # apostrophe/decimal is a letter-adjacent case we exclude.
+    # Strip translator margin footnotes ("TN: ...", "CLARIFICATION ON THE LEVELS OF...",
+    # "KOREAN EQUIVALENT OF...") so margin explanations aren't narrated mid-dialogue.
+    t = re.sub(r"(?:^|\s)(?:TN|T/N|TL\s*NOTE)\s*:\s*.*$", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?:^|\s)(?:CLARIFICATION ON THE LEVELS OF|KOREAN EQUIVALENT OF)\b.*$", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\*[A-Za-z][A-Za-z ]{2,28}:[^.!?]*\brefers to\b[^.!?]*[.!?]?", " ", t, flags=re.IGNORECASE)
+    # Strip stylized dot-chains / HUD glyph gibberish ("mxo.nx.axexaxxaxo...", "xm.xngo0.om")
+    # and tokens carrying weird math/Greek OCR artifacts ("drΩT02TM", "'HE∀M").
+    t = re.sub(r"\S*[Ω∀∃∑∏∆∇√∞≈≠≤≥◆◇●○■□★☆]+\S*", " ", t)
+    t = re.sub(r"\b(?:[A-Za-z0-9]{1,5}\.){3,}[A-Za-z0-9]{1,5}\b", " ", t)
+    # Distressed handwritten dot-separated English phrases ("Its.as.if-" -> "Its as if-")
+    def _un_dot_phrase(m):
+        parts = m.group(0).split(".")
+        if all((_is_common_word(p.rstrip("-")) or p.rstrip("-").lower() in _REAL_SHORT_WORDS) for p in parts if p):
+            return " ".join(parts)
+        return m.group(0)
+    t = re.sub(r"\b[A-Za-z]{1,8}\.[A-Za-z]{1,8}\.[A-Za-z]{1,8}(?:-|\b)", _un_dot_phrase, t)
+    # Separate period-glued sentences ("NO.HE'S" -> "NO. HE'S", "HUMAN.THIS" -> "HUMAN. THIS")
+    t = re.sub(r"([A-Za-z]{2,})\.([A-Za-z]{2,})(?!\.(?:com|net|org|co|gg)\b)", r"\1. \2", t)
+    # Rejoin broken hyphen line-wraps ("MAR- TIAL" -> "MARTIAL", "ANCES- TOR" -> "ANCESTOR",
+    # "BLOOD- LINE" -> "BLOODLINE") whenever the joined word is a real English word.
+    _COMPOUND_HYPHEN_EXCEPTIONS = {
+        "bloodline", "already", "something", "someone", "anyone", "everyone",
+        "everything", "nothing", "somewhere", "meanwhile", "forever", "outside",
+        "inside", "without", "within", "understand", "underground", "however",
+        "therefore", "whatever", "whenever", "wherever", "martial", "ancestor",
+        "possible", "percentage", "invisible", "noticed",
+    }
+    def _rejoin_hyphen_wrap(m):
+        w1, w2 = m.group(1), m.group(2)
+        joined = w1 + w2
+        jl = joined.lower()
+        if (_is_known_wordform(jl) or jl in _COMPOUND_HYPHEN_EXCEPTIONS) and (
+            not (_is_known_wordform(w1.lower()) and _is_known_wordform(w2.lower()))
+            or jl in _COMPOUND_HYPHEN_EXCEPTIONS
+        ):
+            return joined
+        return m.group(0)
+    t = re.sub(r"\b([A-Za-z]{2,})-\s+([A-Za-z]{2,})\b", _rejoin_hyphen_wrap, t)
     t = re.sub(r'([A-Za-z]{2}),([A-Za-z]{2})', r'\1, \2', t)
     t = re.sub(r'([A-Za-z]{3})([!?])([A-Za-z]{2})', r'\1\2 \3', t)
     t = re.sub(r'\s*\b(minus|dash|underscore)\b\s*$', '...', t, flags=re.IGNORECASE)
@@ -1553,12 +1815,54 @@ def _clean_and_normalize_ocr_text(text: str) -> str:
 
     # possessive / contraction 's split off the word by a stray space around
     # the apostrophe ("DEMON' S" / "DRAGON 'S" -> "DEMON'S" / "DRAGON'S").
-    # Without this the orphaned "S" is swept away as a 1-char shard later.
     t = re.sub(r"\b([A-Za-z]{2,})'\s+([Ss])\b", r"\1'\2", t)
     t = re.sub(r"\b([A-Za-z]{2,})\s+'([Ss])\b", r"\1'\2", t)
     t = re.sub(r"\b([A-Za-z]{2,})\s+'\s+([Ss])\b", r"\1'\2", t)
 
-    return t
+    # Digit-as-word OCR confusions in unambiguous dialogue contexts:
+    _PRE_15_SKIP = {
+        "chapter", "episode", "form", "step", "stage", "rank", "grade",
+        "tier", "no", "number", "part", "floor", "level", "lvl", "age", "year",
+        "years", "minute", "minutes", "second", "seconds", "hour", "hours",
+        "day", "days", "month", "months", "round", "top", "page", "vol", "volume",
+        "at", "for", "of", "from", "to", "in", "by", "about", "around", "over", "under",
+    }
+    _POST_15_IS = {
+        "still", "not", "here", "there", "the", "a", "an", "being", "now", "very",
+        "so", "too", "already", "below", "above", "going", "coming", "this", "that",
+        "it", "dead", "alive", "able", "over", "done", "gone", "my", "his", "her",
+        "your", "our", "really", "actually", "just", "getting", "becoming", "looking",
+    }
+
+    def _fix_15(m):
+        pw, nw = m.group(1), m.group(2)
+        pl, nl = pw.lower(), nw.lower()
+        if pl == "level" and nl in ("below", "above"):
+            pass
+        elif pl in _PRE_15_SKIP or nl not in _POST_15_IS:
+            return m.group(0)
+        is_tok = "IS" if pw.isupper() else "is"
+        return f"{pw} {is_tok} {nw}"
+
+    t = re.sub(r"\b([A-Za-z]{2,})\s+15\s+([A-Za-z]+)\b", _fix_15, t)
+    t = re.sub(
+        r"(?<![\d.,#])\b1\b(?=\s+(?:AM|HAVE|HAD|WAS|WERE|WILL|WOULD|COULD|SHOULD|CAN|CAN'T|CANT|DON'T|DONT|DIDN'T|WON'T|MIGHT|MUST|NEED|THINK|KNOW|GUESS|BELIEVE|SEE|FEEL|WANT|MEAN)\b)",
+        "I",
+        t,
+    )
+
+    def _alnum_word_fix(m):
+        tok = m.group(0)
+        if re.fullmatch(r"\d+(?:st|nd|rd|th|[kmgt]?[bghmzs]?)", tok, re.I):
+            return tok
+        cand = tok.translate(str.maketrans("015", "OIS")).lower()
+        if cand.isalpha() and len(cand) >= 3 and _is_common_word(cand):
+            return cand.upper() if any(c.isupper() for c in tok) else cand
+        return tok
+
+    t = re.sub(r"\b(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*[015])[A-Za-z0-9]{3,}\b", _alnum_word_fix, t)
+
+    return re.sub(r"\s{2,}", " ", t).strip()
 
 
 def _sort_regions_reading_order(regions, is_ui_box=False):
@@ -1600,9 +1904,13 @@ def _sort_regions_reading_order(regions, is_ui_box=False):
                 v_ov = min(r.y_max, ln["y2"]) - max(r.y_min, ln["y1"])
                 if v_ov / min(rh, ln["y2"] - ln["y1"]) < 0.45:
                     continue
-                h_ov = min(r.x_max, ln["x2"]) - max(r.x_min, ln["x1"])
-                if h_ov / min(rw, ln["x2"] - ln["x1"]) > 0.25:
-                    continue  # stacked, not same line
+                # Check horizontal overlap against individual members on the line,
+                # NOT the outer [x1, x2] span (two outer words would falsely claim the
+                # middle of the line and push middle words onto fake separate lines).
+                if any((min(r.x_max, m.x_max) - max(r.x_min, m.x_min))
+                       / min(rw, max(1.0, m.x_max - m.x_min)) > 0.25
+                       for m in ln["members"]):
+                    continue  # stacked above/below a member, not same line
                 ln["members"].append(r)
                 ln["y1"] = min(ln["y1"], r.y_min); ln["y2"] = max(ln["y2"], r.y_max)
                 ln["x1"] = min(ln["x1"], r.x_min); ln["x2"] = max(ln["x2"], r.x_max)
@@ -1622,7 +1930,10 @@ def _sort_regions_reading_order(regions, is_ui_box=False):
         # bubbles overlap in BOTH x and y), group regions into bubbles by
         # spatial proximity, order the bubbles top-to-bottom / left-to-right,
         # then line-group within each bubble.
-        gap = med_h * 1.6
+        # Group lines belonging to the same speech bubble using each pair's own
+        # local line height rather than a tiny footnote skewing med_h, and allow
+        # slightly looser vertical spacing than horizontal gap so side-by-side
+        # columns don't merge into one cluster.
         parent = list(range(len(regs)))
 
         def find(i):
@@ -1634,9 +1945,10 @@ def _sort_regions_reading_order(regions, is_ui_box=False):
         for i in range(len(regs)):
             for j in range(i + 1, len(regs)):
                 a, b = regs[i], regs[j]
+                pair_h = max(med_h, min(max(1.0, a.y_max - a.y_min), max(1.0, b.y_max - b.y_min)))
                 dx = max(a.x_min - b.x_max, b.x_min - a.x_max, 0.0)
                 dy = max(a.y_min - b.y_max, b.y_min - a.y_max, 0.0)
-                if dx <= gap and dy <= gap:
+                if dx <= pair_h * 1.25 and dy <= pair_h * 1.35:
                     parent[find(i)] = find(j)
 
         groups = {}
@@ -1669,7 +1981,7 @@ def _sort_regions_reading_order(regions, is_ui_box=False):
             if g > v_gap:
                 v_gap, v_at = g, (cur_x2 + r.x_min) / 2.0
             cur_x2 = max(cur_x2, r.x_max)
-        if v_at is not None and v_gap >= max(med_h * 1.4, span_w * 0.09):
+        if v_at is not None and v_gap >= max(med_h * 1.15, span_w * 0.06, 20.0):
             left = [r for r in regs if (r.x_min + r.x_max) / 2.0 < v_at]
             right = [r for r in regs if (r.x_min + r.x_max) / 2.0 >= v_at]
             if left and right:
@@ -1693,10 +2005,28 @@ def _looks_like_ocr_noise(text):
         return s not in ("I", "A", "a")
     if re.fullmatch(r"(.)\1{2,}", s):                       # "OOOO", "!!!!"
         return True
+    # Bare digits/punctuation/phone-like numbers (e.g. Hangul circle 'ㅇ' misread as "0")
+    if re.fullmatch(r"[\d\W_]+", s):
+        return True
+    if re.search(r"[Ω∀∃∑∏∆∇√∞≈≠≤≥]", s):
+        return True
     toks = [t for t in re.split(r"\s+", s) if t]
     letters_only = re.sub(r"[^A-Za-z]", "", s)
     if not letters_only:
         return True
+    # Single stray letter + symbol ("I!", "I.", "$A", "i2", "/A1")
+    if len(toks) == 1 and len(letters_only) == 1 and s not in ("I", "A", "a", "I?", "I..."):
+        return True
+    # Lone 2-letter uppercase hallucination ("ER", "TE") not in valid 2-letter vocabulary
+    _VALID_2L = {
+        "ah", "am", "an", "as", "at", "aw", "be", "by", "do", "eh", "em", "ew",
+        "go", "ha", "he", "hi", "hm", "ho", "if", "in", "is", "it", "ma", "me",
+        "mm", "my", "na", "no", "of", "oh", "ok", "on", "or", "ow", "ox", "oy",
+        "pa", "so", "to", "uh", "um", "up", "us", "we", "ya", "ye", "yo",
+    }
+    if len(toks) == 1 and len(letters_only) == 2 and len(re.sub(r"[^A-Za-z0-9]", "", s)) <= 3:
+        if letters_only.lower() not in _VALID_2L:
+            return True
     # a run of short fragments, none of which is a real little word
     if len(toks) >= 2 and all(len(re.sub(r"[^A-Za-z]", "", t)) <= 2 for t in toks):
         if not any(t.lower() in ("i", "a", "an", "as", "at", "be", "is", "it", "no",
@@ -1704,8 +2034,10 @@ def _looks_like_ocr_noise(text):
                                  "we", "ah", "hi", "ha", "ho", "uh", "um", "my")
                    for t in toks):
             return True
-    # a single short vowel-less alpha blob ("NNW", "TTR", "WN")
+    # a single short vowel-less alpha blob ("NNW", "TTR", "WN"), excluding explicit SFX ("GRRR", "BZZT")
     if len(letters_only) <= 4 and not re.search(r"[aeiouyAEIOUY]", letters_only):
+        if _is_probable_sfx(s, explicit_only=True):
+            return False
         return True
     return False
 
@@ -1729,6 +2061,7 @@ _CORR_DIRS = [os.path.join(_HERE, "..", "..", "pipeline", "ocr-corrections"),
 _CORR_LEARN_DIR = _CORR_DIRS[1]
 _corr_cache = {}   # slug -> (mtime_sig, compiled)
 _corr_lock = threading.Lock()
+_corr_tls = threading.local()  # re-entrancy guard: _compile_learned -> _looks_like_ocr_garble -> _load_corrections
 
 
 def _slugify_series(name):
@@ -1744,10 +2077,23 @@ _CREDIT_LINE_RE = re.compile(
     r"(?i)(?:asura ?scan?s?|asura ?scams?|asura\.?gg|discord\.?gg|/asuran\b|"
     r"\bzo?doc?c\b|\brodocc\b|\bpedoce\b|korean ?translators?|recruiting now|"
     r"for the fastest releases?|read (?:it |them )?at for the|"
-    r"re?[dl] ?ice s[tu][tu][dl][il][oc]|"                       # Red ice Studio / Studic / Stutlo
+    r"re?[dl] ?ice ?s[tu][tu][dl][il](?:[oc]\w*)?|redice(?:inc|studio)?|"
+    r"\b(?:asura|reap(?:er)?|flame|lumi|sura|void|realm|leva|astr[ao]|drake|reset|night|manhwa\s*freak)\s*scans?\b|"
+    r"(?:asura|reap(?:er)?|flame|lumi|suras?)\s*scans?\s*\.\s*(?:com|gg|co|net)(?:/\S*)?|"
+    r"\b(?:patr[e]?on\s*\.\s*com|paypal\s*\.\s*me|ko-?fi\s*\.\s*com)(?:/|\b)|"
+    r"[a-z0-9._%+-]+\s*@\s*gmail\s*\.\s*com|"
+    r"support\s+the\s+mangaka\s+by\s+buying|buying\s+the\s+official\s+version|"
+    r"(?:hello|dear)[,\s]+readers\b|we\s+are\s+currently\s+(?:looking\s+)?for|wish\s+to\s+help\s+us\s+out\s+and\s+join\s+the\s+team|"
+    r"if\s+you\s+enjoy\s+our\s+work|contact\s+us\s+through\s+(?:either\s+)?(?:gmail|discord)|"
+    r"join\s+our\s+discord|tra\s+pro\s+cle\s+red\s+typ\s+qua|"
+    r"translator\s*:\s*\S+.*(?:proof\s*reader|cleaner|re\s*drawer|typesetter|quality)\s*:|"
+    r"\blans\.co\.?\b|\breapscans\.co\.?\b|\bsurascans\b|\bmgeko(?:\.cc)?\b|"
+    r"updates\s+new\s+comics(?:\s+active\s+community)?|active\s+community|fastest\s+updates|"
+    r"^\W*(?:(?:[a-z]{1,3}|d\s*&\s*c)\W+){0,2}webtoon(?:\W+.*redice.*)?\W*$|"
+    r"this manhwa chapter ends on novel chapter|continue reading the novel at|"
     r"\bartista\b|han ?joong ?w[u]?eol ?ya|w[u]?eol ?ya\b|guem ?gang ?bul ?gae|"
     r"\bartist ?a?\b.{0,40}\bstudi[oc]\b|author ?[-:·]? ?han ?joong|"
-    r"novel ?chapters? ?:|published by river|read at\b.{0,20}fastest)"
+    r"novel ?chapters? ?:|published by river|read at\b.{0,40}fastest)"
 )
 # a run of scanlation staff-list tokens ("NANO MACHINE OAKS SCARPET SCARPET KIRO
 # RUSH REGIS", "DOTORI BRAHIMM DAN") that OCR lifts off the credits banner —
@@ -1756,12 +2102,32 @@ _CREDIT_STAFF_RE = re.compile(
     r"(?i)\b(?:nano ?machine|oaks|scarpet|kiro|dotori|brahimm|regis|kishi|rush|"
     r"lance|peri|victor|joemama|euwen|dan|mado|med|me|reg is)\b")
 
+_PROMO_BANNER_RE = re.compile(
+    r"(?i)(?:this manhwa chapter ends on novel chapter\b|"
+    r"continue reading (?:the )?novel at\b|"
+    r"read (?:it |them )?at .{0,35}for the fastest releases?|"
+    r"for the fastest releases?\s*$|"
+    r"updates\s+new\s+comics(?:\s+active\s+community)?|\bmgeko\.cc\b|"
+    r"redice(?:inc|studio)\b.{0,20}|\bwebtoon\b.*redice|"
+    r"^\W*(?:(?:[a-z]{1,3}|d\s*&\s*c)\W+){0,2}webtoon\W*$|"
+    r"support\s+the\s+mangaka\s+by\s+buying|buying\s+the\s+official\s+version|"
+    r"(?:hello|dear)[,\s]+readers\b|we\s+are\s+currently\s+(?:looking\s+)?for|wish\s+to\s+help\s+us\s+out\s+and\s+join\s+the\s+team|"
+    r"if\s+you\s+enjoy\s+our\s+work|contact\s+us\s+through\s+(?:either\s+)?(?:gmail|discord)|"
+    r"join\s+our\s+discord\s+to\s+get\s+updates|\btra\s+pro\s+cle\s+red\s+typ\s+qua\b|"
+    r"translator\s*:\s*\S+.*(?:proof\s*reader|cleaner|re\s*drawer|typesetter|quality)\s*:|"
+    r"\b(?:patr[e]?on\s*\.\s*com|paypal\s*\.\s*me|ko-?fi\s*\.\s*com)(?:/|\b)|"
+    r"\b(?:https?://)?(?:www\.)?(?:asura|reap(?:er)?|flame|lumi|sura|void|realm|manhwa\s*freak)\s*scans?\s*\.\s*(?:com|gg|co|net)(?:/\S*)?|"
+    r"\b(?:reaper|asura|flame|lumi|sura)\s*scans\b)"
+)
+
 
 def _line_has_real_dialogue(text):
     # type: (str) -> bool
     """After removing any credit signature, is there still a run of ordinary
     words left (i.e. the line is dialogue that merely picked up a trailing
     'Red ice Studio', not a pure credits line)?"""
+    if _PROMO_BANNER_RE.search(text):
+        return False
     stripped = _CREDIT_LINE_RE.sub(" ", text)
     stripped = _CREDIT_STAFF_RE.sub(" ", stripped)
     words = re.findall(r"[A-Za-z][A-Za-z']{2,}", stripped)
@@ -1773,8 +2139,8 @@ def _line_has_real_dialogue(text):
 # Source → confidence weight for a learned correction. A GOT-OCR2 / cloud-VLM
 # re-read of the pixels is strong evidence; a tighter-params retry of the same
 # classical model is weaker.
-_LEARN_WEIGHTS = {"got-ocr2": 1.0, "cloud-vlm": 1.0, "tight-unclip": 0.55,
-                  "paddle-variant": 0.45, "cross-panel": 0.7}
+_LEARN_WEIGHTS = {"got-ocr2": 1.0, "cloud-vlm": 1.0, "parseq-crop": 0.90,
+                  "tight-unclip": 0.55, "paddle-variant": 0.45, "cross-panel": 0.7}
 _PROMOTE_MIN_WEIGHT = 3.0      # weighted confirmations to auto-apply a token pair
 _PROMOTE_MIN_SHARE = 0.62      # this `to` must own >=62% of `from`'s total weight
 _EXEMPLAR_MIN_WEIGHT = 2.0     # whole-line exemplar reuse
@@ -1821,7 +2187,7 @@ def _globally_learnable(cb, ca, source):
     # type: (str, str, str) -> bool
     cl = re.sub(r"[^a-z]", "", ca.lower())
     return (source in ("got-ocr2", "cloud-vlm", "cloud-llm")
-            and _token_looks_mangled(cb) and not _is_probable_sfx(cb)
+            and _token_looks_mangled(cb) and not _is_probable_sfx(cb, explicit_only=True)
             and len(cl) >= 3 and _is_known_wordform(cl)
             and _is_common_word(cl))          # a genuinely common target, not a rare name-ish word
 
@@ -1849,8 +2215,8 @@ def _aggregate_pairs(path, pairs, weight, source, ts):
             f.write(json.dumps(e) + "\n")
 
 
-def _compile_learned(slug):
-    # type: (str) -> dict
+def _compile_learned(slug, known_names=None):
+    # type: (str, Optional[Any]) -> dict
     """Turn the raw <slug>.learned.jsonl / .exemplars.jsonl into an applied set:
     promoted token map (conflict-safe), a char-confusion table for fuzzy repair
     of NOVEL tokens, learned SFX, and whole-line exemplars. Also (re)writes the
@@ -1894,44 +2260,63 @@ def _compile_learned(slug):
     promoted = {}
     near = []       # for review
     conflicts = []
+    conflict_cands = {}
     for fr, tos in by_from.items():
         total = sum(tos.values())
         best_to, best_w = max(tos.items(), key=lambda kv: kv[1])
         share = best_w / total if total else 0
         _bt_low = re.sub(r"[^a-z]", "", best_to.lower())
         _fr_low = re.sub(r"[^a-z]", "", fr.lower())
-        real = (_is_known_wordform(_bt_low) or _bt_low in _REAL_SHORT_WORDS)
-        # a `to` that is just a truncation of `from` ("MENTS"->"MENT") is a
-        # tokenisation artefact, never a real fix
-        trunc = bool(_bt_low) and (_fr_low.startswith(_bt_low) or _fr_low.endswith(_bt_low))
-        # FAST TRACK: `from` is STRUCTURALLY garbled (4+ consonant run / vowelless
-        # / consonant-dense) so it cannot be a character name — a single
-        # pixel-level VLM read to a real word, with no competing target, is
-        # trusted immediately. This is what stops GOT-OCR2 being called again
-        # for the same mis-read. Never fast-track a shout/onomatopoeia `from`
-        # (GOT-OCR2 returns a junk short word for a scream panel) or a 1-2 letter
-        # `to`.
-        fast = (_token_looks_mangled(fr) and real and not trunc and len(tos) == 1
-                and not _is_probable_sfx(fr) and len(_bt_low) >= 3
-                and vlm_w.get(fr, 0) >= 1.0 and best_to != fr)
+        if _is_known_wordform(_fr_low) or _is_probable_sfx(fr, explicit_only=True):
+            continue
+        if known_names and _fr_low in known_names:
+            continue
+        common_target = _is_common_target(best_to)
+        real = common_target or (_bt_low in _REAL_SHORT_WORDS)
+        is_substr = bool(_bt_low) and (_fr_low.startswith(_bt_low) or _fr_low.endswith(_bt_low))
+        trunc = is_substr and not (
+            (_fr_low.endswith(_bt_low) or _fr_low.startswith(_bt_low))
+            and (len(_fr_low) - len(_bt_low)) <= 2
+            and common_target
+            and (len(_bt_low) >= 2 and (_bt_low in _SPLIT_FUNCTION_WORDS or best_w >= 3.0))
+        )
+        mangled = _token_looks_mangled(fr) or _looks_corrupted(fr)
+        vw = vlm_w.get(fr, 0.0)
+        fast = (
+            common_target and not trunc and best_to != fr
+            and not _is_probable_sfx(fr, explicit_only=True)
+            and (
+                (mangled and vw >= 1.0 and len(_bt_low) >= 2 and share >= 0.80)
+                or (mangled and best_w >= 1.1 and share >= 0.85 and len(_bt_low) >= 3)
+                or (best_w >= 1.65 and share >= 0.85 and len(_bt_low) >= 3)
+            )
+        )
         if not trunc and (fast or (best_w >= _PROMOTE_MIN_WEIGHT
                                    and share >= _PROMOTE_MIN_SHARE and real)):
             promoted[fr] = best_to
-        elif best_w >= 1.5:
-            (conflicts if len(tos) > 1 and share < _PROMOTE_MIN_SHARE else near).append(
-                (fr, tos, best_to, best_w, share))
-    # character-confusion table — ONLY from pairs whose letters mostly already
-    # line up (a genuine per-glyph mis-read: "SHREWD"->"SHREVD"), never a total
-    # scramble ("CTNOHS"->"SHOULD"), so the fuzzy-repair rules stay trustworthy.
-    confus = {}   # (wrong_char, right_char) -> [weight, {distinct from-tokens}]
+        else:
+            if len(tos) > 1 and share < _PROMOTE_MIN_SHARE and total >= 2.0 and not is_substr:
+                clean_cands = [
+                    to for to, w in sorted(tos.items(), key=lambda kv: -kv[1])
+                    if w >= 0.55 and _is_common_target(to)
+                    and (_WORDCOST.get(to.lower(), 99.0) <= 12.2 or to.lower() in _SPLIT_FUNCTION_WORDS)
+                ][:4]
+                if len(clean_cands) >= 2:
+                    conflict_cands[fr] = clean_cands
+            if best_w >= 1.5:
+                (conflicts if len(tos) > 1 and share < _PROMOTE_MIN_SHARE else near).append(
+                    (fr, tos, best_to, best_w, share))
+    confus = {}
     for fr, tos in by_from.items():
         for to, w in tos.items():
             a, b = re.sub(r"[^A-Z]", "", fr), re.sub(r"[^A-Z]", "", to)
-            if not (3 <= len(a) <= 12 and len(a) == len(b)):
+            if not (4 <= len(a) <= 12 and len(a) == len(b)):
+                continue
+            if not _is_common_target(to):
                 continue
             same = sum(1 for ca, cb in zip(a, b) if ca == cb)
-            if same < 0.6 * len(a) or (len(a) - same) > 2:
-                continue          # not a clean 1-2 glyph substitution
+            if (len(a) - same) != 1:
+                continue  # single unambiguous positional glyph substitution
             for ca, cb in zip(a, b):
                 if ca != cb:
                     slot = confus.setdefault((ca, cb), [0.0, set()])
@@ -1939,15 +2324,11 @@ def _compile_learned(slug):
                     slot[1].add(fr)
     char_subs = {}
     for (ca, cb), (w, froms) in confus.items():
-        # a glyph-confusion rule feeds fuzzy-repair of NOVEL tokens, so demand
-        # real corroboration: weight >= 3 AND the same swap seen in >= 2
-        # different mangled tokens (one pair at weight 2.2 is not a pattern).
-        if w >= 3.0 and len(froms) >= 2:
+        if w >= 1.5 and len(froms) >= 2:
             char_subs.setdefault(ca, []).append((cb, w))
     for ca in char_subs:
         char_subs[ca].sort(key=lambda t: -t[1])
     learned_sfx = {k for k, v in sfx_votes.items() if v >= 2.0}
-    # exemplars: whole normalised garbled line -> fixed line, weighted
     ex_raw = _read_jsonl(xp)
     ex_by = {}
     for e in ex_raw:
@@ -1959,11 +2340,19 @@ def _compile_learned(slug):
     exemplars = {}
     for k, tos in ex_by.items():
         bt, bw = max(tos.items(), key=lambda kv: kv[1])
-        # a whole-line exemplar only ever fires on an EXACT normalised match of
-        # the garbled input, so a single pixel-level VLM read is enough — that
-        # panel won't be sent to GOT-OCR2 a second time.
-        if bw >= 1.0 and bt and not _looks_like_ocr_garble(bt):
+        if not bt or _looks_like_ocr_garble(bt, extra_names=known_names):
+            continue
+        if bw >= 1.0:
             exemplars[k] = bt
+        elif bw >= 0.55:
+            _bt_words = re.findall(r"[A-Za-z][A-Za-z'’]*", bt)
+            _bt_known = sum(
+                1 for w in _bt_words
+                if _is_known_wordform(w) or w.lower() in _REAL_SHORT_WORDS
+                or (known_names and re.sub(r"[^a-z]", "", w.lower()) in known_names)
+            )
+            if len(_bt_words) >= 3 and _bt_known == len(_bt_words) and _ocr_text_quality(bt) <= 0.0:
+                exemplars[k] = bt
     # write review file (best-effort)
     try:
         if near or conflicts:
@@ -1982,7 +2371,7 @@ def _compile_learned(slug):
                         f.write(f"- `{fr}` → `{bt}`  (weight {bw:.1f}, share {sh:.0%})\n")
     except Exception:
         pass
-    return {"promoted": promoted, "char_subs": char_subs,
+    return {"promoted": promoted, "conflicts": conflict_cands, "char_subs": char_subs,
             "sfx": learned_sfx, "exemplars": exemplars}
 
 
@@ -2002,7 +2391,26 @@ def _load_corrections(slug):
     cached = _corr_cache.get(slug)
     if cached and cached[0] == sig:
         return cached[1]
+    if getattr(_corr_tls, "compiling", False):
+        # Same thread is already compiling this set (it holds _corr_lock and
+        # re-entered via _looks_like_ocr_garble). Waiting on the lock here
+        # would self-deadlock every OCR worker, so hand back a minimal set.
+        return {"phrases": [], "tokens": {}, "conflicts": {}, "sfx": set(), "names": set(),
+                "char_subs": {}, "exemplars": {}}
     with _corr_lock:
+        cached = _corr_cache.get(slug)
+        if cached and cached[0] == sig:
+            return cached[1]
+        _corr_tls.compiling = True
+        try:
+            return _load_corrections_locked(slug, sig, json_paths)
+        finally:
+            _corr_tls.compiling = False
+
+
+def _load_corrections_locked(slug, sig, json_paths):
+    # type: (str, tuple, list) -> dict
+    if True:
         phrases = []
         tokens = {}
         sfx = set()
@@ -2030,14 +2438,19 @@ def _load_corrections(slug):
                 nc = re.sub(r"[^a-z]", "", str(nm).lower())
                 if nc:
                     names.add(nc)
-        learned = _compile_learned(slug)
+        learned = _compile_learned(slug, known_names=names)
         for k, v in learned["promoted"].items():
             if re.sub(r"[^a-z]", "", k.lower()) in names:
                 continue                     # never "correct" a known name
             tokens.setdefault(k, v)          # curated .json wins on conflict
+        conflicts = {
+            k: v for k, v in (learned.get("conflicts") or {}).items()
+            if k not in tokens and re.sub(r"[^a-z]", "", k.lower()) not in names
+        }
         sfx |= learned["sfx"]
         phrases.sort(key=lambda t: -len(t[0]))
-        compiled = {"phrases": phrases, "tokens": tokens, "sfx": sfx, "names": names,
+        compiled = {"phrases": phrases, "tokens": tokens, "conflicts": conflicts,
+                    "sfx": sfx, "names": names,
                     "char_subs": learned["char_subs"], "exemplars": learned["exemplars"]}
         _corr_cache[slug] = (sig, compiled)
         return compiled
@@ -2097,9 +2510,11 @@ def _apply_known_corrections(text, slug):
     # type: (str, str) -> str
     if not text:
         return text
+    if _PROMO_BANNER_RE.search(text):
+        return ""
     corr = _load_corrections(slug)
-    if not (corr["phrases"] or corr["tokens"] or corr["sfx"]
-            or corr["char_subs"] or corr["exemplars"]):
+    if not (corr["phrases"] or corr["tokens"] or corr.get("conflicts")
+            or corr["sfx"] or corr["char_subs"] or corr["exemplars"]):
         # credit strip is unconditional even with no per-series dict
         return "" if _CREDIT_LINE_RE.search(text) and not _line_has_real_dialogue(text) else text
     # 0a. a scanlation credit / staff / aggregator-watermark line is never spoken
@@ -2121,19 +2536,31 @@ def _apply_known_corrections(text, slug):
         def _r(m, _repl=repl):
             return _match_case(m.group(0), _repl)
         out = re.sub(re.escape(search_lc), _r, out, flags=re.IGNORECASE)
-    _tokmap, _subs = corr["tokens"], corr["char_subs"]
-    if _tokmap or _subs:
-        def _tok(m):
-            w = m.group(0)
-            key = re.sub(r"[^A-Za-z]", "", w).upper()
-            if key.lower() in _names:           # protected proper noun — leave it
-                return w
+    _tokmap, _subs, _confs = corr["tokens"], corr["char_subs"], corr.get("conflicts") or {}
+    if _tokmap or _subs or _confs:
+        _parts = re.split(r"(\b[A-Za-z][A-Za-z']*\b)", out)
+        _word_slots = [idx for idx, p in enumerate(_parts) if idx % 2 == 1]
+        _word_list = [_parts[idx] for idx in _word_slots]
+        for w_pos, part_idx in enumerate(_word_slots):
+            w = _parts[part_idx]
+            core_w = re.sub(r"[^A-Za-z]", "", w)
+            key = core_w.upper()
+            if key.lower() in _names:
+                continue
             repl = _tokmap.get(key)
             if repl is not None:
-                return "" if repl == "" else _match_case(re.sub(r"[^A-Za-z]", "", w), repl)
+                _parts[part_idx] = "" if repl == "" else _match_case(core_w, repl)
+                continue
+            if key in _confs and not _is_known_wordform(w) and len(_word_list) >= 3:
+                picked = _disambiguate_tie(_word_list, w_pos, _confs[key],
+                                           min_prob=0.05, min_ratio=5.0)
+                if picked:
+                    _parts[part_idx] = _match_case(core_w, picked)
+                    continue
             fz = _fuzzy_repair_token(w, _subs)
-            return fz if fz is not None else w
-        out = re.sub(r"\b[A-Za-z][A-Za-z']*\b", _tok, out)
+            if fz is not None:
+                _parts[part_idx] = fz
+        out = "".join(_parts)
     if corr["sfx"]:
         toks = out.split()
         real = [t for t in toks
@@ -2151,6 +2578,7 @@ def _apply_known_corrections(text, slug):
     _wtoks = re.findall(r"[A-Za-z][A-Za-z']*", out)
     _lone_junk = (len(_wtoks) <= 1 and len(re.sub(r"[^A-Za-z]", "", out)) <= 6
                   and not any(_is_known_wordform(w) or w.lower() in _REAL_SHORT_WORDS
+                              or _is_probable_sfx(w)
                               for w in _wtoks)
                   and not re.search(r"[.!?]{2,}|\.\.\.|[-–—]$", out))
     if _wtoks and (_lone_junk or (len(_wtoks) <= 1 and _looks_like_ocr_noise(out))):
@@ -2161,42 +2589,44 @@ def _apply_known_corrections(text, slug):
 def _learn_ocr_correction(before, after, slug, source="got-ocr2"):
     # type: (str, str, str, str) -> None
     """Record how a VLM / retry re-read of a panel differs from the classical
-    OCR. Token-aligned single-word swaps feed the promotion + char-confusion
-    machinery; whole-line differences feed the exemplar cache. `source` sets
-    the evidence weight."""
+    OCR. Sequence-aligned 1-to-1 single-word swaps feed the promotion +
+    char-confusion machinery; whole-line differences feed the exemplar cache."""
     if not before or not after or slug == "_none":
         return
     w = _LEARN_WEIGHTS.get(source, 0.5)
     bw, aw = before.split(), after.split()
+    bn = [re.sub(r"[^a-z']", "", x.lower()) for x in bw]
+    an = [re.sub(r"[^a-z']", "", x.lower()) for x in aw]
+    sm = difflib.SequenceMatcher(None, bn, an, autojunk=False)
+    opcodes = sm.get_opcodes()
+    has_equal_anchor = any(tag == "equal" and (i2 - i1) >= 1 for tag, i1, i2, _j1, _j2 in opcodes)
+    names_set = _series_name_set(slug)
     token_pairs = []
-    if len(bw) == len(aw):
-        for b, a in zip(bw, aw):
-            cb = re.sub(r"[^A-Za-z']", "", b)
-            ca = re.sub(r"[^A-Za-z']", "", a)
+    if has_equal_anchor or (len(bw) == 1 and len(aw) == 1):
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag != "replace" or (i2 - i1) != 1 or (j2 - j1) != 1:
+                continue
+            cb = re.sub(r"[^A-Za-z']", "", bw[i1])
+            ca = re.sub(r"[^A-Za-z']", "", aw[j1])
             if not (cb and ca) or cb.lower() == ca.lower() or len(cb) < 3:
                 continue
             bl, al = cb.lower(), ca.lower()
-            # never learn a "fix" for a word that is already correct, a known
-            # series proper noun, or a stretched shout / onomatopoeia (GOT-OCR2
-            # reads a scream panel and returns a random short word:
-            # "ARRRGHH"->"AR", "UWAAA"->"DON'T").
-            if _is_known_wordform(cb) or _is_probable_sfx(cb):
+            if _is_known_wordform(cb) or _is_probable_sfx(cb, explicit_only=True):
                 continue
-            if bl in _series_name_set(slug):
+            if bl in names_set:
                 continue
-            # `after` has to be a real word (drop the old len<=2 escape hatch
-            # that let "->AR" / "->FO" / "->LO" through).
-            if not (_is_known_wordform(ca) or al in _REAL_SHORT_WORDS):
+            common_target = _is_common_target(aw[j1])
+            if not (common_target or al in ("i", "a")):
                 continue
-            # truncation guard: GOT-OCR2 split the word differently and the
-            # "correction" is just a fragment ("MENTS"->"MENT", "CIAL"->"CIA",
-            # "TARDS"->"TARD", "SEOB"->"SEO"). Reject when one is a prefix/suffix
-            # of the other.
-            if bl.startswith(al) or bl.endswith(al) or al.startswith(bl) or al.endswith(bl):
+            noise_strip = (
+                (bl.endswith(al) or bl.startswith(al))
+                and (len(bl) - len(al)) <= 2
+                and al in _SPLIT_FUNCTION_WORDS
+            )
+            if not noise_strip and (bl.startswith(al) or bl.endswith(al) or al.startswith(bl) or al.endswith(bl)):
                 continue
-            # length has to stay in the same ballpark
             ratio = len(al) / len(bl)
-            if ratio < 0.5 or ratio > 1.8:
+            if ratio < 0.45 or ratio > 1.8:
                 continue
             token_pairs.append((cb.upper(), ca.upper()))
     lp, xp, _rp = _learned_paths(slug)
@@ -2220,9 +2650,11 @@ def _learn_ocr_correction(before, after, slug, source="got-ocr2"):
             clean_after = _apply_known_corrections(clean_after, slug) or clean_after
             _ex_toks = re.findall(r"[A-Za-z][A-Za-z']{2,}", clean_after)
             _ex_clean = sum(1 for t in _ex_toks
-                            if _is_known_wordform(t) or t.lower() in _REAL_SHORT_WORDS)
-            if (not _looks_like_ocr_garble(clean_after)
+                            if _is_known_wordform(t) or t.lower() in _REAL_SHORT_WORDS
+                            or re.sub(r"[^a-z]", "", t.lower()) in names_set)
+            if (not _looks_like_ocr_garble(clean_after, extra_names=names_set)
                     and not _CREDIT_LINE_RE.search(clean_after)
+                    and _ocr_text_quality(clean_after) <= 0.0
                     # the fixed line has to be almost entirely real words, or a
                     # garble→garble pair (or a credit strip) gets memorised
                     and _ex_toks and _ex_clean / len(_ex_toks) >= 0.85):
@@ -2265,6 +2697,19 @@ def _learn_sfx(token, slug, weight=1.0):
         logger.debug("learn sfx (%s)", exc)
 
 
+def _raw_regions_are_credits(regions):
+    # type: (List[_TextRegion]) -> bool
+    """True when the detector's raw text blocks belong to a scanlation/promo end banner."""
+    if not regions:
+        return False
+    joined = " ".join((getattr(r, "text", "") or "").strip() for r in regions)
+    if not joined.strip():
+        return False
+    if _PROMO_BANNER_RE.search(joined):
+        return True
+    return bool(_CREDIT_LINE_RE.search(joined) and not _line_has_real_dialogue(joined))
+
+
 def _merge_regions(regions, is_ui_box=False, engine="paddleocr"):
     # type: (List[_TextRegion], bool, str) -> Tuple[str, float, int]
     """Merge sorted text regions into a single coherent string.
@@ -2275,10 +2720,12 @@ def _merge_regions(regions, is_ui_box=False, engine="paddleocr"):
     if not regions:
         return "", 0.0, 0
 
-    # Filter detector noise, but never down to nothing.
+    # Drop pure detector noise regions; if EVERY region on the panel is noise
+    # ("0" from Hangul circle, "ER", "?!", "/A1"), the panel carries no dialogue.
     filtered = [r for r in regions if not _looks_like_ocr_noise(r.text)]
-    if filtered:
-        regions = filtered
+    if not filtered:
+        return "", 0.0, 0
+    regions = filtered
 
     sorted_regions = _sort_regions_reading_order(regions, is_ui_box=is_ui_box)
 
@@ -2316,7 +2763,18 @@ def _merge_regions(regions, is_ui_box=False, engine="paddleocr"):
             all_confidences.append(r.confidence)
 
     merged_text = _repair_and_denoise(_clean_and_normalize_ocr_text("".join(parts)))
-    merged_text = _apply_known_corrections(merged_text, _ocr_series_ctx["slug"])
+    merged_text = _apply_known_corrections(merged_text, _get_series_slug())
+    if not (merged_text or "").strip():
+        return "", 0.0, 0
+    _SOLO_FUNCTION_WORDS = {
+        "to", "of", "in", "on", "at", "by", "an", "as", "or",
+        "is", "be", "am", "the", "and", "for", "from", "with",
+    }
+    if merged_text.strip().lower() in _SOLO_FUNCTION_WORDS and not any(c in merged_text for c in ("!", "?")):
+        return "", 0.0, 0
+    _solo_core = merged_text.strip(" .,!?-\u2014:;\"'()[]")
+    if _solo_core and " " not in _solo_core and _is_alnum_garble_token(_solo_core):
+        return "", 0.0, 0
     avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
     return merged_text, round(avg_confidence, 4), len(sorted_regions)
@@ -2439,6 +2897,190 @@ def _run_rapidocr_on_image(img, options=None, unclip_override=None, box_override
             x_min=min(xs), y_min=min(ys), y_max=max(ys), x_max=max(xs),
         ))
     return regions
+
+
+# ---------------------------------------------------------------------------
+# PARSeq INT8 ONNX crop-level vision rescue
+# Runs ONLY on cropped suspect bounding boxes (the 1-5% of regions flagged by
+# _looks_like_ocr_garble or low confidence) — ~16 ms/crop on CPU ONNX, zero
+# PyTorch runtime overhead, and an independent ViT scene-text recognizer that
+# excels on jagged/sheared comic lettering where PP-OCR CTC heads stumble.
+# ---------------------------------------------------------------------------
+OCR_CROP_REC = os.environ.get("OCR_CROP_REC", "1").strip().lower() not in ("0", "false", "no")
+_parseq_lock = threading.Lock()
+_parseq_state = {"resolved": False, "pred": None}
+_parseq_stats = {"calls": 0, "crops": 0, "improved_regions": 0, "recovered_panels": 0}
+
+
+def _warm_parseq_on_startup():
+    if not _SKIP_OCR_INIT and OCR_CROP_REC:
+        _get_parseq_crop_rec()
+
+
+def _get_parseq_crop_rec():
+    if not OCR_CROP_REC:
+        return None
+    if _parseq_state["resolved"]:
+        return _parseq_state["pred"]
+    with _parseq_lock:
+        if _parseq_state["resolved"]:
+            return _parseq_state["pred"]
+        _parseq_state["resolved"] = True
+        try:
+            import onnxruntime as _ort
+            from onnxtr.models import EngineConfig, parseq as _ox_parseq, recognition_predictor as _ox_rec_pred
+            so = _ort.SessionOptions()
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
+            arch = _ox_parseq(load_in_8_bit=True, engine_cfg=EngineConfig(session_options=so))
+            pred = _ox_rec_pred(arch=arch)
+            # tiny warmup
+            pred([np.full((32, 96, 3), 255, dtype=np.uint8)])
+            _parseq_state["pred"] = pred
+            logger.info("PARSeq INT8 crop recognizer initialized (onnxtr, intra_op=1)")
+        except Exception as exc:
+            logger.warning("PARSeq crop recognizer unavailable (%s) — disabled", exc)
+            _parseq_state["pred"] = None
+    return _parseq_state["pred"]
+
+
+def _split_word_crops(crop):
+    # type: (np.ndarray) -> List[np.ndarray]
+    """Split a wide multi-word bounding-box crop on clean vertical whitespace
+    valleys so PARSeq (which has no space token) receives single-word crops."""
+    h, w = crop.shape[:2]
+    if w < h * 2.2:
+        return [crop]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+    bg = float(np.median(border))
+    ink = np.abs(gray.astype(np.float32) - bg) > 28.0
+    col_has_ink = ink.mean(axis=0) > 0.04
+    min_gap = max(3, int(h * 0.18))
+    splits = []
+    i = 0
+    while i < w and not col_has_ink[i]:
+        i += 1
+    while i < w:
+        while i < w and col_has_ink[i]:
+            i += 1
+        g_start = i
+        while i < w and not col_has_ink[i]:
+            i += 1
+        g_end = i
+        if i < w and (g_end - g_start) >= min_gap:
+            splits.append((g_start + g_end) // 2)
+    if not splits:
+        return [crop]
+    cuts = [0] + splits + [w]
+    out = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        pa, pb = max(0, a - 2), min(w, b + 2)
+        if pb - pa >= 4:
+            out.append(crop[:, pa:pb])
+    return out or [crop]
+
+
+def _region_needs_crop_rec(r, names_set):
+    # type: (_TextRegion, set) -> bool
+    txt = (r.text or "").strip()
+    if not txt:
+        return False
+    if r.confidence < 0.78:
+        return True
+    toks = re.findall(r"[A-Za-z][A-Za-z'’]*", txt)
+    for tok in toks:
+        core = re.sub(r"[^a-z]", "", tok.lower())
+        if len(core) < 3:
+            continue
+        if _is_known_wordform(tok) or core in names_set or _is_probable_sfx(tok, explicit_only=True):
+            continue
+        return True
+    return False
+
+
+def _recover_regions_with_parseq(img, regions, is_ui_box=False):
+    # type: (np.ndarray, List[_TextRegion], bool) -> Optional[Tuple[str, float, int, int]]
+    """Re-read ONLY flagged garbled/uncertain regions using PARSeq INT8 on their
+    cropped pixel boxes. Returns (text, conf, count, improved_count) or None."""
+    if not OCR_CROP_REC or not regions:
+        return None
+    pred = _get_parseq_crop_rec()
+    if pred is None:
+        return None
+    rgb = img
+    if rgb.ndim == 2:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+    elif rgb.shape[2] == 4:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
+    img_h, img_w = rgb.shape[:2]
+    slug = _get_series_slug()
+    names_set = _series_name_set(slug)
+
+    job_crops = []     # flat list of word-level crop arrays
+    region_spans = []  # (region_idx, start_sub, end_sub)
+    for idx, r in enumerate(regions):
+        if not _region_needs_crop_rec(r, names_set):
+            continue
+        bh = max(1.0, r.y_max - r.y_min)
+        px = max(4, int(round(bh * 0.15)))
+        py = max(3, int(round(bh * 0.12)))
+        x1 = max(0, int(round(r.x_min)) - px)
+        y1 = max(0, int(round(r.y_min)) - py)
+        x2 = min(img_w, int(round(r.x_max)) + px)
+        y2 = min(img_h, int(round(r.y_max)) + py)
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            continue
+        sub = _split_word_crops(rgb[y1:y2, x1:x2])
+        start_i = len(job_crops)
+        job_crops.extend(sub)
+        region_spans.append((idx, start_i, len(job_crops)))
+
+    if not job_crops:
+        return None
+
+    with _parseq_lock:
+        _parseq_stats["calls"] += 1
+        _parseq_stats["crops"] += len(job_crops)
+        preds = pred(job_crops)
+
+    updated = list(regions)
+    improved_regions = 0
+    for r_idx, s_i, e_i in region_spans:
+        r = regions[r_idx]
+        sub_preds = preds[s_i:e_i]
+        cand_words = [t.strip() for t, c in sub_preds if t and t.strip()]
+        if not cand_words:
+            continue
+        min_conf = min(float(c) for t, c in sub_preds if t and t.strip())
+        if min_conf < 0.65:
+            continue
+        raw_cand = " ".join(cand_words)
+        # Preserve original uppercase/lowercase cadence if PARSeq flipped case
+        if r.text.isupper():
+            raw_cand = raw_cand.upper()
+        cand_clean = _apply_known_corrections(
+            _repair_and_denoise(_clean_and_normalize_ocr_text(raw_cand)), slug
+        )
+        orig_clean = _apply_known_corrections(
+            _repair_and_denoise(_clean_and_normalize_ocr_text(r.text)), slug
+        )
+        if not cand_clean or cand_clean == orig_clean:
+            continue
+        if len(cand_clean) == 1 and orig_clean == "I" and cand_clean != "I":
+            continue
+        q_cand = _ocr_text_quality(cand_clean)
+        q_orig = _ocr_text_quality(orig_clean)
+        if (q_cand < q_orig) or (r.confidence < 0.72 and q_cand <= q_orig and min_conf > r.confidence + 0.10):
+            updated[r_idx] = _TextRegion(raw_cand, max(r.confidence, min_conf),
+                                         r.x_min, r.y_min, r.y_max, r.x_max)
+            improved_regions += 1
+
+    if improved_regions == 0:
+        return None
+    _parseq_stats["improved_regions"] += improved_regions
+    merged_text, merged_conf, merged_count = _merge_regions(updated, is_ui_box=is_ui_box, engine="rapidocr")
+    return merged_text, merged_conf, merged_count, improved_regions
 
 
 def _run_ocr_on_image(img, options=None):
@@ -2660,9 +3302,15 @@ def _run_tesseract_ocr(img):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
         pil_img.save(tmp_path)
+        _tw, _th = pil_img.size
+        _t_max = max(_tw, _th)
+        if _t_max > 1280:
+            _ts = 1280.0 / float(_t_max)
+            pil_img = pil_img.resize((max(1, int(_tw * _ts)), max(1, int(_th * _ts))), Image.BILINEAR)
+            pil_img.save(tmp_path)
         result = subprocess.run(
             ["tesseract", tmp_path, "stdout", "--psm", "6", "tsv"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3,
         )
         if result.returncode != 0:
             logger.warning("tesseract exited %d: %s", result.returncode, (result.stderr or "")[:200])
@@ -2699,8 +3347,8 @@ def _run_tesseract_ocr(img):
         avg_conf = (sum(confs) / len(confs)) / 100.0
         return text, max(0.0, min(1.0, avg_conf))
     except subprocess.TimeoutExpired:
-        logger.warning("tesseract timed out after 5s")
-        return "", 0.0
+        logger.warning("tesseract timed out after 3s")
+        return "__TIMEOUT__", 0.0
     except Exception as exc:
         logger.warning("tesseract OCR failed: %s", exc)
         return "", 0.0
@@ -3046,12 +3694,19 @@ def _ocr_with_cascade(img, options=None):
 
         candidates = []  # type: List[dict]
         best_tuple = None  # type: Optional[Tuple[str, float, int, str, float, List[dict], str]]
+        _orig_garble = ""
 
         # --- PRIMARY: RapidOCR (PP-OCRv5 mobile, ONNXRuntime) ---
         if rapidocr_engine is not None:
             try:
                 rapid_regions = _run_rapidocr_on_image(img, opts)
                 rapid_text, rapid_conf, rapid_count = _merge_regions(rapid_regions, is_ui_box=is_ui_box, engine="rapidocr")
+                if not rapid_text and _raw_regions_are_credits(rapid_regions):
+                    candidates.append({
+                        "text": "", "confidence": 0.0, "regions": 0,
+                        "provider": "rapidocr", "model": RAPIDOCR_MODEL_NAME, "variant": "credits_filtered",
+                    })
+                    return ("", 0.0, 0, "NO_TEXT", 0.0, list(candidates), "credits_filtered")
                 rapid_status, rapid_quality, rapid_reason = _quality_status(rapid_text, rapid_conf, rapid_count)
 
                 candidates.append({
@@ -3066,16 +3721,50 @@ def _ocr_with_cascade(img, options=None):
                 # PaddleOCR variants + VLM tier(s) get a shot at reading it.
                 _rapid_suspect = (rapid_status == "SUCCESS"
                                   and _looks_like_ocr_garble(rapid_text))
-                _orig_garble = rapid_text
+                _rapid_lowconf = (rapid_count > 0 and rapid_conf < 0.78 and rapid_status != "SUCCESS")
+                _orig_garble = rapid_text if _rapid_suspect else ""
+                # FASTEST crop-level vision recovery (~20-50 ms total): re-read ONLY
+                # the garbled / low-conf word crops using PARSeq INT8 ONNX.
+                if (_rapid_suspect or _rapid_lowconf) and OCR_CROP_REC:
+                    try:
+                        _pq = _recover_regions_with_parseq(img, rapid_regions, is_ui_box=is_ui_box)
+                        if _pq is not None:
+                            _pt, _pc, _pn, _p_imp = _pq
+                            _pq_better = (_ocr_text_quality(_pt) < _ocr_text_quality(rapid_text)
+                                          or (_rapid_suspect and not _looks_like_ocr_garble(_pt)
+                                              and _ocr_text_quality(_pt) <= _ocr_text_quality(rapid_text)))
+                            if _pt and _pn and _pq_better:
+                                candidates.append({"text": _pt, "confidence": _pc, "regions": _pn,
+                                                   "provider": "parseq", "model": "parseq-int8",
+                                                   "variant": f"crop_rec_{_p_imp}"})
+                                rapid_text, rapid_conf, rapid_count = _pt, _pc, _pn
+                                rapid_status, rapid_quality, rapid_reason = _quality_status(_pt, _pc, _pn)
+                                best_tuple = (rapid_text, rapid_conf, rapid_count, rapid_status,
+                                              rapid_quality, list(candidates),
+                                              "parseq_crop_recovered:" + rapid_reason)
+                                _parseq_stats["recovered_panels"] += 1
+                                logger.info("  PARSeq crop rescue (%d boxes) -> %r", _p_imp, rapid_text[:80])
+                                if _orig_garble and not _looks_like_ocr_garble(rapid_text):
+                                    _learn_ocr_correction(_orig_garble, rapid_text,
+                                                          _get_series_slug(), source="parseq-crop")
+                                _rapid_suspect = (rapid_status == "SUCCESS"
+                                                  and _looks_like_ocr_garble(rapid_text))
+                    except Exception as _pe:
+                        logger.debug("PARSeq crop recovery failed (%s)", _pe)
+
                 if _rapid_suspect:
                     logger.info("RapidOCR result looks garbled (%r) — attempting recovery", rapid_text[:80])
-                    # FAST recovery (free, ~0.2s): re-run RapidOCR with tighter
-                    # box dilation. unclip 1.6 over-merges some panels' lines
-                    # into garble ("IT SEEOH SS SWIIS" for "IT SEEMS AS THOUGH");
-                    # a 1.3 pass reads those cleanly. Keep whichever is cleaner.
+                    if not _orig_garble:
+                        _orig_garble = rapid_text
+                    # Next recovery (~0.15s): re-run RapidOCR with tighter box dilation
+                    # (then run PARSeq crop rescue on _tr if any box is still garbled).
                     try:
                         _tr = _run_rapidocr_on_image(img, opts, unclip_override=1.3, box_override=0.5)
                         _tt, _tc, _tn = _merge_regions(_tr, is_ui_box=is_ui_box, engine="rapidocr")
+                        if _tt and _tn and _looks_like_ocr_garble(_tt) and OCR_CROP_REC:
+                            _pq2 = _recover_regions_with_parseq(img, _tr, is_ui_box=is_ui_box)
+                            if _pq2 is not None and _pq2[0] and _ocr_text_quality(_pq2[0]) < _ocr_text_quality(_tt):
+                                _tt, _tc, _tn = _pq2[0], _pq2[1], _pq2[2]
                         if _tt and _tn and _ocr_text_quality(_tt) < _ocr_text_quality(rapid_text):
                             candidates.append({"text": _tt, "confidence": _tc, "regions": _tn,
                                                "provider": "rapidocr", "model": RAPIDOCR_MODEL_NAME,
@@ -3087,7 +3776,7 @@ def _ocr_with_cascade(img, options=None):
                                           "rapidocr_tight_unclip_recovered:" + rapid_reason)
                             logger.info("  tight-unclip pass cleaner -> %r", rapid_text[:80])
                             _learn_ocr_correction(_orig_garble, rapid_text,
-                                                  _ocr_series_ctx["slug"], source="tight-unclip")
+                                                  _get_series_slug(), source="tight-unclip")
                             _rapid_suspect = _looks_like_ocr_garble(rapid_text)
                     except Exception as _te:
                         logger.debug("tight-unclip recovery failed (%s)", _te)
@@ -3108,7 +3797,7 @@ def _ocr_with_cascade(img, options=None):
                     if OCR_LOCAL_VLM:
                         _gt, _gc = _run_local_vlm_ocr(img)
                         if _gt and not _looks_like_ocr_garble(_gt):
-                            _slug = _ocr_series_ctx["slug"]
+                            _slug = _get_series_slug()
                             _learn_ocr_correction(_orig_garble, _gt, _slug, source="got-ocr2")
                             _gt = _apply_known_corrections(_gt, _slug)
                             _gr = max(1, len(re.split(r"\s+/\s+", _gt)))
@@ -3125,6 +3814,9 @@ def _ocr_with_cascade(img, options=None):
                 if rapid_status == "SUCCESS":
                     return best_tuple
                 if rapid_count == 0:
+                    if rapid_regions:
+                        return (rapid_text, rapid_conf, rapid_count, "NO_TEXT", 0.0,
+                                list(candidates), f"noise_or_sfx_only:{rapid_reason}")
                     if OCR_VLM_ON_ZERO_REGIONS:
                         _zt, _zc = _vlm_zero_region_candidate(img)
                         if _zt:
@@ -3150,6 +3842,12 @@ def _ocr_with_cascade(img, options=None):
         try:
             regions = _run_ocr_on_image(img, opts)
             merged_text, avg_conf, region_count = _merge_regions(regions, is_ui_box=is_ui_box)
+            if not merged_text and _raw_regions_are_credits(regions):
+                candidates.append({
+                    "text": "", "confidence": 0.0, "regions": 0,
+                    "provider": "paddleocr", "model": MODEL_NAME, "variant": "credits_filtered",
+                })
+                return ("", 0.0, 0, "NO_TEXT", 0.0, list(candidates), "credits_filtered")
             status, quality_score, reason = _quality_status(merged_text, avg_conf, region_count)
 
             candidates.append({
@@ -3162,6 +3860,11 @@ def _ocr_with_cascade(img, options=None):
                 best_tuple = fallback_tuple
 
             if status == "SUCCESS":
+                if (_orig_garble and merged_text
+                        and _ocr_text_quality(merged_text) < _ocr_text_quality(_orig_garble)
+                        and not _looks_like_ocr_garble(merged_text)):
+                    _learn_ocr_correction(_orig_garble, merged_text,
+                                          _get_series_slug(), source="paddle-variant")
                 return best_tuple
 
             # Detector found ZERO candidate text regions in the original image —
@@ -3174,6 +3877,9 @@ def _ocr_with_cascade(img, options=None):
             # compute — it was making every quiet chapter (the majority of most
             # chapters) several times slower for no quality benefit.
             if region_count == 0:
+                if regions:
+                    return (merged_text, avg_conf, region_count, "NO_TEXT", 0.0,
+                            list(candidates), f"noise_or_sfx_only:{reason}")
                 return (merged_text, avg_conf, region_count, status, quality_score,
                         list(candidates), f"skipped_cascade_zero_regions_detected:{reason}")
 
@@ -3201,6 +3907,11 @@ def _ocr_with_cascade(img, options=None):
                 })
 
                 if var_status == "SUCCESS" and var_quality > best_tuple[4]:
+                    if (_orig_garble and var_text
+                            and _ocr_text_quality(var_text) < _ocr_text_quality(_orig_garble)
+                            and not _looks_like_ocr_garble(var_text)):
+                        _learn_ocr_correction(_orig_garble, var_text,
+                                              _get_series_slug(), source="paddle-variant")
                     best_tuple = (
                         var_text, var_conf, var_count, var_status, var_quality,
                         list(candidates), f"paddleocr_variant_{variant_name}:{var_reason}",
@@ -3216,13 +3927,14 @@ def _ocr_with_cascade(img, options=None):
 
         try:
             tess_passes = [
-                ("standard", img),
-                ("upscale_1.5x", _preprocess_upscale(img, 1.5)),
-                ("contrast_clahe", _preprocess_contrast(img)),
+                ("standard", lambda: img),
+                ("contrast_clahe", lambda: _preprocess_contrast(img)),
             ]
 
-            for tess_variant, t_img in tess_passes:
-                tess_text, tess_conf = _run_tesseract_ocr(t_img)
+            for tess_variant, t_fn in tess_passes:
+                tess_text, tess_conf = _run_tesseract_ocr(t_fn())
+                if tess_text == "__TIMEOUT__":
+                    break
                 if not tess_text:
                     continue
 
@@ -3264,8 +3976,8 @@ def _ocr_with_cascade(img, options=None):
                 for _model_label, vlm_text, vlm_conf in vlm_variants:
                     _src = "got-ocr2" if "got" in _model_label.lower() else "cloud-vlm"
                     _learn_ocr_correction(_classical_before, vlm_text,
-                                          _ocr_series_ctx["slug"], source=_src)
-                    vlm_text = _apply_known_corrections(vlm_text, _ocr_series_ctx["slug"])
+                                          _get_series_slug(), source=_src)
+                    vlm_text = _apply_known_corrections(vlm_text, _get_series_slug())
                     vlm_regions = max(1, len(re.split(r"\s+/\s+", vlm_text)))
                     candidates.append({
                         "text": vlm_text, "confidence": vlm_conf, "regions": vlm_regions,
@@ -3297,6 +4009,11 @@ def _quality_status(text, confidence, regions):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def _startup_warm_crop_rec():
+    _warm_parseq_on_startup()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -3401,10 +4118,21 @@ async def _ocr_one(idx, total_count, img_path, options):
         # Known-mistakes correction dictionary — final pass over the winning
         # text (whichever engine produced it), so per-series fixes also catch
         # VLM output and phrase-level fixes hit the merged result.
-        _corr = _apply_known_corrections(text, _ocr_series_ctx["slug"])
+        _corr = _apply_known_corrections(text, _get_series_slug())
         if _corr != text:
-            reason = (reason or "") + "|dict"
-            text = _corr
+            if not _corr.strip() and text.strip() and (
+                _PROMO_BANNER_RE.search(text)
+                or (_CREDIT_LINE_RE.search(text) and not _line_has_real_dialogue(text))
+            ):
+                text = ""
+                avg_conf = 0.0
+                region_count = 0
+                status = "NO_TEXT"
+                quality_score = 0.0
+                reason = "credits_filtered"
+            else:
+                reason = (reason or "") + "|dict"
+                text = _corr
 
         elapsed_ms = (time.perf_counter() - t_one_start) * 1000.0
         logger.info(
@@ -3440,10 +4168,10 @@ async def ocr_batch(request: BatchOCRRequest):
     import asyncio
     t_start = time.perf_counter()
     total = len(request.images)
-    _ocr_series_ctx["slug"] = _slugify_series(
-        request.series or os.environ.get("RECAP_OCR_SERIES", ""))
+    _set_series_slug(_slugify_series(
+        request.series or os.environ.get("RECAP_OCR_SERIES", "")))
     logger.info("[Batch OCR] Received request for %d images (concurrency limit: %d, series: %s)",
-                total, OCR_CONCURRENCY, _ocr_series_ctx["slug"])
+                total, OCR_CONCURRENCY, _get_series_slug())
 
     results = list(await asyncio.gather(*[
         _ocr_one(idx, total, img_path, request.options) for idx, img_path in enumerate(request.images)

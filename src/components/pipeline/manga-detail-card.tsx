@@ -21,11 +21,13 @@ const SOURCE_LABEL: Record<MangaSource, string> = {
   fanfox: "FanFox",
   webtoons: "Webtoons",
   asurascans: "AsuraScans",
+  thunderscans: "ThunderScans",
+  vortexscans: "VortexScans",
+  rizzfables: "RizzFables",
   mal: "MAL",
   anilist: "AniList",
   mangadex: "MangaDex",
   mangapill: "MangaPill",
-  toonily: "Toonily",
   comick: "Comick",
   weebcentral: "WeebCentral",
   mgeko: "MangaGeko",
@@ -102,8 +104,9 @@ export function MangaDetailCard({ manga, open, onClose, onSelect, isBookmarked, 
               <div className="w-28 h-40 sm:w-32 sm:h-44 rounded-xl overflow-hidden border border-border bg-muted shadow-md">
                 {manga.coverUrl ? (
                   <img
-                    src={manga.coverUrl}
+                    src={`/api/cover?url=${encodeURIComponent(manga.coverUrl)}`}
                     alt={manga.title}
+                    referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
                   />
                 ) : (

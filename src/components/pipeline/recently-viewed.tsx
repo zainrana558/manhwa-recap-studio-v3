@@ -98,13 +98,22 @@ export function RecentlyViewed({
                   <img
                     src={item.coverUrl}
                     alt={item.title}
+                    referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      const img = e.currentTarget;
+                      img.style.display = "none";
+                      const sib = img.nextElementSibling as HTMLElement | null;
+                      if (sib) sib.style.display = "flex";
+                    }}
                     className="w-full h-full object-cover"
                   />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center text-muted-foreground/30">
-                    <Clock className="h-4 w-4" />
-                  </div>
-                )}
+                ) : null}
+                <div
+                  className="w-full h-full items-center justify-center text-muted-foreground/30"
+                  style={{ display: item.coverUrl ? "none" : "flex" }}
+                >
+                  <Clock className="h-4 w-4" />
+                </div>
               </div>
 
               <p className="text-[10px] text-muted-foreground w-[72px] text-center leading-tight line-clamp-2 group-hover:text-primary transition-colors">

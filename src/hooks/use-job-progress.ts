@@ -45,7 +45,6 @@ export function useJobProgress(jobId: string | null): UseJobProgressResult {
     setPrevJobId(jobId);
     setJob(null);
     setLogs([]);
-    setConnected(false);
   }
 
   // Reset refs when jobId changes (separate effect to satisfy react-hooks/refs rule).
@@ -140,6 +139,19 @@ export function useJobProgress(jobId: string | null): UseJobProgressResult {
       }
     };
   }, [job?.status, job?.mangaTitle]);
+
+  useEffect(() => {
+    const socket = getSocket();
+    setConnected(socket.connected);
+    const onConn = () => setConnected(true);
+    const onDisc = () => setConnected(false);
+    socket.on("connect", onConn);
+    socket.on("disconnect", onDisc);
+    return () => {
+      socket.off("connect", onConn);
+      socket.off("disconnect", onDisc);
+    };
+  }, []);
 
   useEffect(() => {
     if (!jobId) {

@@ -48,7 +48,7 @@ restart_pipeline() {
   log "Pipeline service (port 3001) is down — restarting"
   pkill -9 -f "bun index.ts" 2>/dev/null
   sleep 1
-  (cd "$PROJECT_DIR/mini-services/pipeline-service" && setsid bun run start > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null &)
+  (set -a; [ -f "$PROJECT_DIR/.env" ] && source "$PROJECT_DIR/.env"; set +a; cd "$PROJECT_DIR/mini-services/pipeline-service" && setsid bun --env-file=../../.env index.ts > "$LOG_DIR/pipeline.log" 2>&1 < /dev/null &)
 }
 
 restart_nextjs() {

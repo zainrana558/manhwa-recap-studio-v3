@@ -1,3 +1,4 @@
+import { getPrivateExt } from "@/lib/private-loader";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import {
@@ -5,7 +6,9 @@ import {
   getSlugFromId,
   getChaptersForSource,
 } from "@/lib/scrapers";
-import { outputDir } from "@/lib/paths";
+import { outputDir, jobDir, ensureDir } from "@/lib/paths";
+import { promises as fs } from "fs";
+import path from "path";
 import { mapJob } from "@/lib/serialize";
 import type { CreateJobInput, JobDetail } from "@/types/pipeline";
 
@@ -124,11 +127,28 @@ export async function POST(req: NextRequest) {
     // Narration is on by default; pass narrate:false to speak the raw
     // transcribed panel text verbatim instead of an LLM-rewritten recap.
     const narrate = body.narrate !== false;
-    const narrationStyle = (["verbatim", "cleanup", "recap"] as const).includes(
+    const narrationStyle = (["verbatim", "cleanup", "recap", "dramatic", "concise"] as const).includes(
       body.narrationStyle as never
     )
       ? (body.narrationStyle as string)
       : "verbatim";
+    const narrationSpeed = (["slow", "normal", "fast", "brisk"] as const).includes(
+      body.narrationSpeed as never
+    )
+      ? (body.narrationSpeed as string)
+      : "normal";
+    const frameStyle = (["blur", "cover", "dark"] as const).includes(
+      body.frameStyle as never
+    )
+      ? (body.frameStyle as string)
+      : "blur";
+    const bgmVolume = (["subtle", "balanced", "bold"] as const).includes(
+      body.bgmVolume as never
+    )
+      ? (body.bgmVolume as string)
+      : "balanced";
+    const includeIntro = body.includeIntro !== false;
+    const watermark = typeof body.watermark === "string" ? body.watermark.slice(0, 60) : "Denji Recaps";
     const describeVisuals = body.describeVisuals === true;
     const visualProvider = (
       ["auto", "ollama", "groq", "gemini", "openrouter", "none"] as const
@@ -276,6 +296,30 @@ export async function POST(req: NextRequest) {
       outputDir: outputDir(job.id),
     });
 
+    // Persist extra recap options for pipeline-service without needing a DB migration.
+    try {
+      const jDir = jobDir(job.id);
+      await ensureDir(jDir);
+      await fs.writeFile(
+        path.join(jDir, "recap_options.json"),
+        JSON.stringify(
+          {
+            narrationStyle,
+            narrationSpeed,
+            frameStyle,
+            bgmVolume,
+            includeIntro,
+            watermark,
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+    } catch {
+      // non-fatal
+    }
+
     // 3) Tell the pipeline service to start the job.
     const pipelineOk = await notifyPipeline("/internal/start", { jobId: job.id });
 
@@ -313,5 +357,32 @@ export async function POST(req: NextRequest) {
       { error: `Failed to create job: ${message}` },
       { status: 500 }
     );
+  }
+}
+
+
+export async function DELETE(req: NextRequest) {
+  try {
+    const scope = new URL(req.url).searchParams.get("scope");
+    if (scope !== "private") {
+      return NextResponse.json({ error: "Invalid scope" }, { status: 400 });
+    }
+    const ext = getPrivateExt();
+    if (!ext) return NextResponse.json({ deleted: 0 });
+    const allJobs = await db.job.findMany({ select: { id: true, mangaId: true, voice: true } });
+    const targetIds = allJobs.filter((j) => ext.isPrivateJob(j)).map((j) => j.id);
+    for (const id of targetIds) {
+      const dir = jobDir(id);
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    if (targetIds.length > 0) {
+      await db.job.deleteMany({ where: { id: { in: targetIds } } });
+    }
+    return NextResponse.json({ deleted: targetIds.length });
+  } catch (err) {
+    console.error("DELETE /api/jobs error:", err);
+    return NextResponse.json({ error: "Failed to clean up jobs" }, { status: 500 });
   }
 }

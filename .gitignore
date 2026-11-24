@@ -153,3 +153,13 @@ Caddyfile.prod.bak
 /scratch_*.sh
 # large generated OCR-training corpora live in Kaggle datasets, not git
 pipeline/training/ocr/_data/
+src/private/
+mini-services/pipeline-service/private/
+pipeline/private_voice.py
+
+# local backups, db, downloads & scratch notes
+*.bak
+*.bak_*
+prisma/*.db
+public/downloads/
+PROJECT_CONTEXT_AND_NOTES.md
