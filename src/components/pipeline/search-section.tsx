@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useCallback, useMemo, useEffect, useRef, forwardRef, useImperativeHandle } from "react";
-import { Search, Loader2, Sparkles, ExternalLink, X, Clock, Bookmark, BookmarkCheck, ArrowUpDown, BookmarkCheckIcon, History, Heart, Info } from "lucide-react";
+import { Search, Loader2, Sparkles, ExternalLink, X, Clock, Bookmark, BookmarkCheck, ArrowUpDown, BookmarkCheckIcon, History, Heart, Info, ArrowRight } from "lucide-react";
+import { motion } from "framer-motion";
+import { AtelierCinemaDeck, SearchResults3DCoverflow, Tilt3DResultCard, TypedCinemaTitle, EditorialGenreAtelier, type GenrePreset } from "@/components/pipeline/atelier-stage";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
@@ -41,7 +43,6 @@ const SOURCE_FILTERS: { value: SourceFilter; label: string; color: string }[] = 
   { value: "mangadex", label: "MangaDex", color: "text-orange-400" },
   { value: "mangahere", label: "MangaHere", color: "text-emerald-400" },
   { value: "fanfox", label: "FanFox", color: "text-orange-400" },
-  { value: "mangapill", label: "MangaPill", color: "text-cyan-400" },
   { value: "comick", label: "Comick", color: "text-violet-400" },
   { value: "weebcentral", label: "WeebCentral", color: "text-indigo-400" },
   { value: "mal", label: "MAL", color: "text-sky-400" },
@@ -196,6 +197,23 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     const [poppedBookmark, setPoppedBookmark] = useState<string | null>(null);
     const [focusedResultIdx, setFocusedResultIdx] = useState(-1);
     const [expandedManga, setExpandedManga] = useState<MangadexManga | null>(null);
+    const [resultsViewMode, setResultsViewMode] = useState<"3d-both" | "3d-stage" | "3d-grid">("3d-both");
+    const [activeGenre, setActiveGenre] = useState<string>("all");
+    const [displayLimit, setDisplayLimit] = useState<number>(24);
+    const [placeholderIdx, setPlaceholderIdx] = useState(0);
+    const PLACEHOLDERS = [
+      "Search Nano Machine…",
+      "Search Solo Leveling…",
+      "Search Omniscient Reader…",
+      "Search Tower of God…",
+      "Search The Beginning After the End…",
+    ];
+    useEffect(() => {
+      const id = setInterval(() => {
+        setPlaceholderIdx((i) => (i + 1) % 5);
+      }, 3200);
+      return () => clearInterval(id);
+    }, []);
     const searchStartTime = useRef<number>(0);
     const historyPanelRef = useRef<HTMLDivElement>(null);
     const resultsGridRef = useRef<HTMLDivElement>(null);
@@ -415,12 +433,10 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     const handleSelect = useCallback(
       async (m: MangadexManga) => {
         const source = m.source ?? "mangahere";
-        // Everything except the metadata-only catalogs (MAL / AniList) has a
-        // real chapter+image scraper — pass those straight through.
-        if (source !== "mal" && source !== "anilist") {
-          onSelectManga(m);
-          return;
-        }
+        // Open the Quick Manhwa Overview page immediately for all sources;
+        // MangaOverview resolves MAL/AniList to a live archive when "Do the Recap" is clicked.
+        onSelectManga(m);
+        return;
 
         setResolvingId(m.id);
         const findingToast = toast({
@@ -488,6 +504,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     // Reset focused index when results change
     useEffect(() => {
       setFocusedResultIdx(-1);
+      setDisplayLimit(24);
     }, [visibleResults.length]);
 
     // Keyboard navigation for search results
@@ -528,115 +545,112 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
     return (
       <section ref={sectionRef} className="space-y-6">
         {/* Hero with glow orbs */}
-        <div className="relative">
-          <div className="absolute inset-0 overflow-hidden pointer-events-none">
-            <div
-              className="hidden lg:block absolute -top-20 left-1/4 w-[300px] h-[300px] rounded-full blur-[80px] opacity-15"
-              style={{
-                background: "radial-gradient(circle, oklch(0.78 0.17 65), oklch(0.72 0.18 45 / 0.3), transparent)",
-                animation: "float-orb-1 8s ease-in-out infinite",
+        {/* Centered Editorial Hero — Typed-Out Title + Sculpted Search + 5-Card Real-Cover 3D Deck */}
+        <div className="relative pt-2 sm:pt-6 pb-4 space-y-10">
+          <div className="max-w-3xl mx-auto text-center space-y-6">
+            {/* Centered Editorial Eyebrow with flanking gold rules */}
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+              className="inline-flex items-center justify-center gap-3.5"
+            >
+              <span className="h-[1px] w-10 bg-gradient-to-r from-transparent to-[#F5D27A]" />
+              <span className="text-[10.5px] font-mono uppercase tracking-[0.28em] text-[#F5D27A]">
+                Edition III · Private Screening House
+              </span>
+              <span className="h-[1px] w-10 bg-gradient-to-l from-transparent to-[#F5D27A]" />
+            </motion.div>
+
+            {/* Centered Sculptural Headline with Live Typed-Out Animation */}
+            <div className="space-y-1">
+              <motion.h1
+                initial={{ opacity: 0, y: 18 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.65, ease: [0.22, 1, 0.36, 1] }}
+                className="font-serif text-5xl sm:text-6xl lg:text-[4.6rem] font-semibold tracking-tight leading-[1.02] text-foreground"
+              >
+                Turn Panels
+              </motion.h1>
+              <div className="text-4xl sm:text-6xl lg:text-[4.5rem] leading-[1.08] tracking-tight">
+                <TypedCinemaTitle />
+              </div>
+            </div>
+
+            <motion.p
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.65, delay: 0.15, ease: [0.22, 1, 0.36, 1] }}
+              className="text-muted-foreground text-sm sm:text-base max-w-xl mx-auto leading-relaxed"
+            >
+              Search fourteen live archives, sculpt every panel with neural segmentation, and master narrated widescreen editions with studio-grade cadence.
+            </motion.p>
+
+            {/* Centered Sculpted Floating Command Search Bar */}
+            <motion.form
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.65, delay: 0.24, ease: [0.22, 1, 0.36, 1] }}
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSearch();
               }}
-            />
-            <div
-              className="hidden lg:block absolute -top-10 right-1/4 w-[250px] h-[250px] rounded-full blur-[80px] opacity-15"
-              style={{
-                background: "radial-gradient(circle, oklch(0.72 0.18 45), oklch(0.65 0.22 50 / 0.3), transparent)",
-                animation: "float-orb-2 12s ease-in-out infinite",
-              }}
-            />
-            <div
-              className="hidden lg:block absolute top-10 left-1/2 -translate-x-1/2 w-[200px] h-[200px] rounded-full blur-[80px] opacity-15"
-              style={{
-                background: "radial-gradient(circle, oklch(0.65 0.2 25), oklch(0.72 0.18 45 / 0.3), transparent)",
-                animation: "float-orb-3 15s ease-in-out infinite",
+              className="max-w-2xl mx-auto"
+            >
+              <div className="group flex items-center gap-2 p-1.5 pl-5 rounded-full bg-card border border-primary/45 shadow-[0_22px_54px_-16px_rgba(225,29,72,0.38),0_0_0_1px_rgba(245,210,122,0.18)] focus-within:border-[#F5D27A] focus-within:shadow-[0_26px_60px_-14px_rgba(244,63,94,0.52)] transition-all duration-300">
+                <Search className="h-4 w-4 text-primary shrink-0 transition-transform duration-300 group-focus-within:scale-110" />
+                <Input
+                  id="search-input"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onFocus={() => setInputFocused(true)}
+                  onBlur={() => setTimeout(() => setInputFocused(false), 200)}
+                  onKeyDown={handleInputKeyDown}
+                  placeholder={PLACEHOLDERS[placeholderIdx]}
+                  className="h-11 border-0 !bg-transparent dark:!bg-transparent shadow-none focus-visible:ring-0 focus-visible:border-0 px-2 text-sm sm:text-base placeholder:text-muted-foreground/65"
+                  autoFocus
+                />
+                <Button
+                  type="submit"
+                  size="lg"
+                  className="h-11 px-6 rounded-full btn-sovereign border-0 shrink-0 group/btn"
+                  disabled={loading || !query.trim()}
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      <span className="tracking-[0.14em] uppercase text-[11px] font-semibold">Searching</span>
+                    </>
+                  ) : (
+                    <span className="inline-flex items-center gap-2 tracking-[0.16em] uppercase text-[11px] font-bold">
+                      Explore
+                      <ArrowRight className="h-3.5 w-3.5 transition-transform duration-300 group-hover/btn:translate-x-1" />
+                    </span>
+                  )}
+                </Button>
+              </div>
+            </motion.form>
+
+            {/* Unique Editorial Genre Atelier */}
+            <EditorialGenreAtelier
+              activeGenre={activeGenre}
+              onSelectGenre={(g: GenrePreset) => {
+                setActiveGenre(g.id);
+                if (g.id === "all") {
+                  if (hasSearched) handleClearResults();
+                  return;
+                }
+                setQuery(g.query);
+                runSearch(g.query, false);
               }}
             />
           </div>
 
-          <div className="absolute inset-0 overflow-hidden pointer-events-none lg:block hidden">
-            <div
-              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[300px] rounded-full opacity-[0.07]"
-              style={{
-                background: "radial-gradient(ellipse, oklch(0.78 0.17 65), oklch(0.65 0.2 25 / 0.3), transparent 70%)",
-              }}
-            />
-          </div>
-
-          <div className={`relative text-center space-y-5 transition-all duration-700 ${isVisible ? "animate-section-in" : "opacity-0"}`}>
-            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-primary/20 bg-primary/5 mb-2">
-              <Sparkles className="h-3.5 w-3.5 text-primary" />
-              <span className="text-[11px] font-semibold uppercase tracking-widest text-primary">AI-Powered Video Pipeline</span>
-            </div>
-            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tight leading-tight">
-              <span className="text-gradient">Manhwa Recap</span>
-              <br />
-              <span className="text-gradient">Studio</span>
-            </h1>
-            <p className="text-muted-foreground text-base sm:text-lg max-w-2xl mx-auto leading-relaxed">
-              Enter any manhwa, manga, or webtoon name. We search{" "}
-              <span className="text-foreground font-medium">every source at once</span>,
-              scrape every chapter, transcribe dialogue with AI, and render a narrated recap video.
-            </p>
-            <div className="flex items-center justify-center gap-3 text-xs text-muted-foreground/50">
-              <div className="flex items-center gap-1.5">
-                <kbd className="px-1.5 py-0.5 rounded border border-border bg-muted text-foreground/70 font-mono text-[10px] hover:bg-muted/80 transition-colors cursor-default">/</kbd>
-                <span>focus</span>
-              </div>
-              <span className="text-muted-foreground/20">·</span>
-              <div className="flex items-center gap-1.5">
-                <kbd className="px-1.5 py-0.5 rounded border border-border bg-muted text-foreground/70 font-mono text-[10px] hover:bg-muted/80 transition-colors cursor-default">Esc</kbd>
-                <span>clear</span>
-              </div>
-              <span className="text-muted-foreground/20">·</span>
-              <div className="flex items-center gap-1.5">
-                <kbd className="px-1.5 py-0.5 rounded border border-border bg-muted text-foreground/70 font-mono text-[10px] hover:bg-muted/80 transition-colors cursor-default">B</kbd>
-                <span>bookmarks</span>
-              </div>
-            </div>
+          {/* Centered 9-Card Tiltable Real-Cover 3D Recommendation Deck (Direct Recap Open!) */}
+          <div className="pt-2">
+            <AtelierCinemaDeck onSelectManga={handleSelect} />
           </div>
         </div>
-
-        {/* Glassmorphism search bar */}
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSearch();
-          }}
-          className="flex flex-col sm:flex-row gap-3 max-w-2xl mx-auto"
-        >
-          <div className="relative flex-1">
-            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-muted-foreground" />
-            <Input
-              id="search-input"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onFocus={() => setInputFocused(true)}
-              onBlur={() => setTimeout(() => setInputFocused(false), 200)}
-              onKeyDown={handleInputKeyDown}
-              placeholder="e.g. Solo Leveling, Tower of God, One Piece…"
-              className="pl-11 h-13 text-base bg-card/80 border-border/80 backdrop-blur-sm focus:bg-card transition-all shadow-sm focus:shadow-md focus:shadow-primary/5 rounded-xl"
-              autoFocus
-            />
-          </div>
-          <Button
-            type="submit"
-            size="lg"
-            className="h-13 px-8 font-semibold rounded-xl shadow-sm hover:shadow-md hover:shadow-primary/10 transition-all"
-            disabled={loading || !query.trim()}
-          >
-            {loading ? (
-              <>
-                <Loader2 className="h-5 w-5 mr-2 animate-spin" />
-                Searching…
-              </>
-            ) : (
-              <>
-                <Sparkles className="h-5 w-5 mr-2" />
-                Search
-              </>
-            )}
-          </Button>
-        </form>
 
         {privateMode && (
           <form
@@ -644,7 +658,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
               e.preventDefault();
               handleExtSearch();
             }}
-            className="max-w-2xl mx-auto mt-3 p-3 rounded-xl border border-rose-500/40 bg-rose-950/20 backdrop-blur-sm space-y-2.5 animate-fade-in-up"
+            className="max-w-2xl mx-auto mt-3 p-3 rounded-xl border border-rose-500/40 bg-rose-950/20  space-y-2.5 animate-fade-in-up"
           >
             <div className="flex flex-col sm:flex-row gap-2.5">
               <div className="relative flex-1 flex items-center gap-2">
@@ -718,7 +732,7 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
             ref={historyPanelRef}
             className="max-w-2xl mx-auto mt-1.5 animate-fade-in-up"
           >
-            <div className="rounded-xl border border-border bg-card/80 backdrop-blur-sm shadow-lg shadow-black/20 overflow-hidden">
+            <div className="rounded-xl border border-border bg-card/80  shadow-lg shadow-black/20 overflow-hidden">
               {searchHistory.length > 0 ? (
                 <>
                   <div className="max-h-64 overflow-y-auto">
@@ -979,146 +993,172 @@ const SearchSection = forwardRef<SearchSectionHandle, SearchSectionProps>(
         )}
 
         {visibleResults.length > 0 && (
-          <div ref={resultsGridRef} className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3 sm:gap-4">
-            {visibleResults.map((m, idx) => {
-              const source = m.source ?? "mangahere";
-              const isResolving = resolvingId === m.id;
-              const isExternal = source === "mal" || source === "anilist";
-              const contentRating = m.contentRating ?? "safe";
-              const mangaStatus = m.status?.toLowerCase() ?? null;
-              const bookmarked = isBookmarked?.(m.id) ?? false;
-              const isPopped = poppedBookmark === m.id;
+          <div className="space-y-8">
+            {/* 3D Display Mode Switcher */}
+            <div className="flex items-center justify-center">
+              <div className="inline-flex items-center gap-1 p-1 rounded-full bg-card border border-primary/30 shadow-md">
+                {(
+                  [
+                    { id: "3d-both" as const, label: "3D Stage + Grid" },
+                    { id: "3d-stage" as const, label: "3D Deck Only" },
+                    { id: "3d-grid" as const, label: "3D Tilt Grid" },
+                  ]
+                ).map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    onClick={() => setResultsViewMode(mode.id)}
+                    className={`relative px-3.5 py-1 rounded-full text-[10px] font-mono uppercase tracking-[0.15em] transition-colors cursor-pointer ${
+                      resultsViewMode === mode.id
+                        ? "text-[#FFF8F5]"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {resultsViewMode === mode.id && (
+                      <motion.span
+                        layoutId="resultsModePill"
+                        transition={{ type: "spring", stiffness: 360, damping: 28 }}
+                        className="absolute inset-0 rounded-full bg-gradient-to-r from-[#E11D48] to-[#BE123C] shadow-[0_4px_14px_rgba(225,29,72,0.55)]"
+                      />
+                    )}
+                    <span className="relative z-10">{mode.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
 
-              const genreTags = (m.tags ?? []).slice(0, 2);
+            {/* Interactive 3D Fanned Coverflow Stage with Real Cover Images & Chapter Counts */}
+            {(resultsViewMode === "3d-both" || resultsViewMode === "3d-stage") && (
+              <SearchResults3DCoverflow
+                items={visibleResults}
+                onSelect={handleSelect}
+                onExpandInfo={setExpandedManga}
+                isBookmarked={isBookmarked}
+                onBookmark={handleBookmark}
+                resolvingId={resolvingId}
+                sourceLabelMap={{
+                  ...SOURCE_LABEL,
+                  ...Object.fromEntries(
+                    Object.entries(privateMode?.sourceLabels ?? {}).map(([k, v]) => [k, v.label])
+                  ),
+                }}
+              />
+            )}
 
-              return (
-                <div
-                  key={m.id}
-                  data-result-index={idx}
-                  onClick={() => !isResolving && handleSelect(m)}
-                  role="button"
-                  tabIndex={-1}
-                  onMouseEnter={() => setFocusedResultIdx(idx)}
-                  onKeyDown={(e) => {
-                    if ((e.key === "Enter" || e.key === " ") && !isResolving) {
-                      e.preventDefault();
-                      handleSelect(m);
-                    }
-                  }}
-                  className={cn(
-                    "group text-left space-y-2 transition-all duration-300 hover:scale-[1.03] hover:-translate-y-1 focus:outline-none focus:ring-2 focus:ring-ring rounded-lg disabled:opacity-60 disabled:hover:scale-100 cursor-pointer animate-item-in hover-glow-sm",
-                    focusedResultIdx === idx && "ring-2 ring-primary/60 bg-accent/30 scale-[1.03] -translate-y-1"
-                  )}
-                  style={{ animationDelay: `${idx * 40}ms` }}
-                >
-                  <div className="aspect-[3/4] rounded-xl overflow-hidden bg-muted border border-border relative group-hover:border-primary/40 group-hover:shadow-lg group-hover:shadow-primary/5 transition-all duration-300">
-                    {m.coverUrl ? (
-                      <>
-                        <img
-                          src={`/api/cover?url=${encodeURIComponent(m.coverUrl)}`}
-                          alt={m.title}
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover group-hover:scale-105 group-hover:brightness-110 transition-all duration-500"
-                          loading="lazy"
-                        />
-                        <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/50 to-transparent pointer-events-none" />
-                      </>
-                    ) : (
-                      <div className="w-full h-full flex flex-col items-center justify-center text-muted-foreground p-2 text-center gap-1">
-                        <Search className="h-6 w-6 opacity-30" />
-                        <span className="text-xs">No cover</span>
-                      </div>
-                    )}
-                    <span
-                      className={`absolute top-1.5 left-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-md border backdrop-blur-sm ${SOURCE_BADGE_CLASSES[source] ?? privateMode?.sourceLabels?.[source]?.badge ?? "bg-zinc-500/20 text-zinc-200 border-zinc-500/40"}`}
-                    >
-                      {isResolving ? "…" : (SOURCE_LABEL[source] ?? privateMode?.sourceLabels?.[source]?.label ?? source)}
-                    </span>
-                    <span
-                      className={`absolute top-1.5 right-1.5 h-2 w-2 rounded-full ${CONTENT_RATING_CLASSES[contentRating] ?? "bg-emerald-500"}`}
-                      title={CONTENT_RATING_LABEL[contentRating] ?? contentRating}
-                    />
-                    {bookmarked && (
-                      <span className="absolute top-1.5 right-7 flex items-center justify-center">
-                        <Heart className="h-3 w-3 text-rose-400 fill-rose-400 drop-shadow-sm" />
-                      </span>
-                    )}
-                    {m.lastChapter && (
-                      <span className="absolute bottom-1.5 left-1.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-md bg-black/60 backdrop-blur-sm text-white/90 border border-white/10">
-                        Ch.{m.lastChapter}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={(e) => handleBookmark(e, m)}
-                      className={`absolute bottom-1.5 right-1.5 p-1.5 rounded-lg bg-black/50 backdrop-blur-sm text-white/70 hover:text-primary hover:bg-black/70 transition-all z-10 ${bookmarked ? "text-primary" : "opacity-0 group-hover:opacity-100"} ${isPopped ? "animate-bookmark-pop" : ""}`}
-                      aria-label={bookmarked ? `Remove ${m.title} from bookmarks` : `Bookmark ${m.title}`}
-                    >
-                      {bookmarked ? <BookmarkCheck className="h-3.5 w-3.5" /> : <Bookmark className="h-3.5 w-3.5" />}
-                    </button>
-                    {isExternal && m.externalUrl && (
-                      <a
-                        href={m.externalUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="absolute top-1.5 right-1.5 p-1 rounded bg-black/50 text-white/80 hover:text-white hover:bg-black/70 transition z-10"
-                        aria-label={`View ${(SOURCE_LABEL[source] ?? privateMode?.sourceLabels?.[source]?.label ?? source)} page`}
+            {/* Full Interactive 3D Pointer-Tilt Poster Grid */}
+            {(resultsViewMode === "3d-both" || resultsViewMode === "3d-grid") && (
+              <div className="space-y-6">
+              <div ref={resultsGridRef} className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 sm:gap-5">
+                {visibleResults.slice(0, displayLimit).map((m, idx) => {
+                  const source = m.source ?? "mangahere";
+                  const isResolving = resolvingId === m.id;
+                  const bookmarked = isBookmarked?.(m.id) ?? false;
+                  const isPopped = poppedBookmark === m.id;
+                  const genreTags = (m.tags ?? []).slice(0, 2);
+
+                  return (
+                    <Tilt3DResultCard key={m.id}>
+                      <div
+                        data-result-index={idx}
+                        onClick={() => !isResolving && handleSelect(m)}
+                        role="button"
+                        tabIndex={0}
+                        onMouseEnter={() => setFocusedResultIdx(idx)}
+                        onKeyDown={(e) => {
+                          if ((e.key === "Enter" || e.key === " ") && !isResolving) {
+                            e.preventDefault();
+                            handleSelect(m);
+                          }
+                        }}
+                        className={cn(
+                          "group text-left focus:outline-none rounded-2xl overflow-hidden cursor-pointer luxury-card aspect-[3/4] relative",
+                          focusedResultIdx === idx && "ring-2 ring-primary/60"
+                        )}
                       >
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
-                    )}
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/10 to-transparent opacity-0 group-hover:opacity-100 transition-all duration-300 flex flex-col items-end justify-between p-2">
-                      <div className="flex flex-wrap gap-1 justify-end">
-                        {genreTags.map((tag) => (
-                          <span key={tag} className="text-[9px] px-1.5 py-0.5 rounded-md bg-black/40 backdrop-blur-sm text-white/80 border border-white/10">
-                            {GENRE_ICONS[tag] ?? ""} {tag}
+                        {m.coverUrl ? (
+                          <img
+                            src={`/api/cover?url=${encodeURIComponent(m.coverUrl)}&w=360`}
+                            alt={m.title}
+                            referrerPolicy="no-referrer"
+                            loading="lazy"
+                            decoding="async"
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-br from-[#2B0916] to-[#0E050A]">
+                            <Sparkles className="h-5 w-5 text-[#F5D27A]/70 mb-1.5" />
+                            <span className="font-serif italic text-xs text-[#FFF8F5]/80 line-clamp-2">{m.title}</span>
+                          </div>
+                        )}
+
+                        {/* Scrim darkens smoothly on hover to make popped-up description crisp */}
+                        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0B0408] via-[#0B0408]/35 to-transparent group-hover:via-[#0B0408]/80 group-hover:to-[#0B0408]/30 transition-all duration-300" />
+
+                        {/* Idle: ONLY Chapter Count badge top-right; Hover: Source pill + Bookmark */}
+                        <span
+                          className={`absolute top-2 left-2 text-[9px] font-mono uppercase px-2 py-0.5 rounded-full border opacity-0 group-hover:opacity-100 transition-opacity duration-200 z-20 ${SOURCE_BADGE_CLASSES[source] ?? privateMode?.sourceLabels?.[source]?.badge ?? "bg-zinc-500/20 text-zinc-200 border-zinc-500/40"}`}
+                        >
+                          {isResolving ? "…" : (SOURCE_LABEL[source] ?? privateMode?.sourceLabels?.[source]?.label ?? source)}
+                        </span>
+
+                        {m.lastChapter && (
+                          <span className="absolute top-2 right-2 text-[9.5px] font-mono font-bold px-2 py-0.5 rounded-full bg-gradient-to-r from-[#E11D48] to-[#9F1239] text-[#FFF8F5] border border-[#F5D27A]/70 shadow-md z-20">
+                            Ch.{m.lastChapter}
                           </span>
-                        ))}
-                      </div>
-                      <div className="flex items-center gap-2 w-full justify-between">
+                        )}
+
                         <button
                           type="button"
-                          onClick={(e) => { e.stopPropagation(); setExpandedManga(m); }}
-                          className="flex items-center gap-1 text-[10px] text-white/70 hover:text-white px-1.5 py-0.5 rounded-md bg-white/10 backdrop-blur-sm hover:bg-white/20 transition z-20"
-                          aria-label={`Show details for ${m.title}`}
+                          onClick={(e) => handleBookmark(e, m)}
+                          className={`absolute bottom-2.5 right-2.5 p-1.5 rounded-full bg-black/65 border border-white/15 text-white/80 hover:text-primary transition-all z-20 ${bookmarked ? "text-primary opacity-100" : "opacity-0 group-hover:opacity-100"} ${isPopped ? "animate-bookmark-pop" : ""}`}
+                          aria-label={bookmarked ? `Remove ${m.title} from bookmarks` : `Bookmark ${m.title}`}
                         >
-                          <Info className="h-3 w-3" />
-                          Info
+                          {bookmarked ? <BookmarkCheck className="h-3.5 w-3.5" /> : <Bookmark className="h-3.5 w-3.5" />}
                         </button>
-                        <span className="text-white text-xs font-medium">
-                          {isResolving
-                            ? "Finding on MangaHere…"
-                            : isExternal
-                              ? "Match on MangaDex →"
-                              : "Select →"}
-                        </span>
+
+                        {/* Bottom Plate: Idle = Title ONLY; Hover = Smooth Description + Genres Pop-Up */}
+                        <div className="absolute bottom-0 inset-x-0 p-3 z-10 space-y-1.5">
+                          <p className="font-serif text-[15px] font-semibold line-clamp-2 leading-snug text-[#FFF8F5] drop-shadow pr-6">
+                            {m.title}
+                          </p>
+                          <div className="grid grid-rows-[0fr] opacity-0 group-hover:grid-rows-[1fr] group-hover:opacity-100 transition-all duration-300">
+                            <div className="overflow-hidden space-y-1.5">
+                              {m.description && (
+                                <p className="text-[10.5px] text-[#FFE8EC]/85 leading-snug line-clamp-3">
+                                  {m.description}
+                                </p>
+                              )}
+                              {genreTags.length > 0 && (
+                                <div className="flex flex-wrap gap-1 pr-6">
+                                  {genreTags.map((tag) => (
+                                    <span key={tag} className="text-[8.5px] font-mono px-1.5 py-0.5 rounded-full bg-[#240A16] text-[#F5D27A] border border-[#F5D27A]/30">
+                                      {tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  </div>
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium line-clamp-2 leading-tight group-hover:text-primary transition-colors">
-                      {m.title}
-                    </p>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <p className="text-xs text-muted-foreground">
-                        {m.year ? `${m.year}` : ""}
-                        {m.year && m.originalLanguage ? " · " : ""}
-                        {m.originalLanguage?.toUpperCase() ?? (isExternal ? SOURCE_LABEL[source] : "?")}
-                        {m.lastChapter ? ` · Ch.${m.lastChapter}` : ""}
-                      </p>
-                    </div>
-                    {mangaStatus && STATUS_BADGE_CLASSES[mangaStatus] && (
-                      <span
-                        className={`inline-block text-[9px] font-medium px-1.5 py-0.5 rounded-md border ${STATUS_BADGE_CLASSES[mangaStatus]}`}
-                      >
-                        {mangaStatus.charAt(0).toUpperCase() + mangaStatus.slice(1)}
-                      </span>
-                    )}
-                  </div>
+                    </Tilt3DResultCard>
+                  );
+                })}
+              </div>
+
+              {visibleResults.length > displayLimit && (
+                <div className="flex justify-center pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setDisplayLimit((n) => n + 24)}
+                    className="px-6 py-2.5 rounded-full bg-card border border-[#F5D27A]/45 hover:border-primary text-xs font-mono uppercase tracking-[0.18em] text-[#F5D27A] hover:text-foreground transition-colors cursor-pointer"
+                  >
+                    Load More ({visibleResults.length - displayLimit} Remaining)
+                  </button>
                 </div>
-              );
-            })}
+              )}
+              </div>
+            )}
           </div>
         )}
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { Github, Zap, Keyboard, ChevronUp, Sun, Moon, Heart, ArrowRight, Sparkles } from "lucide-react";
+import { Github, Zap, Keyboard, ChevronUp, Sun, Moon, Heart, ArrowRight, Sparkles, Palette, Check } from "lucide-react";
 import { NotificationCenter } from "@/components/pipeline/notification-center";
 import { CommandPalette } from "@/components/pipeline/command-palette";
 import { RecentlyViewed } from "@/components/pipeline/recently-viewed";
@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/popover";
 import { Separator } from "@/components/ui/separator";
 import { SearchSection } from "@/components/pipeline/search-section";
+import { MangaOverview } from "@/components/pipeline/manga-overview";
 import { MangaConfig } from "@/components/pipeline/manga-config";
 import { JobProgress } from "@/components/pipeline/job-progress";
 import { JobHistory } from "@/components/pipeline/job-history";
@@ -29,17 +30,72 @@ import { OnboardingTour } from "@/components/pipeline/onboarding-tour";
 import { PipelineStats } from "@/components/pipeline/pipeline-stats";
 import { ActivityFeed } from "@/components/pipeline/activity-feed";
 import { useJobProgress } from "@/hooks/use-job-progress";
-import { useScrollProgress } from "@/hooks/use-section-observer";
+import { motion } from "framer-motion";
+import { CursorVelvetGlow, AtelierAmbientParticles, EditorialMarqueeStrip, Trending3DShowcase } from "@/components/pipeline/atelier-stage";
 import { useBookmarks } from "@/hooks/use-bookmarks";
 import type { MangadexManga } from "@/types/pipeline";
 
-type View = "search" | "config" | "job";
+type View = "search" | "overview" | "config" | "job";
 
 const SHORTCUTS = [
   { key: "/", desc: "Focus search" },
   { key: "Esc", desc: "Clear search results" },
   { key: "B", desc: "Toggle bookmarks" },
   { key: "⌘K", desc: "Command palette" },
+];
+
+
+type BgVariant = "curtain" | "marble" | "deco" | "runway" | "ink" | "lattice";
+
+const BG_VARIANTS: Array<{
+  id: BgVariant;
+  name: string;
+  vibe: string;
+  swatch: string;
+  className: string;
+}> = [
+  {
+    id: "curtain",
+    name: "Crimson Silk Curtain",
+    vibe: "Opera house velvet folds",
+    swatch: "linear-gradient(90deg, #1E0610, #6B0F2E, #16050C, #520C23)",
+    className: "bg-variant-curtain",
+  },
+  {
+    id: "marble",
+    name: "Imperial Marble & Gold",
+    vibe: "Nero obsidian & gold veins",
+    swatch: "linear-gradient(135deg, #1A0812 0%, #0B0509 45%, #F5D27A 50%, #150710 56%)",
+    className: "bg-variant-marble",
+  },
+  {
+    id: "deco",
+    name: "Sunburst Art-Deco Fan",
+    vibe: "1920s Gatsby cinema palais",
+    swatch: "radial-gradient(circle at 50% 100%, #F5D27A 0%, #881337 45%, #12060B 100%)",
+    className: "bg-variant-deco",
+  },
+  {
+    id: "runway",
+    name: "Cherry Spotlight Grid",
+    vibe: "High-fashion lookbook",
+    swatch: "radial-gradient(circle at 50% 40%, #E11D48 0%, #14060D 75%)",
+    className: "bg-variant-runway",
+  },
+  {
+    id: "ink",
+    name: "Nocturne Ink & Gold Dust",
+    vibe: "Sumi wash & maki-e flakes",
+    swatch: "linear-gradient(135deg, #2D091B 0%, #0D050A 55%, #C49334 100%)",
+    className: "bg-variant-ink",
+  },
+  {
+    id: "lattice",
+    name: "Velvet Diamond Lattice",
+    vibe: "Original salon diamond weave",
+    swatch: "linear-gradient(135deg, #240915 0%, #0E060B 60%, #9F1239 100%)",
+    className: "studio-canvas",
+  },
 ];
 
 const TECH_BADGES = ["Next.js 16", "Tailwind CSS 4", "Prisma", "Framer Motion", "Socket.IO", "TypeScript"];
@@ -52,11 +108,29 @@ export default function Home() {
   const [trendingQuery, setTrendingQuery] = useState<string | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [bgPickerOpen, setBgPickerOpen] = useState(false);
+  const [bgVariant, setBgVariant] = useState<BgVariant>("curtain");
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("manhwa-bg-variant") as BgVariant | null;
+      if (saved && BG_VARIANTS.some((v) => v.id === saved)) {
+        setBgVariant(saved);
+      }
+    } catch {}
+  }, []);
+
+  const handleSelectBg = useCallback((id: BgVariant) => {
+    setBgVariant(id);
+    try {
+      localStorage.setItem("manhwa-bg-variant", id);
+    } catch {}
+  }, []);
   const [showBookmarks, setShowBookmarks] = useState(false);
+  const [activeNav, setActiveNav] = useState<"explore" | "collection" | "archive">("explore");
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const { recentlyViewed, addViewed, removeItem: removeRecentlyViewed, clearAll: clearRecentlyViewed } = useRecentlyViewed();
   const { theme, setTheme } = useTheme();
-  const scrollProgress = useScrollProgress();
   const { isBookmarked, toggleBookmark } = useBookmarks();
 
   // Hydration-safe client-only check
@@ -76,7 +150,8 @@ export default function Home() {
       addViewed({ id: manga.id, title: manga.title, coverUrl: manga.coverUrl || "" });
     }
     setSelectedManga(manga);
-    setView("config");
+    setView("overview");
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }, [addViewed]);
 
   const handleJobCreated = useCallback((jobId: string) => {
@@ -329,55 +404,198 @@ export default function Home() {
   );
 
   return (
-    <div className="min-h-screen flex flex-col bg-background bg-grain">
+    <div className={`min-h-screen flex flex-col ${BG_VARIANTS.find((v) => v.id === bgVariant)?.className ?? "studio-canvas"} relative overflow-x-clip transition-[background] duration-500`}>
+      {/* Living interactive velvet spotlight + slow drifting cherry/champagne silk orbs */}
+      <CursorVelvetGlow />
+      <AtelierAmbientParticles />
+      <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+        {/* Architectural print-editorial side margin rails */}
+        <div className="hidden xl:block fixed top-0 bottom-0 left-8 w-px bg-gradient-to-b from-transparent via-[#F5D27A]/20 to-transparent" />
+        <div className="hidden xl:block fixed top-0 bottom-0 right-8 w-px bg-gradient-to-b from-transparent via-[#F5D27A]/20 to-transparent" />
+      </div>
       {/* Onboarding tour */}
       <OnboardingTour />
 
-      {/* Header */}
-      <header className="sticky top-0 z-40 glass backdrop-blur-strong relative shadow-[0_4px_30px_-10px_oklch(0.78_0.17_65/0.08)]">
-        {/* Scroll progress bar */}
-        <div className="absolute inset-x-0 top-0 h-[2px]">
-          <div
-            className="h-full transition-all duration-150 ease-out"
-            style={{
-              width: `${scrollProgress * 100}%`,
-              background: "linear-gradient(90deg, oklch(0.78 0.17 65), oklch(0.72 0.18 45), oklch(0.85 0.15 75))",
-              backgroundSize: "200% 100%",
-              animation: "progress-shimmer 3s linear infinite",
-            }}
-          />
-        </div>
+      {/* Header — Center-Based Couture Maison Bar (Zero Progress Loader, Zero Glass) */}
+      <header className="sticky top-0 z-40 bg-[#FFFDF9] dark:bg-[#12070C] border-b border-primary/25 shadow-[0_14px_40px_-18px_rgba(0,0,0,0.9)]">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3.5 grid grid-cols-[1fr_auto_1fr] items-center gap-4">
+          {/* Left: Kinetic Sliding-Indicator Navigation */}
+          <nav className="hidden md:flex items-center gap-1 p-1 rounded-full bg-secondary/70 border border-border justify-self-start">
+            {(
+              [
+                {
+                  id: "explore" as const,
+                  label: "Explore",
+                  action: () => {
+                    setActiveNav("explore");
+                    handleNewJob();
+                  },
+                },
+                {
+                  id: "collection" as const,
+                  label: "Collection",
+                  action: () => {
+                    setActiveNav("collection");
+                    if (view !== "search") handleNewJob();
+                    setShowBookmarks((v) => !v);
+                  },
+                },
+                {
+                  id: "archive" as const,
+                  label: "Archive",
+                  action: () => {
+                    setActiveNav("archive");
+                    if (view !== "search") handleNewJob();
+                    setTimeout(() => {
+                      document.getElementById("section-job-history")?.scrollIntoView({ behavior: "smooth" });
+                    }, 50);
+                  },
+                },
+              ]
+            ).map((item) => {
+              const isActive = activeNav === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={item.action}
+                  className={`relative px-3.5 py-1.5 rounded-full text-[10.5px] font-mono uppercase tracking-[0.16em] transition-colors cursor-pointer ${
+                    isActive ? "text-[#FFF8F5]" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {isActive && (
+                    <motion.span
+                      layoutId="maisonNavPill"
+                      transition={{ type: "spring", stiffness: 360, damping: 30 }}
+                      className="absolute inset-0 rounded-full bg-gradient-to-r from-[#E11D48] to-[#BE123C] shadow-[0_6px_18px_-4px_rgba(225,29,72,0.7)]"
+                    />
+                  )}
+                  <span className="relative z-10">{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+          <div className="flex md:hidden items-center justify-self-start">
+            {view !== "search" && <ConnectionIndicator connected={connected} />}
+          </div>
 
-        <div className="max-w-6xl mx-auto flex items-center justify-between px-4 py-3">
-          <button onClick={handleNewJob} className="flex items-center gap-2.5 group hover-glow-sm rounded-lg -m-1 p-1">
-            <div className="p-1.5 rounded-lg bg-primary/10 group-hover:bg-primary/20 transition-all duration-300 group-hover:shadow-md group-hover:shadow-primary/10">
-              <Zap className="h-5 w-5 text-primary" />
+          {/* Center: Bespoke Crest + Wordmark (Centered Anchor) */}
+          <motion.button
+            whileHover={{ scale: 1.03 }}
+            whileTap={{ scale: 0.98 }}
+            onClick={() => {
+              setActiveNav("explore");
+              handleNewJob();
+            }}
+            className="flex items-center gap-3 group justify-self-center cursor-pointer"
+          >
+            <div className="relative h-10 w-10 flex items-center justify-center shrink-0">
+              <svg viewBox="0 0 44 44" className="h-10 w-10 drop-shadow-[0_6px_18px_rgba(225,29,72,0.55)] transition-transform duration-500 group-hover:rotate-[12deg]" aria-hidden="true">
+                <defs>
+                  <linearGradient id="cherryCrest" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#FB7185" />
+                    <stop offset="45%" stopColor="#E11D48" />
+                    <stop offset="100%" stopColor="#881337" />
+                  </linearGradient>
+                  <linearGradient id="goldTrim" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#FFF0B8" />
+                    <stop offset="50%" stopColor="#F5D27A" />
+                    <stop offset="100%" stopColor="#C49334" />
+                  </linearGradient>
+                </defs>
+                <polygon points="13,3 31,3 41,13 41,31 31,41 13,41 3,31 3,13" fill="url(#cherryCrest)" stroke="url(#goldTrim)" strokeWidth="1.75" />
+                <polygon points="14.5,6 29.5,6 38,14.5 38,29.5 29.5,38 14.5,38 6,29.5 6,14.5" fill="none" stroke="#FFF0B8" strokeOpacity="0.35" strokeWidth="0.75" />
+                <path d="M12.5 14.5 L20.5 12.5 L20.5 31.5 L12.5 29.5 Z" fill="#FFF8F5" fillOpacity="0.96" />
+                <path d="M23.5 12.5 L31.5 14.5 L31.5 23.5 L23.5 25.5 Z" fill="url(#goldTrim)" />
+                <polygon points="24,27.2 31,29.3 24,31.4" fill="#FFF8F5" />
+              </svg>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm sm:text-base">Manhwa Recap Studio</span>
-              <span className="hidden sm:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary/80 border border-primary/20">
-                v3
+            <div className="text-left">
+              <span className="block font-serif font-semibold text-lg sm:text-2xl tracking-tight leading-none text-foreground">
+                Manhwa <span className="italic gold-foil-live">Recap</span>
+              </span>
+              <span className="hidden sm:block text-[8.5px] font-mono uppercase tracking-[0.3em] text-muted-foreground mt-0.5">
+                Atelier · Edition III
               </span>
             </div>
-          </button>
-          <div className="flex items-center gap-1.5 sm:gap-2">
-            {/* Connection indicator — only shown when not in search view */}
-            {view !== "search" && <ConnectionIndicator connected={connected} />}
+          </motion.button>
 
-            {/* Notification center — only shown on search view */}
+          {/* Right: Quick Command Pill + Sculpted Utility Controls */}
+          <div className="flex items-center justify-end gap-1.5 sm:gap-2 justify-self-end">
+            <div className="hidden md:flex items-center">
+              {view !== "search" && <ConnectionIndicator connected={connected} />}
+            </div>
+            <motion.button
+              whileHover={{ scale: 1.04 }}
+              whileTap={{ scale: 0.96 }}
+              type="button"
+              onClick={() => setCommandPaletteOpen(true)}
+              className="hidden sm:inline-flex items-center gap-1.5 h-8 px-3 rounded-full border border-[#F5D27A]/35 bg-card text-[10px] font-mono uppercase tracking-[0.14em] text-foreground/85 hover:border-primary hover:text-primary transition-colors cursor-pointer"
+            >
+              <span>Search</span>
+              <kbd className="text-[9px] text-[#F5D27A] font-semibold">⌘K</kbd>
+            </motion.button>
+
             {view === "search" && <NotificationCenter />}
-
-            {/* Settings dialog button */}
             <SettingsDialog />
 
-            {/* Keyboard shortcut helper */}
+            {/* Live Background Switcher */}
+            <Popover open={bgPickerOpen} onOpenChange={setBgPickerOpen}>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  className="h-8 px-2.5 rounded-full border border-[#F5D27A]/40 bg-card flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-[0.14em] text-[#F5D27A] hover:border-primary hover:text-primary transition-colors cursor-pointer"
+                  aria-label="Switch background theme"
+                  title="Preview Backgrounds"
+                >
+                  <Palette className="h-3.5 w-3.5" />
+                  <span className="hidden lg:inline">Backdrop</span>
+                </button>
+              </PopoverTrigger>
+              <PopoverContent side="bottom" align="end" className="w-72 p-3 space-y-2.5 bg-[#160810] dark:bg-[#14070E] border border-[#F5D27A]/35 shadow-2xl">
+                <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                  <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-[#F5D27A]">
+                    Live Backdrop Preview
+                  </p>
+                  <span className="text-[9px] font-mono text-muted-foreground">6 Styles</span>
+                </div>
+                <div className="space-y-1.5">
+                  {BG_VARIANTS.map((v) => {
+                    const active = bgVariant === v.id;
+                    return (
+                      <button
+                        key={v.id}
+                        type="button"
+                        onClick={() => handleSelectBg(v.id)}
+                        className={`w-full flex items-center gap-3 p-2 rounded-xl border text-left transition-all cursor-pointer ${
+                          active
+                            ? "bg-[#260B18] border-[#F5D27A]/75 shadow-[0_6px_18px_-6px_rgba(225,29,72,0.55)]"
+                            : "bg-card/50 border-white/5 hover:border-primary/40 hover:bg-[#1E0A14]"
+                        }`}
+                      >
+                        <span
+                          className="h-8 w-8 rounded-lg border border-[#F5D27A]/40 shrink-0 shadow-inner"
+                          style={{ background: v.swatch }}
+                        />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium text-[#FFF8F5] truncate">{v.name}</p>
+                          <p className="text-[10px] text-muted-foreground truncate">{v.vibe}</p>
+                        </div>
+                        {active && <Check className="h-3.5 w-3.5 text-[#F5D27A] shrink-0" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              </PopoverContent>
+            </Popover>
+
             <Popover open={shortcutsOpen} onOpenChange={setShortcutsOpen}>
               <PopoverTrigger asChild>
                 <button
-                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                  className="h-8 w-8 rounded-full border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-primary hover:border-primary/60 transition-colors cursor-pointer"
                   aria-label="Keyboard shortcuts"
                 >
-                  <Keyboard className="h-4 w-4" />
+                  <Keyboard className="h-3.5 w-3.5" />
                 </button>
               </PopoverTrigger>
               <PopoverContent side="bottom" align="end" className="w-64 p-3 space-y-3">
@@ -394,26 +612,20 @@ export default function Home() {
                     </div>
                   ))}
                 </div>
-                <div className="pt-1 border-t border-border">
-                  <p className="text-[10px] text-muted-foreground/60 leading-relaxed">
-                    Bookmarks are saved locally. Press <kbd className="px-1 py-0.5 rounded border border-border bg-muted font-mono text-[9px]">B</kbd> to toggle. Press <kbd className="px-1 py-0.5 rounded border border-border bg-muted font-mono text-[9px]">⌘K</kbd> for commands.
-                  </p>
-                </div>
               </PopoverContent>
             </Popover>
 
-            {/* Theme toggle */}
             {mounted && (
               <button
                 onClick={toggleTheme}
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all duration-300"
+                className="h-8 w-8 rounded-full border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-primary hover:border-primary/60 transition-colors cursor-pointer"
                 aria-label="Toggle theme"
               >
                 <Sun
-                  className={`h-4 w-4 transition-all duration-300 ${theme === "dark" ? "rotate-0 scale-100" : "rotate-90 scale-0 absolute"}`}
+                  className={`h-3.5 w-3.5 transition-all duration-300 ${theme === "dark" ? "rotate-0 scale-100" : "rotate-90 scale-0 absolute"}`}
                 />
                 <Moon
-                  className={`h-4 w-4 transition-all duration-300 ${theme === "dark" ? "-rotate-90 scale-0 absolute" : "rotate-0 scale-100"}`}
+                  className={`h-3.5 w-3.5 transition-all duration-300 ${theme === "dark" ? "-rotate-90 scale-0 absolute" : "rotate-0 scale-100"}`}
                 />
               </button>
             )}
@@ -422,27 +634,19 @@ export default function Home() {
               href="https://github.com/zainrana558/manhwa-recap-studio-v3"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-muted-foreground hover:text-foreground transition"
+              className="h-8 w-8 rounded-full border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-primary hover:border-primary/60 transition-colors"
               aria-label="Source"
             >
-              <Github className="h-4 w-4" />
+              <Github className="h-3.5 w-3.5" />
             </a>
           </div>
         </div>
-
-        <div
-          className="absolute bottom-0 inset-x-0 h-px"
-          style={{
-            background: "linear-gradient(90deg, transparent, oklch(0.78 0.17 65 / 0.4), oklch(0.72 0.18 45 / 0.3), transparent)",
-          }}
-        />
       </header>
 
       {/* Main */}
-      <main ref={mainRef} className="flex-1 overflow-y-auto px-4 py-8 sm:py-12">
+      <main ref={mainRef} className="relative z-10 flex-1 overflow-x-hidden px-4 py-8 sm:py-12">
         {view === "search" && (
-          <div className="space-y-12 max-w-6xl mx-auto">
-            <StatsBar />
+          <div className="space-y-14 max-w-6xl mx-auto">
             <SearchSection
               ref={searchSectionRef}
               onResults={() => {}}
@@ -453,6 +657,18 @@ export default function Home() {
               onBookmarkToggle={handleBookmarkToggle}
             />
 
+            <div className="rounded-2xl overflow-hidden border border-[#F5D27A]/20">
+              <EditorialMarqueeStrip />
+            </div>
+
+            <div id="section-trending">
+              <Trending3DShowcase
+                onSelectManga={handleSelectManga}
+                isBookmarked={isBookmarked}
+                onBookmarkToggle={handleBookmarkToggle}
+              />
+            </div>
+
             <RecentlyViewed
               items={recentlyViewed}
               onSelectManga={handleSelectManga}
@@ -460,51 +676,39 @@ export default function Home() {
               onClearAll={clearRecentlyViewed}
             />
 
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            {/* Bookmarks toggle + section */}
             {showBookmarks && (
-              <BookmarksSection onSelectManga={handleSelectManga} />
+              <>
+                <div className="editorial-rule max-w-4xl mx-auto" />
+                <BookmarksSection onSelectManga={handleSelectManga} />
+              </>
             )}
 
-            <div id="section-trending">
-              <TrendingSearches onPick={handleTrendingPick} />
-            </div>
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <div id="section-how-it-works">
-              <HowItWorks />
-            </div>
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <FeaturesGrid />
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <PipelineStats />
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
+            <div className="editorial-rule max-w-4xl mx-auto" />
 
             <div id="section-job-history">
               <JobHistory onSelectJob={handleSelectHistoryJob} refreshKey={historyRefresh} />
             </div>
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <FAQ />
-
-            <div className="gradient-separator max-w-4xl mx-auto my-0" />
-
-            <ActivityFeed />
           </div>
+        )}
+
+        {view === "overview" && selectedManga && (
+          <MangaOverview
+            manga={selectedManga}
+            onBack={handleNewJob}
+            onStartRecap={(resolved) => {
+              setSelectedManga(resolved);
+              setView("config");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+            isBookmarked={isBookmarked(selectedManga.id)}
+            onBookmarkToggle={() => handleBookmarkToggle(selectedManga)}
+          />
         )}
 
         {view === "config" && selectedManga && (
           <MangaConfig
             manga={selectedManga}
-            onBack={handleNewJob}
+            onBack={() => setView("overview")}
             onJobCreated={handleJobCreated}
           />
         )}
@@ -541,161 +745,101 @@ export default function Home() {
         isDark={theme === "dark"}
       />
 
-      {/* CTA Section */}
-      {view === "search" && (
-        <div className="relative border-t border-border overflow-hidden">
-          {/* Animated gradient mesh background */}
-          <div
-            className="absolute inset-0 opacity-[0.07]"
-            style={{
-              background: "radial-gradient(ellipse 600px 400px at 20% 50%, oklch(0.78 0.17 65 / 0.6), transparent), radial-gradient(ellipse 500px 350px at 80% 40%, oklch(0.72 0.18 45 / 0.5), transparent), radial-gradient(ellipse 400px 300px at 50% 80%, oklch(0.85 0.15 75 / 0.4), transparent)",
-              backgroundSize: "200% 200%",
-              animation: "gradient-mesh 12s ease-in-out infinite",
-            }}
-          />
+      {/* Footer — Monumental Couture Maison Colophon */}
+      <footer className="relative z-10 mt-auto bg-[#FFF9F6] dark:bg-[#11060B] border-t border-primary/35 overflow-hidden">
+        {/* Giant subtle architectural serif watermark */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none select-none absolute -bottom-8 left-1/2 -translate-x-1/2 whitespace-nowrap font-serif font-bold text-[15vw] sm:text-[11vw] leading-none tracking-tight text-primary/[0.04] dark:text-[#F5D27A]/[0.035]"
+        >
+          MANHWA RECAP
+        </div>
 
-          {/* Floating decorative shapes */}
-          <div className="absolute top-8 left-[10%] w-3 h-3 rounded-full bg-primary/20 animate-float" style={{ animationDelay: "0s" }} />
-          <div className="absolute top-12 right-[15%] w-2 h-2 rotate-45 bg-primary/15 animate-float" style={{ animationDelay: "0.8s" }} />
-          <div className="absolute bottom-10 left-[25%] w-2.5 h-2.5 rounded-full bg-primary/10 animate-float" style={{ animationDelay: "1.5s" }} />
-          <div className="absolute top-1/2 right-[8%] w-2 h-2 rotate-45 bg-primary/12 animate-float" style={{ animationDelay: "2.2s" }} />
-          <div className="absolute bottom-8 right-[30%] w-1.5 h-1.5 rounded-full bg-primary/18 animate-float" style={{ animationDelay: "0.5s" }} />
-
-          <div className="relative max-w-6xl mx-auto px-4 py-16 sm:py-20">
-            <div className="flex flex-col lg:flex-row items-center justify-between gap-10">
-              <div className="space-y-4 text-center lg:text-left">
-                <h2 className="text-2xl sm:text-3xl lg:text-4xl font-bold tracking-tight leading-tight">
-                  Ready to create your{" "}
-                  <br className="hidden sm:block" />
-                  <span className="text-gradient">first recap video?</span>
-                </h2>
-                <p className="text-sm text-muted-foreground max-w-md leading-relaxed mx-auto lg:mx-0">
-                  Search for any manhwa, configure your preferences, and let the AI pipeline handle the rest. It takes about 2 minutes per chapter.
+        <div className="relative max-w-6xl mx-auto px-4 sm:px-6 py-14 grid grid-cols-1 md:grid-cols-12 gap-10 items-start">
+          {/* Col 1 — Brand House */}
+          <div className="md:col-span-5 space-y-4">
+            <div className="flex items-center gap-3">
+              <svg viewBox="0 0 44 44" className="h-9 w-9 shrink-0 drop-shadow-[0_4px_12px_rgba(225,29,72,0.45)]" aria-hidden="true">
+                <polygon points="13,3 31,3 41,13 41,31 31,41 13,41 3,31 3,13" fill="#E11D48" stroke="#F5D27A" strokeWidth="1.8" />
+                <path d="M12.5 14.5 L20.5 12.5 L20.5 31.5 L12.5 29.5 Z" fill="#FFF8F5" />
+                <path d="M23.5 12.5 L31.5 14.5 L31.5 23.5 L23.5 25.5 Z" fill="#F5D27A" />
+                <polygon points="24,27.2 31,29.3 24,31.4" fill="#FFF8F5" />
+              </svg>
+              <div>
+                <p className="font-serif font-semibold text-xl leading-none text-foreground">
+                  Manhwa <span className="italic gold-foil-live">Recap</span>
+                </p>
+                <p className="text-[9px] font-mono uppercase tracking-[0.28em] text-[#F5D27A] mt-1">
+                  Private Screening Atelier
                 </p>
               </div>
-              <div className="flex flex-col sm:flex-row items-center gap-3">
-                {/* Main CTA button with glow + pulsing ring */}
-                <div className="relative">
-                  {/* Pulsing ring behind button */}
-                  <div className="absolute inset-0 rounded-xl bg-primary/20 animate-pulse-ring" />
-                  {/* Subtle glow behind button */}
-                  <div className="absolute -inset-3 rounded-2xl bg-primary/10 blur-xl" />
-                  <button
-                    onClick={() => {
-                      const input = document.getElementById("search-input") as HTMLInputElement | null;
-                      if (input) {
-                        input.focus();
-                        input.scrollIntoView({ behavior: "smooth", block: "center" });
-                      }
-                    }}
-                    className="relative inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-semibold hover:bg-primary/90 shadow-lg hover:shadow-xl hover:shadow-primary/20 transition-all active:scale-95 shine-effect"
-                  >
-                    <Sparkles className="h-4 w-4" />
-                    Get Started
-                    <ArrowRight className="h-4 w-4" />
-                  </button>
-                </div>
-                <button
-                  onClick={() => {
-                    const input = document.getElementById("search-input") as HTMLInputElement | null;
-                    if (input) {
-                      input.value = "Solo Leveling";
-                      input.dispatchEvent(new Event("input", { bubbles: true }));
-                      input.focus();
-                      const form = input.closest("form");
-                      if (form) form.requestSubmit();
-                      input.scrollIntoView({ behavior: "smooth", block: "center" });
-                    }
-                  }}
-                  className="inline-flex items-center gap-2 px-5 py-3 rounded-xl border border-primary/30 text-primary hover:bg-primary/5 hover:border-primary/50 transition-all hover-lift"
-                >
-                  Try Demo
-                </button>
-              </div>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed max-w-sm">
+              Sculpting vertical webtoons into cinema-grade narrated editions with neural segmentation, zero-clip vertical pans, and studio acoustics.
+            </p>
+          </div>
+
+          {/* Col 2 — Navigation */}
+          <div className="md:col-span-3 space-y-3">
+            <p className="text-[10px] font-mono uppercase tracking-[0.24em] text-primary">
+              Navigation
+            </p>
+            <div className="flex flex-col items-start gap-2.5 text-xs text-muted-foreground">
+              <button type="button" onClick={handleNewJob} className="hover:text-foreground hover:translate-x-1 transition-all cursor-pointer">
+                Explore Archives
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (view !== "search") handleNewJob();
+                  setShowBookmarks((v) => !v);
+                }}
+                className="hover:text-foreground hover:translate-x-1 transition-all cursor-pointer"
+              >
+                Saved Collection
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (view !== "search") handleNewJob();
+                  setTimeout(() => document.getElementById("section-job-history")?.scrollIntoView({ behavior: "smooth" }), 50);
+                }}
+                className="hover:text-foreground hover:translate-x-1 transition-all cursor-pointer"
+              >
+                Studio History
+              </button>
+              <button type="button" onClick={() => setCommandPaletteOpen(true)} className="hover:text-foreground hover:translate-x-1 transition-all cursor-pointer">
+                Command Palette (⌘K)
+              </button>
             </div>
           </div>
-        </div>
-      )}
 
-      {/* Footer */}
-      <footer className="relative mt-auto border-t border-border bg-background/50 overflow-hidden">
-        {/* Subtle top gradient glow line */}
-        <div
-          className="absolute top-0 inset-x-0 h-px"
-          style={{
-            background: "linear-gradient(90deg, transparent, oklch(0.78 0.17 65 / 0.4), oklch(0.72 0.18 45 / 0.3), transparent)",
-          }}
-        />
-
-        <div className="relative max-w-6xl mx-auto px-4 py-8 space-y-5">
-          {/* Brand section */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-            <div className="flex items-center gap-2.5">
-              <div className="p-1.5 rounded-lg bg-primary/10 border border-primary/15">
-                <Zap className="h-4 w-4 text-primary" />
-              </div>
-              <span className="font-bold text-sm">Manhwa Recap Studio</span>
-              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary/80 border border-primary/20">
-                v3
-              </span>
-            </div>
-
-            {/* Social links */}
-            <div className="flex items-center gap-3">
+          {/* Col 3 — Craft & Engine */}
+          <div className="md:col-span-4 space-y-3">
+            <p className="text-[10px] font-mono uppercase tracking-[0.24em] text-primary">
+              Atelier Engine
+            </p>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              YOLO11n-seg Slicer C · RapidOCR · Kokoro Neural Voice · 1920×1080 Cinema Mastering
+            </p>
+            <div className="pt-1 flex items-center gap-3">
               <a
                 href="https://github.com/zainrana558/manhwa-recap-studio-v3"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
-                aria-label="GitHub"
+                className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-primary/40 bg-card text-[11px] font-mono uppercase tracking-[0.14em] text-foreground hover:border-primary hover:text-primary transition-colors"
               >
-                <Github className="h-4 w-4" />
+                <Github className="h-3.5 w-3.5" />
+                Repository
               </a>
-              <span className="text-muted-foreground/30">|</span>
-              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                Built with <Heart className="h-3 w-3 text-rose-400 inline" /> for manhwa fans
-              </span>
             </div>
           </div>
+        </div>
 
-          <Separator className="opacity-30" />
-
-          {/* Technology badges with marquee scroll */}
-          <div className="relative overflow-hidden py-1">
-            {/* Fade edges */}
-            <div className="absolute inset-y-0 left-0 w-12 bg-gradient-to-r from-background/80 to-transparent z-10 pointer-events-none" />
-            <div className="absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-background/80 to-transparent z-10 pointer-events-none" />
-            <div className="flex animate-marquee w-max gap-2">
-              {[...TECH_BADGES, ...TECH_BADGES].map((badge, i) => (
-                <span
-                  key={`${badge}-${i}`}
-                  className="bg-card border border-border rounded-full px-2.5 py-0.5 text-[10px] text-muted-foreground font-medium hover:border-primary/30 hover:text-foreground transition-colors cursor-default whitespace-nowrap"
-                >
-                  {badge}
-                </span>
-              ))}
-            </div>
-          </div>
-
-          <Separator className="opacity-20" />
-
-          {/* Bottom links */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-muted-foreground">
-            <div className="flex items-center gap-2">
-              <span className="text-muted-foreground/60">Powered by</span>
-              <a href="https://asurascans.com" target="_blank" rel="noopener noreferrer" className="text-foreground/80 hover:text-primary transition">
-                AsuraScans
-              </a>
-              <span className="text-muted-foreground/40">·</span>
-              <a href="https://groq.com" target="_blank" rel="noopener noreferrer" className="text-foreground/80 hover:text-primary transition">
-                Groq
-              </a>
-              <span className="text-muted-foreground/40">·</span>
-              <span className="text-foreground/80">RapidOCR · Kokoro-82M INT8 · ffmpeg · YOLO</span>
-            </div>
-            <div className="flex items-center gap-3">
-              <span>For personal use only</span>
-            </div>
+        <div className="relative border-t border-border/50">
+          <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] font-mono text-muted-foreground/70">
+            <span>© Manhwa Recap Studio · Edition III</span>
+            <span>For personal archival &amp; narration use</span>
           </div>
         </div>
       </footer>

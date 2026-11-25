@@ -1,24 +1,33 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Playfair_Display, Plus_Jakarta_Sans, IBM_Plex_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 import { Providers } from "@/components/providers";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const playfair = Playfair_Display({
+  variable: "--font-serif",
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  style: ["normal", "italic"],
 });
 
-const geistMono = Geist_Mono({
+const jakarta = Plus_Jakarta_Sans({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+});
+
+const plexMono = IBM_Plex_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
+  weight: ["400", "500"],
 });
 
 export const metadata: Metadata = {
-  title: "Manhwa Recap Studio — Auto-Scrape & Narrate",
+  title: "Manhwa Recap Studio — Luxury Narration Atelier",
   description:
-    "Enter a manhwa/manga/webtoon name. We search MangaDex, scrape every chapter, translate to English with Groq, and render a narrated recap video with captions.",
-  keywords: ["manhwa", "manga", "webtoon", "recap", "video", "MangaDex", "Groq", "TTS"],
+    "Discover manhwa, manga, and webtoons across every archive and craft cinema-grade narrated recap editions.",
+  keywords: ["manhwa", "manga", "webtoon", "recap", "video", "narration"],
   authors: [{ name: "Manhwa Recap Studio" }],
 };
 
@@ -30,7 +39,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground min-h-screen`}
+        className={`${playfair.variable} ${jakarta.variable} ${plexMono.variable} antialiased bg-background text-foreground min-h-screen selection:bg-primary/30 selection:text-foreground`}
       >
         <Providers>
           {children}

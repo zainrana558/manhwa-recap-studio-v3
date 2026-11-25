@@ -1,6 +1,7 @@
 "use client";
 
-import { Clock, X } from "lucide-react";
+import { useState } from "react";
+import { Clock, X, Sparkles, ArrowRight } from "lucide-react";
 import type { RecentManga } from "@/hooks/use-recently-viewed";
 import type { MangadexManga } from "@/types/pipeline";
 
@@ -25,118 +26,141 @@ function relativeTime(timestamp: number): string {
   return `${Math.floor(days / 30)}mo ago`;
 }
 
+function RecentPosterCard({
+  item,
+  onOpen,
+  onRemove,
+}: {
+  item: RecentManga;
+  onOpen: () => void;
+  onRemove: (e: React.MouseEvent) => void;
+}) {
+  const [failed, setFailed] = useState(false);
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className="group relative w-[148px] sm:w-[162px] snap-start shrink-0 rounded-2xl overflow-hidden bg-[#160810] border border-primary/25 hover:border-[#F5D27A]/75 shadow-[0_14px_34px_-14px_rgba(0,0,0,0.8)] hover:shadow-[0_20px_44px_-12px_rgba(225,29,72,0.45)] transition-all duration-300 hover:-translate-y-1.5 cursor-pointer"
+    >
+      <button
+        type="button"
+        onClick={onRemove}
+        className="absolute top-2 right-2 z-20 h-6 w-6 rounded-full bg-black/75 border border-white/15 text-white/80 hover:bg-[#E11D48] hover:text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+        aria-label={`Remove ${item.title}`}
+      >
+        <X className="h-3 w-3" />
+      </button>
+
+      <div className="aspect-[3/4] relative overflow-hidden">
+        {item.coverUrl && !failed ? (
+          <img
+            src={`/api/cover?url=${encodeURIComponent(item.coverUrl)}&w=320`}
+            alt={item.title}
+            referrerPolicy="no-referrer"
+            loading="lazy"
+            decoding="async"
+            onError={() => setFailed(true)}
+            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+          />
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center p-3 text-center bg-gradient-to-br from-[#2B0916] to-[#0E050A]">
+            <Sparkles className="h-5 w-5 text-[#F5D27A]/70 mb-1.5" />
+            <span className="font-serif italic text-xs text-[#FFF8F5]/80 line-clamp-2">
+              {item.title}
+            </span>
+          </div>
+        )}
+
+        {/* Diagonal shine sweep */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-y-0 -left-full w-2/3 -skew-x-12 bg-gradient-to-r from-transparent via-[#FFF4C6]/25 to-transparent group-hover:left-[160%] transition-all duration-700"
+        />
+
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0D0509] via-[#0D0509]/35 to-transparent" />
+
+        <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[9px] font-mono bg-[#14070D]/90 text-[#F5D27A] border border-[#F5D27A]/30">
+          {relativeTime(item.viewedAt)}
+        </span>
+
+        <div className="absolute bottom-0 inset-x-0 p-3 space-y-1">
+          <p className="font-serif font-medium text-sm leading-snug text-[#FFF8F5] line-clamp-2">
+            {item.title}
+          </p>
+          <span className="inline-flex items-center gap-1 text-[9.5px] font-mono uppercase tracking-[0.14em] text-[#F5D27A] opacity-0 group-hover:opacity-100 transition-opacity">
+            Open Overview
+            <ArrowRight className="h-2.5 w-2.5" />
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function RecentlyViewed({
   items,
   onSelectManga,
   onRemoveItem,
   onClearAll,
 }: RecentlyViewedProps) {
-  if (items.length === 0) {
-    return (
-      <section className="animate-fade-in-up">
-        <div className="max-w-6xl mx-auto">
-          <div className="relative">
-            <div className="absolute inset-x-0 top-0 h-[2px] rounded-full bg-gradient-to-r from-primary/20 via-primary/5 to-transparent" />
-            <div className="flex items-center gap-2 mb-3 pt-1">
-              <Clock className="h-4 w-4 text-muted-foreground/40" />
-              <h2 className="text-sm font-semibold text-muted-foreground/40">Recently Viewed</h2>
-            </div>
-            <div className="flex items-center justify-center py-6 animate-breathe">
-              <p className="text-xs text-muted-foreground/30">Viewed manga will appear here</p>
-            </div>
-          </div>
-        </div>
-      </section>
-    );
-  }
+  if (items.length === 0) return null;
 
   return (
-    <section className="animate-fade-in-up">
-      <div className="max-w-6xl mx-auto">
-        <div className="relative">
-          <div className="absolute inset-x-0 top-0 h-[2px] rounded-full bg-gradient-to-r from-primary/30 via-primary/10 to-transparent" />
-          <div className="flex items-center gap-2 mb-3 pt-1">
-            <Clock className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold text-muted-foreground">Recently Viewed</h2>
-          </div>
+    <section className="max-w-6xl mx-auto space-y-5">
+      <div className="flex items-end justify-between gap-4 border-b border-primary/20 pb-3">
+        <div className="space-y-1">
+          <p className="text-[10px] font-mono uppercase tracking-[0.26em] text-[#F5D27A] flex items-center gap-2">
+            <Clock className="h-3 w-3 text-[#F43F5E]" />
+            Continue Screening
+          </p>
+          <h2 className="font-serif text-2xl sm:text-3xl font-semibold text-foreground">
+            Recently Viewed
+          </h2>
         </div>
 
-        <div className="flex items-center gap-3 overflow-x-auto snap-x snap-mandatory scrollbar-thin pb-2 hover-glow-sm rounded-xl">
-          {items.map((item) => (
-            <div
-              key={item.id}
-              className="group relative flex flex-col items-center gap-1.5 snap-start shrink-0 cursor-pointer transition-transform duration-200 hover:scale-105"
-              onClick={() => {
-                onSelectManga({
-                  id: item.id,
-                  title: item.title,
-                  coverUrl: item.coverUrl || null,
-                  description: "",
-                  status: null,
-                  year: null,
-                  originalLanguage: null,
-                  availableTranslatedLanguages: [],
-                  tags: [],
-                  contentRating: null,
-                  lastChapter: null,
-                });
-              }}
-            >
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemoveItem(item.id);
-                }}
-                className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                aria-label={`Remove ${item.title}`}
-              >
-                <X className="h-2.5 w-2.5" />
-              </button>
+        <button
+          type="button"
+          onClick={onClearAll}
+          className="px-3 py-1.5 rounded-full text-[10px] font-mono uppercase tracking-[0.16em] text-muted-foreground hover:text-rose-300 border border-border hover:border-rose-500/40 bg-card transition-colors cursor-pointer"
+        >
+          Clear History
+        </button>
+      </div>
 
-              <div className="w-12 h-[68px] rounded-lg overflow-hidden bg-muted border border-border group-hover:border-primary/30 transition-colors">
-                {item.coverUrl ? (
-                  <img
-                    src={item.coverUrl}
-                    alt={item.title}
-                    referrerPolicy="no-referrer"
-                    onError={(e) => {
-                      const img = e.currentTarget;
-                      img.style.display = "none";
-                      const sib = img.nextElementSibling as HTMLElement | null;
-                      if (sib) sib.style.display = "flex";
-                    }}
-                    className="w-full h-full object-cover"
-                  />
-                ) : null}
-                <div
-                  className="w-full h-full items-center justify-center text-muted-foreground/30"
-                  style={{ display: item.coverUrl ? "none" : "flex" }}
-                >
-                  <Clock className="h-4 w-4" />
-                </div>
-              </div>
-
-              <p className="text-[10px] text-muted-foreground w-[72px] text-center leading-tight line-clamp-2 group-hover:text-primary transition-colors">
-                {item.title}
-              </p>
-
-              <span className="text-[9px] text-muted-foreground/50">
-                {relativeTime(item.viewedAt)}
-              </span>
-            </div>
-          ))}
-
-          <button
-            onClick={(e) => {
+      <div className="flex items-stretch gap-4 overflow-x-auto snap-x snap-mandatory scrollbar-thin pb-3 pt-1">
+        {items.map((item) => (
+          <RecentPosterCard
+            key={item.id}
+            item={item}
+            onOpen={() =>
+              onSelectManga({
+                id: item.id,
+                title: item.title,
+                coverUrl: item.coverUrl || null,
+                description: "",
+                status: null,
+                year: null,
+                originalLanguage: null,
+                availableTranslatedLanguages: [],
+                tags: [],
+                contentRating: null,
+                lastChapter: null,
+              })
+            }
+            onRemove={(e) => {
               e.stopPropagation();
-              onClearAll();
+              onRemoveItem(item.id);
             }}
-            className="shrink-0 flex flex-col items-center gap-1.5 snap-start px-3 py-2 rounded-lg border border-dashed border-border hover:border-primary/40 hover:bg-primary/5 transition-colors"
-          >
-            <X className="h-4 w-4 text-muted-foreground" />
-            <span className="text-[10px] text-muted-foreground">Clear all</span>
-          </button>
-        </div>
+          />
+        ))}
       </div>
     </section>
   );
